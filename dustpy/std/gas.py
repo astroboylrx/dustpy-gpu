@@ -19,6 +19,7 @@ from simframe.backends.api import get_backend
 from simframe.backends.api import select_backend
 from simframe.backends.api import xp
 from dustpy.std import gas_f
+from dustpy.utils.backend import bind_sparse_solver
 from dustpy.utils.backend import call_numpy
 from dustpy.utils.backend import solve_sparse_linear_system
 from dustpy.utils.backend import to_backend
@@ -94,20 +95,62 @@ def _jac_abc_cupy(area, nu, r, ri, v):
     w[:-1] = r[1:] - r[:-1]
     w[-1] = w[-2]
 
-    ir = np.arange(1, Nr - 1)
-    A[ir] += vip[ir] * r[ir - 1]
-    B[ir] += -vip[ir + 1] * r[ir] + vim[ir] * r[ir]
-    C[ir] += -vim[ir + 1] * r[ir + 1]
+    A[1:-1] += vip[1:-2] * r[:-2]
+    B[1:-1] += -vip[2:-1] * r[1:-1] + vim[1:-2] * r[1:-1]
+    C[1:-1] += -vim[2:-1] * r[2:]
 
-    A[ir] += Di[ir] * g[ir - 1] / w[ir - 1] * r[ir - 1]
-    B[ir] += -Di[ir] * g[ir] / w[ir - 1] * r[ir]
-    B[ir] += -Di[ir + 1] * g[ir] / w[ir] * r[ir]
-    C[ir] += Di[ir + 1] * g[ir + 1] / w[ir] * r[ir + 1]
+    A[1:-1] += Di[1:-2] * g[:-2] / w[:-2] * r[:-2]
+    B[1:-1] += -Di[1:-2] * g[1:-1] / w[:-2] * r[1:-1]
+    B[1:-1] += -Di[2:-1] * g[1:-1] / w[1:-1] * r[1:-1]
+    C[1:-1] += Di[2:-1] * g[2:] / w[1:-1] * r[2:]
 
     A *= Vinv
     B *= Vinv
     C *= Vinv
     return A, B, C
+
+
+def _get_gas_jac_pattern_numpy(Nr):
+    """Cache fixed CSR pattern for gas Jacobian with boundary placeholder columns."""
+    global _GAS_JAC_PATTERN_KEY, _GAS_JAC_PATTERN_VALUE
+    key = int(Nr)
+    if _GAS_JAC_PATTERN_KEY == key and _GAS_JAC_PATTERN_VALUE is not None:
+        return _GAS_JAC_PATTERN_VALUE
+
+    Nr_int = int(Nr)
+    indptr = np.arange(0, 3 * Nr_int + 1, 3, dtype=np.int64)
+    indices = np.empty((3 * Nr_int,), dtype=np.int64)
+    indices[:3] = (0, 1, 2)
+    if Nr_int > 2:
+        mid = np.arange(1, Nr_int - 1, dtype=np.int64)
+        indices[3:3 * (Nr_int - 1):3] = mid - 1
+        indices[4:3 * (Nr_int - 1):3] = mid
+        indices[5:3 * (Nr_int - 1):3] = mid + 1
+    indices[-3:] = (Nr_int - 3, Nr_int - 2, Nr_int - 1)
+    _GAS_JAC_PATTERN_KEY = key
+    _GAS_JAC_PATTERN_VALUE = (indptr, indices)
+    return _GAS_JAC_PATTERN_VALUE
+
+
+def _get_gas_jac_pattern_cupy(Nr):
+    indptr, indices = _get_gas_jac_pattern_numpy(Nr)
+    return cp.asarray(indptr), cp.asarray(indices)
+
+
+def _pack_gas_jac_data(A, B, C):
+    """Pack tridiagonal gas Jacobian coefficients into cached CSR pattern order."""
+    Nr = int(B.shape[0])
+    data = xp.zeros((3 * Nr,), dtype=B.dtype)
+    data[0] = B[0]
+    data[1] = C[0]
+    if Nr > 2:
+        data[3:3 * (Nr - 1):3] = A[1:-1]
+        data[4:3 * (Nr - 1):3] = B[1:-1]
+        data[5:3 * (Nr - 1):3] = C[1:-1]
+    last = 3 * (Nr - 1)
+    data[last + 1] = A[-1]
+    data[last + 2] = B[-1]
+    return data
 
 
 def _modified_rhs_python(dt, rhs, S):
@@ -171,8 +214,11 @@ _K_S_TOT = None
 _K_T_PASS = None
 _K_IMPL_1_DIRECT = None
 _K_INTERP_TO_INTERFACES_1D = None
+_K_JACOBIAN = None
 _CSR_HOST_META_KEY = None
 _CSR_HOST_META_VALUE = None
+_GAS_JAC_PATTERN_KEY = None
+_GAS_JAC_PATTERN_VALUE = None
 
 
 def _get_csr_host_meta(mat):
@@ -401,11 +447,14 @@ def bind_backend_kernels(backend=None):
     global _BOUND_BACKEND, _K_ENFORCE_FLOOR, _K_CS, _K_ETA, _K_FI, _K_HP
     global _K_N, _K_P, _K_RHO, _K_S_HYD, _K_TIMESTEP, _K_VRAD, _K_VVISC
     global _K_IMPLICIT_BOUNDARIES, _K_MFP, _K_NU, _K_S_TOT, _K_T_PASS, _K_IMPL_1_DIRECT, _K_INTERP_TO_INTERFACES_1D
-    global _CSR_HOST_META_KEY, _CSR_HOST_META_VALUE
+    global _K_JACOBIAN, _CSR_HOST_META_KEY, _CSR_HOST_META_VALUE
+    global _GAS_JAC_PATTERN_KEY, _GAS_JAC_PATTERN_VALUE
 
     backend = get_backend() if backend is None else backend
     if backend == _BOUND_BACKEND and _K_FI is not None:
         return
+
+    bind_sparse_solver(backend=backend)
 
     _K_ENFORCE_FLOOR = select_backend({"cupy": _enforce_floor_cupy}, backend=backend, default=_enforce_floor_fortran)
     _K_CS = select_backend({"cupy": _cs_isothermal_cupy}, backend=backend, default=_cs_isothermal_fortran)
@@ -426,9 +475,12 @@ def bind_backend_kernels(backend=None):
     _K_T_PASS = select_backend({"cupy": _t_passive_cupy}, backend=backend, default=_t_passive_fortran)
     _K_IMPL_1_DIRECT = select_backend({"cupy": _f_impl_1_direct_cupy}, backend=backend, default=_f_impl_1_direct_numpy)
     _K_INTERP_TO_INTERFACES_1D = select_backend({"cupy": _interp_to_interfaces_1d_cupy}, backend=backend, default=_interp_to_interfaces_1d_numpy)
+    _K_JACOBIAN = select_backend({"cupy": _jacobian_cupy}, backend=backend, default=_jacobian_numpy)
 
     _CSR_HOST_META_KEY = None
     _CSR_HOST_META_VALUE = None
+    _GAS_JAC_PATTERN_KEY = None
+    _GAS_JAC_PATTERN_VALUE = None
     _BOUND_BACKEND = backend
 
 
@@ -579,30 +631,7 @@ def Hp(sim):
     return _K_HP(sim)
 
 
-def jacobian(sim, x, *args, **kwargs):
-    """Functions calculates the Jacobian for the gas.
-
-    Parameters
-    ----------
-    sim : Frame
-        Parent simulation frame
-    x : IntVar
-        Integration variable
-    args : additional positional arguments
-    kwargs : additional keyworda arguments
-
-    Returns
-    -------
-    jac : Field
-        Jacobi matrix for gas evolution
-
-    Notes
-    -----
-    The boundaries need information about the time step, which is only available at
-    the integration stage. The boundary values are therefore meaningless and should not
-    be used to calculate the source terms via matrix-vector multiplication.
-    See the documentation for details."""
-
+def _jacobian_numpy(sim, x, *args, **kwargs):
     # Parameters
     nu = sim.gas.nu * sim.dust.backreaction.A
     # Velocity contribution from dust back reaction
@@ -616,49 +645,44 @@ def jacobian(sim, x, *args, **kwargs):
     area = sim.grid.A
     Nr = int(sim.grid.Nr)
 
-    # Construct Jacobian
-    if get_backend() == "cupy":
-        A, B, C = _jac_abc_cupy(area, nu, r, ri, v)
-    else:
-        A, B, C = _gas_f_call(gas_f.jac_abc, area, nu, r, ri, v, to_backend_result=False)
-    row_hyd = np.hstack(
-        (np.arange(Nr-1)+1, np.arange(Nr), np.arange(Nr-1)))
-    col_hyd = np.hstack(
-        (np.arange(Nr-1), np.arange(Nr), np.arange(Nr-1)+1))
-    if get_backend() == "cupy":
-        dat_hyd = cp.concatenate((A.ravel()[1:], B.ravel(), C.ravel()[:-1]))
-    else:
-        dat_hyd = np.hstack((A.ravel()[1:], B.ravel(), C.ravel()[:-1]))
-
-    # Right hand side
+    A, B, C = _gas_f_call(gas_f.jac_abc, area, nu, r, ri, v, to_backend_result=False)
     sim.gas._rhs[:] = sim.gas.Sigma
 
-    # Boundaries. This is only reserving space in the sparce matrix
-    row_in = [0, 0, 0]
-    col_in = [0, 1, 2]
-    dat_in = [0., 0., 0.]
-    row_out = [Nr-1, Nr-1, Nr-1]
-    col_out = [Nr-3, Nr-2, Nr-1]
-    dat_out = [0., 0., 0.]
-
-    # Stitching together the generators
-    row = np.hstack((row_hyd, row_in, row_out))
-    col = np.hstack((col_hyd, col_in, col_out))
-    if get_backend() == "cupy":
-        dat = cp.concatenate((dat_hyd, cp.asarray(dat_in), cp.asarray(dat_out)))
-        J = cp_sparse.coo_matrix(
-            (dat, (cp.asarray(row), cp.asarray(col))),
-            shape=(Nr, Nr),
-        ).tocsr()
-    else:
-        dat = np.hstack((dat_hyd, dat_in, dat_out))
-        gen = (dat, (row, col))
-        J = sp.csc_matrix(
-            gen,
-            shape=(Nr, Nr)
-        )
-
+    indptr, indices = _get_gas_jac_pattern_numpy(Nr)
+    dat = _pack_gas_jac_data(A.ravel(), B.ravel(), C.ravel())
+    J = sp.csr_matrix((np.asarray(dat), indices, indptr), shape=(Nr, Nr))
     return J
+
+
+def _jacobian_cupy(sim, x, *args, **kwargs):
+    nu = sim.gas.nu * sim.dust.backreaction.A
+    v = sim.dust.backreaction.B * 2. * sim.gas.eta * sim.grid.r * sim.grid.OmegaK
+    v += _field_data(sim.gas.torque.v)
+
+    r = sim.grid.r
+    ri = sim.grid.ri
+    area = sim.grid.A
+    Nr = int(sim.grid.Nr)
+
+    A, B, C = _jac_abc_cupy(area, nu, r, ri, v)
+    sim.gas._rhs[:] = sim.gas.Sigma
+
+    indptr, indices = _get_gas_jac_pattern_cupy(Nr)
+    dat = _pack_gas_jac_data(A.ravel(), B.ravel(), C.ravel())
+    J = cp_sparse.csr_matrix((dat, indices, indptr), shape=(Nr, Nr))
+    return J
+
+
+def jacobian(sim, x, *args, **kwargs):
+    """Functions calculates the Jacobian for the gas.
+
+    Notes
+    -----
+    The boundaries need information about the time step, which is only available at
+    the integration stage. The boundary values are therefore meaningless and should not
+    be used to calculate the source terms via matrix-vector multiplication.
+    See the documentation for details."""
+    return _K_JACOBIAN(sim, x, *args, **kwargs)
 
 
 def lyndenbellpringle1974(r, rc, p, Mdisk):

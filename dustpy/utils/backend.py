@@ -79,6 +79,8 @@ def _load_cupy_gmres_config():
 
 
 _CUPY_GMRES_CONFIG = _load_cupy_gmres_config()
+_BOUND_SOLVER_BACKEND = None
+_SOLVE_SPARSE_IMPL = None
 
 
 def reload_cupy_gmres_config():
@@ -234,145 +236,170 @@ def call_numpy(func, *args, to_backend_result=True, audit_tag=None, **kwargs):
         _AUDIT_LOCAL.tag = prev_tag
 
 
-def solve_sparse_linear_system(matrix, rhs):
-    """Solve a linear system with a backend-aware sparse path.
+def _solve_sparse_linear_system_cupy(matrix, rhs):
+    if cp is None or cp_sparse is None or cp_splinalg is None:
+        raise RuntimeError("CuPy backend requested but cupy/cupyx is unavailable.")
 
-    For cupy backend, this uses GPU GMRES with Jacobi preconditioning.
-    For torch backend, this tries ``torch.sparse.spsolve`` and then sparse CPU LU.
-    For numpy backend, this uses SciPy LU decomposition.
-    """
-    if get_backend() == "cupy":
-        if cp is None or cp_sparse is None or cp_splinalg is None:
-            raise RuntimeError("CuPy backend requested but cupy/cupyx is unavailable.")
+    is_scipy_sparse = sp.issparse(matrix)
+    is_cupy_sparse = isinstance(matrix, cp_sparse.spmatrix)
 
-        is_scipy_sparse = sp.issparse(matrix)
-        is_cupy_sparse = isinstance(matrix, cp_sparse.spmatrix)
+    if is_cupy_sparse:
+        matrix_gpu = matrix if getattr(matrix, "format", None) == "csr" else matrix.tocsr()
+    elif is_scipy_sparse:
+        matrix_gpu = cp_sparse.csr_matrix(matrix)
+    else:
+        matrix_gpu = cp.asarray(matrix)
+    rhs_raw = rhs._data if hasattr(rhs, "_data") else rhs
+    rhs_gpu = cp.asarray(rhs_raw)
 
-        if is_cupy_sparse:
-            matrix_gpu = matrix.tocsr()
-        elif is_scipy_sparse:
-            matrix_gpu = cp_sparse.csr_matrix(matrix)
-        else:
-            matrix_gpu = cp.asarray(matrix)
-        rhs_raw = rhs._data if hasattr(rhs, "_data") else rhs
-        rhs_gpu = cp.asarray(rhs_raw)
+    if is_scipy_sparse or is_cupy_sparse:
+        diag = matrix_gpu.diagonal()
+        diag = cp.where(cp.abs(diag) > 1e-15, diag, cp.ones_like(diag))
+        inv_diag = 1.0 / diag
 
-        if is_scipy_sparse or is_cupy_sparse:
-            diag = matrix_gpu.diagonal()
-            diag = cp.where(cp.abs(diag) > 1e-15, diag, cp.ones_like(diag))
-            inv_diag = 1.0 / diag
+        def matvec(x):
+            return inv_diag * x
 
-            def matvec(x):
-                return inv_diag * x
-
-            precond = cp_splinalg.LinearOperator(matrix_gpu.shape, matvec=matvec)
-            cfg = _CUPY_GMRES_CONFIG
-            tier1 = cfg["tier1"]
-            # Tier-1: strict tolerances (fast/default path).
-            tier1_kwargs = _cupy_gmres_kwargs(
-                rtol=tier1["rtol"],
-                atol=tier1["atol"],
-                maxiter=tier1["maxiter"],
-                restart=tier1["restart"],
-                precond=precond,
-                x0=rhs_gpu,
-            )
-            sol, info = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier1_kwargs)
-            if info == 0:
-                with _AUDIT_LOCK:
-                    _GMRES_STATS["tier1_success"] += 1
-                return sol
-
-            # Tier-2: relaxed tolerances + more iterations for hard timesteps.
-            tier2 = cfg["tier2"]
-            tier2_kwargs = _cupy_gmres_kwargs(
-                rtol=tier2["rtol"],
-                atol=tier2["atol"],
-                maxiter=tier2["maxiter"],
-                restart=tier2["restart"],
-                precond=precond,
-                x0=sol,
-            )
-            sol2, info2 = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier2_kwargs)
-            if info2 == 0:
-                with _AUDIT_LOCK:
-                    _GMRES_STATS["tier2_success"] += 1
-                return sol2
-
-            # Optional last-resort CPU direct fallback (explicitly opt-in).
-            if cfg["cpu_fallback"]:
-                with _AUDIT_LOCK:
-                    _GMRES_STATS["cpu_fallback"] += 1
-                matrix_cpu = sp.csr_matrix(cp.asnumpy(matrix_gpu))
-                rhs_cpu = cp.asnumpy(rhs_gpu)
-                matrix_lu = sp.linalg.splu(
-                    matrix_cpu.tocsc(),
-                    permc_spec="MMD_AT_PLUS_A",
-                    diag_pivot_thresh=0.0,
-                    options=dict(SymmetricMode=True),
-                )
-                return cp.asarray(matrix_lu.solve(rhs_cpu))
-
+        precond = cp_splinalg.LinearOperator(matrix_gpu.shape, matvec=matvec)
+        cfg = _CUPY_GMRES_CONFIG
+        tier1 = cfg["tier1"]
+        # Tier-1: strict tolerances (fast/default path).
+        tier1_kwargs = _cupy_gmres_kwargs(
+            rtol=tier1["rtol"],
+            atol=tier1["atol"],
+            maxiter=tier1["maxiter"],
+            restart=tier1["restart"],
+            precond=precond,
+            x0=rhs_gpu,
+        )
+        sol, info = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier1_kwargs)
+        if info == 0:
             with _AUDIT_LOCK:
-                _GMRES_STATS["tier2_failed"] += 1
-            raise RuntimeError(
-                "CuPy GMRES failed to converge "
-                f"(tier1_info={info}, tier2_info={info2})."
-            )
+                _GMRES_STATS["tier1_success"] += 1
+            return sol
 
-        return cp.linalg.solve(matrix_gpu, rhs_gpu)
+        # Tier-2: relaxed tolerances + more iterations for hard timesteps.
+        tier2 = cfg["tier2"]
+        tier2_kwargs = _cupy_gmres_kwargs(
+            rtol=tier2["rtol"],
+            atol=tier2["atol"],
+            maxiter=tier2["maxiter"],
+            restart=tier2["restart"],
+            precond=precond,
+            x0=sol,
+        )
+        sol2, info2 = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier2_kwargs)
+        if info2 == 0:
+            with _AUDIT_LOCK:
+                _GMRES_STATS["tier2_success"] += 1
+            return sol2
 
-    if get_backend() == "torch":
-        if torch is None:
-            raise RuntimeError("PyTorch backend requested but torch is unavailable.")
-
-        rhs_t = xp.asarray(rhs)
-        if rhs_t.dtype not in (torch.float32, torch.float64):
-            rhs_t = rhs_t.to(dtype=torch.float64)
-        device = rhs_t.device
-        dtype = rhs_t.dtype
-
-        can_try_torch_sparse = rhs_t.device.type != "cpu"
-        if sp.issparse(matrix) and can_try_torch_sparse and hasattr(torch.sparse, "spsolve"):
-            matrix_csr = matrix.tocsr()
-            crow_indices = torch.from_numpy(
-                matrix_csr.indptr.astype(np.int64, copy=False)
-            ).to(device=device)
-            col_indices = torch.from_numpy(
-                matrix_csr.indices.astype(np.int64, copy=False)
-            ).to(device=device)
-            values = torch.from_numpy(matrix_csr.data).to(device=device, dtype=dtype)
-            matrix_t = torch.sparse_csr_tensor(
-                crow_indices,
-                col_indices,
-                values,
-                size=matrix_csr.shape,
-                device=device,
-                dtype=dtype,
-            )
-            try:
-                return torch.sparse.spsolve(matrix_t, rhs_t)
-            except Exception:
-                pass
-
-        if sp.issparse(matrix):
+        # Optional last-resort CPU direct fallback (explicitly opt-in).
+        if cfg["cpu_fallback"]:
+            with _AUDIT_LOCK:
+                _GMRES_STATS["cpu_fallback"] += 1
+            matrix_cpu = sp.csr_matrix(cp.asnumpy(matrix_gpu))
+            rhs_cpu = cp.asnumpy(rhs_gpu)
             matrix_lu = sp.linalg.splu(
-                matrix,
+                matrix_cpu.tocsc(),
                 permc_spec="MMD_AT_PLUS_A",
                 diag_pivot_thresh=0.0,
                 options=dict(SymmetricMode=True),
             )
-            return xp.asarray(matrix_lu.solve(to_numpy(rhs_t)))
+            return cp.asarray(matrix_lu.solve(rhs_cpu))
 
-        dense = xp.asarray(matrix)
-        if dense.layout != torch.strided:
-            dense = dense.to_dense()
-        return torch.linalg.solve(dense, rhs_t.unsqueeze(-1)).squeeze(-1)
+        with _AUDIT_LOCK:
+            _GMRES_STATS["tier2_failed"] += 1
+        raise RuntimeError(
+            "CuPy GMRES failed to converge "
+            f"(tier1_info={info}, tier2_info={info2})."
+        )
 
+    return cp.linalg.solve(matrix_gpu, rhs_gpu)
+
+
+def _solve_sparse_linear_system_torch(matrix, rhs):
+    if torch is None:
+        raise RuntimeError("PyTorch backend requested but torch is unavailable.")
+
+    rhs_t = xp.asarray(rhs)
+    if rhs_t.dtype not in (torch.float32, torch.float64):
+        rhs_t = rhs_t.to(dtype=torch.float64)
+    device = rhs_t.device
+    dtype = rhs_t.dtype
+
+    can_try_torch_sparse = rhs_t.device.type != "cpu"
+    if sp.issparse(matrix) and can_try_torch_sparse and hasattr(torch.sparse, "spsolve"):
+        matrix_csr = matrix.tocsr()
+        crow_indices = torch.from_numpy(
+            matrix_csr.indptr.astype(np.int64, copy=False)
+        ).to(device=device)
+        col_indices = torch.from_numpy(
+            matrix_csr.indices.astype(np.int64, copy=False)
+        ).to(device=device)
+        values = torch.from_numpy(matrix_csr.data).to(device=device, dtype=dtype)
+        matrix_t = torch.sparse_csr_tensor(
+            crow_indices,
+            col_indices,
+            values,
+            size=matrix_csr.shape,
+            device=device,
+            dtype=dtype,
+        )
+        try:
+            return torch.sparse.spsolve(matrix_t, rhs_t)
+        except Exception:
+            pass
+
+    if sp.issparse(matrix):
+        matrix_cpu = matrix if sp.isspmatrix_csc(matrix) else matrix.tocsc()
+        matrix_lu = sp.linalg.splu(
+            matrix_cpu,
+            permc_spec="MMD_AT_PLUS_A",
+            diag_pivot_thresh=0.0,
+            options=dict(SymmetricMode=True),
+        )
+        return xp.asarray(matrix_lu.solve(to_numpy(rhs_t)))
+
+    dense = xp.asarray(matrix)
+    if dense.layout != torch.strided:
+        dense = dense.to_dense()
+    return torch.linalg.solve(dense, rhs_t.unsqueeze(-1)).squeeze(-1)
+
+
+def _solve_sparse_linear_system_numpy(matrix, rhs):
+    matrix_cpu = matrix if sp.isspmatrix_csc(matrix) else matrix.tocsc()
     matrix_lu = sp.linalg.splu(
-        matrix,
+        matrix_cpu,
         permc_spec="MMD_AT_PLUS_A",
         diag_pivot_thresh=0.0,
         options=dict(SymmetricMode=True),
     )
     return matrix_lu.solve(np.asarray(to_numpy(rhs)))
+
+
+def bind_sparse_solver(backend=None):
+    """Bind sparse linear solver implementation for the selected backend."""
+    global _BOUND_SOLVER_BACKEND, _SOLVE_SPARSE_IMPL
+    backend = get_backend() if backend is None else backend
+    if backend == _BOUND_SOLVER_BACKEND and _SOLVE_SPARSE_IMPL is not None:
+        return
+
+    if backend == "cupy":
+        _SOLVE_SPARSE_IMPL = _solve_sparse_linear_system_cupy
+    elif backend == "torch":
+        _SOLVE_SPARSE_IMPL = _solve_sparse_linear_system_torch
+    else:
+        _SOLVE_SPARSE_IMPL = _solve_sparse_linear_system_numpy
+    _BOUND_SOLVER_BACKEND = backend
+
+
+def solve_sparse_linear_system(matrix, rhs):
+    """Solve a linear system with the backend-bound sparse solver path."""
+    if _SOLVE_SPARSE_IMPL is None:
+        bind_sparse_solver()
+    return _SOLVE_SPARSE_IMPL(matrix, rhs)
+
+
+# Default binding at import time (normally overwritten during run initialize).
+bind_sparse_solver()

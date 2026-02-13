@@ -6,6 +6,7 @@ import math
 import os
 from dustpy.std import dust_f
 from dustpy.utils.backend import call_numpy
+from dustpy.utils.backend import bind_sparse_solver
 from dustpy.utils.backend import solve_sparse_linear_system
 from dustpy.utils.backend import to_numpy
 from simframe.backends.api import get_backend
@@ -110,6 +111,8 @@ _JCOAG_WORK_CACHE_KEY = None
 _JCOAG_WORK_CACHE_VALUE = None
 _JCOAG_ROWOFF_CACHE_KEY = None
 _JCOAG_ROWOFF_CACHE_VALUE = None
+_DUST_JHB_PATTERN_CACHE_KEY = None
+_DUST_JHB_PATTERN_CACHE_VALUE = None
 _JCOAG_WORKBUF_MODE = "fresh"
 _SCATTER_MODE = "addat"
 
@@ -123,9 +126,13 @@ def _get_jcoag_chunk_size(Nr_int, Nm):
         except Exception:
             pass
 
-    # Conservative default:
-    # larger Nm benefits from wider radial batching on this workload.
-    base = 64 if int(Nm) >= 96 else 32
+    # Auto heuristic tuned for production-like grids:
+    # use full-radius batches for moderate grids, otherwise keep memory bounded.
+    if int(Nr_int) <= 256 and int(Nm) <= 128:
+        return int(Nr_int)
+    base = 128 if int(Nm) >= 96 else 64
+    if int(Nr_int) > 384:
+        base = 96 if int(Nm) >= 96 else 48
     return max(1, min(int(base), int(Nr_int)))
 
 
@@ -712,6 +719,14 @@ def _get_jcoag_pattern_cupy(Nr, Nm, q):
         return _JCOAG_PATTERN_GPU_CACHE_VALUE
 
     src_i, src_j, row, col, L = _get_jcoag_pattern(Nr, Nm, q)
+    Ntot = int(Nr * Nm)
+    # Build CSR structure once; in current ordering this is identity-permutation,
+    # but keep a permutation fallback for safety.
+    coo = sp.coo_matrix((np.arange(int(row.size), dtype=np.int64), (row, col)), shape=(Ntot, Ntot))
+    csr = coo.tocsr()
+    perm = csr.data.astype(np.int64, copy=False)
+    ident = np.arange(int(row.size), dtype=np.int64)
+    perm_gpu = None if np.array_equal(perm, ident) else cp.asarray(perm)
     _JCOAG_PATTERN_GPU_CACHE_KEY = key
     _JCOAG_PATTERN_GPU_CACHE_VALUE = (
         cp.asarray(src_i),
@@ -719,6 +734,9 @@ def _get_jcoag_pattern_cupy(Nr, Nm, q):
         cp.asarray(row),
         cp.asarray(col),
         L,
+        cp.asarray(csr.indices.astype(np.int64, copy=False)),
+        cp.asarray(csr.indptr.astype(np.int64, copy=False)),
+        perm_gpu,
     )
     return _JCOAG_PATTERN_GPU_CACHE_VALUE
 
@@ -768,6 +786,23 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
             )
         )
 
+    stick_cat_flat = None
+    stick_cat_coeff = None
+    stick_cat_src = None
+    if len(stick_targets) > 0:
+        flat_parts = []
+        coeff_parts = []
+        src_parts = []
+        for flat, coeff, src in stick_targets:
+            if int(flat.size) > 0:
+                flat_parts.append(flat)
+                coeff_parts.append(coeff)
+                src_parts.append(src)
+        if len(flat_parts) > 0:
+            stick_cat_flat = cp.concatenate(flat_parts)
+            stick_cat_coeff = cp.concatenate(coeff_parts)
+            stick_cat_src = cp.concatenate(src_parts)
+
     klf_vals = iLF_cpu[j_all, i_all]
     frag_valid = klf_vals >= 0
     klf_v = klf_vals[frag_valid]
@@ -803,9 +838,11 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
             cp.asarray(-c1_eps),
             cp.asarray(-D_cpu[c1_j, c1_i]),
         )
+        c1_flat_cat = cp.concatenate(c1_flat_parts)
+        c1_coeff_mat = cp.stack(c1_coeff_parts, axis=0)
         c1_pair_idx_gpu = cp.asarray(c1_pair_idx.astype(np.int64))
     else:
-        c1_flat_parts = c1_coeff_parts = c1_pair_idx_gpu = None
+        c1_flat_cat = c1_coeff_mat = c1_pair_idx_gpu = None
 
     c2_i = ero_i[case2]
     c2_j = ero_j[case2]
@@ -825,9 +862,11 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
             cp.asarray(-np.ones(len(c2_i))),
             cp.asarray(-D_cpu[c2_j, c2_i]),
         )
+        c2_flat_cat = cp.concatenate(c2_flat_parts)
+        c2_coeff_mat = cp.stack(c2_coeff_parts, axis=0)
         c2_pair_idx_gpu = cp.asarray(c2_pair_idx.astype(np.int64))
     else:
-        c2_flat_parts = c2_coeff_parts = c2_pair_idx_gpu = None
+        c2_flat_cat = c2_coeff_mat = c2_pair_idx_gpu = None
 
     ff_idx = np.where(~is_erosion)[0]
     ff_i = i_all[ff_idx]
@@ -841,27 +880,32 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
             cp.asarray(-np.ones(len(ff_i))),
             cp.asarray(-D_cpu[ff_j, ff_i]),
         )
+        ff_flat_cat = cp.concatenate(ff_flat_parts)
+        ff_coeff_mat = cp.stack(ff_coeff_parts, axis=0)
         ff_pair_idx_gpu = cp.asarray(ff_idx.astype(np.int64))
     else:
-        ff_flat_parts = ff_coeff_parts = ff_pair_idx_gpu = None
+        ff_flat_cat = ff_coeff_mat = ff_pair_idx_gpu = None
 
     pre = {
         "q": q,
         "j_gpu": cp.asarray(j_all.astype(np.int64)),
         "i_gpu": cp.asarray(i_all.astype(np.int64)),
         "stick_targets": stick_targets,
+        "stick_cat_flat": stick_cat_flat,
+        "stick_cat_coeff": stick_cat_coeff,
+        "stick_cat_src": stick_cat_src,
         "frag_valid_gpu": cp.asarray(np.where(frag_valid)[0].astype(np.int64)),
         "frag_dist_gpu": frag_dist_gpu,
         "frag_flat_gpu": frag_flat_gpu,
         "n_frag": n_frag,
-        "c1_flat_parts": c1_flat_parts,
-        "c1_coeff_parts": c1_coeff_parts,
+        "c1_flat_cat": c1_flat_cat,
+        "c1_coeff_mat": c1_coeff_mat,
         "c1_pair_idx_gpu": c1_pair_idx_gpu,
-        "c2_flat_parts": c2_flat_parts,
-        "c2_coeff_parts": c2_coeff_parts,
+        "c2_flat_cat": c2_flat_cat,
+        "c2_coeff_mat": c2_coeff_mat,
         "c2_pair_idx_gpu": c2_pair_idx_gpu,
-        "ff_flat_parts": ff_flat_parts,
-        "ff_coeff_parts": ff_coeff_parts,
+        "ff_flat_cat": ff_flat_cat,
+        "ff_coeff_mat": ff_coeff_mat,
         "ff_pair_idx_gpu": ff_pair_idx_gpu,
     }
     _JCOAG_PRECOMP_CACHE_KEY = key
@@ -893,6 +937,49 @@ def _get_boundary_basis_cupy(Nr, Nm, dtype):
     _BOUNDARY_BASIS_CACHE_KEY = key
     _BOUNDARY_BASIS_CACHE_VALUE = (Bin0, Bin1, Bin2, Bout0, Bout1, Bout2)
     return _BOUNDARY_BASIS_CACHE_VALUE
+
+
+def _get_dust_hyd_boundary_pattern_cupy(Nr, Nm):
+    """Return cached COO pattern for (J_hyd + J_in + J_out) assembly."""
+    global _DUST_JHB_PATTERN_CACHE_KEY, _DUST_JHB_PATTERN_CACHE_VALUE
+    key = (int(Nr), int(Nm))
+    if _DUST_JHB_PATTERN_CACHE_KEY == key and _DUST_JHB_PATTERN_CACHE_VALUE is not None:
+        return _DUST_JHB_PATTERN_CACHE_VALUE
+
+    Nr_i = int(Nr)
+    Nm_i = int(Nm)
+    Ntot = int(Nr_i * Nm_i)
+
+    # Hydrodynamic tridiagonal block pattern with +/- Nm offsets.
+    idx = np.arange(Ntot, dtype=np.int64)
+    row_hyd = np.hstack((idx[Nm_i:], idx, idx[:-Nm_i]))
+    col_hyd = np.hstack((idx[:-Nm_i], idx, idx[Nm_i:]))
+
+    # Inner/outer boundary placeholders (3*Nm each) aligned with dat_in/dat_out layout.
+    row0 = np.arange(Nm_i, dtype=np.int64)
+    row_out = row0 + (Nr_i - 1) * Nm_i
+    row_b = np.hstack((row0, row0, row0, row_out, row_out, row_out))
+    col_b = np.hstack(
+        (
+            row0,
+            row0 + Nm_i,
+            row0 + 2 * Nm_i,
+            row_out,
+            row_out - Nm_i,
+            row_out - 2 * Nm_i,
+        )
+    )
+
+    row_all = np.hstack((row_hyd, row_b))
+    col_all = np.hstack((col_hyd, col_b))
+
+    _DUST_JHB_PATTERN_CACHE_KEY = key
+    _DUST_JHB_PATTERN_CACHE_VALUE = (
+        cp.asarray(row_all),
+        cp.asarray(col_all),
+        int(row_hyd.size),
+    )
+    return _DUST_JHB_PATTERN_CACHE_VALUE
 
 
 def _get_jstick_map_cupy(iStick, cStick, Nm):
@@ -993,7 +1080,9 @@ def _jacobian_coagulation_generator_cupy(
     q = pre["q"]
     j_gpu = pre["j_gpu"]
     i_gpu = pre["i_gpu"]
-    stick_targets = pre["stick_targets"]
+    stick_cat_flat = pre["stick_cat_flat"]
+    stick_cat_coeff = pre["stick_cat_coeff"]
+    stick_cat_src = pre["stick_cat_src"]
 
     if _JCOAG_WORKBUF_MODE == "reuse":
         jac = _get_jcoag_work_buffer(Nr, Nm, Sigma.dtype)
@@ -1018,11 +1107,14 @@ def _jacobian_coagulation_generator_cupy(
         rates_s = n_mid[start:stop, j_gpu] * Rs_mid[start:stop, j_gpu, i_gpu]
         ratef = n_mid[start:stop, j_gpu] * Rf_mid[start:stop, j_gpu, i_gpu]
 
-        for flat, coeff, valid in stick_targets:
-            if int(flat.size) > 0:
-                idx = row_offsets + flat[None, :]
-                vals = coeff[None, :] * rates_s[:, valid]
-                _scatter_add_1d(jac_mid_flat, idx.reshape(span * int(flat.size)), vals.reshape(span * int(flat.size)))
+        if stick_cat_flat is not None:
+            idx = row_offsets + stick_cat_flat[None, :]
+            vals = stick_cat_coeff[None, :] * rates_s[:, stick_cat_src]
+            _scatter_add_1d(
+                jac_mid_flat,
+                idx.reshape(span * int(stick_cat_flat.size)),
+                vals.reshape(span * int(stick_cat_flat.size)),
+            )
 
         if pre["n_frag"] > 0:
             ratef_v = ratef[:, pre["frag_valid_gpu"]]
@@ -1036,35 +1128,37 @@ def _jacobian_coagulation_generator_cupy(
                 frag_vals.reshape(-1),
             )
 
-        if pre["c1_flat_parts"] is not None:
+        if pre["c1_flat_cat"] is not None:
             ratef_c1 = ratef[:, pre["c1_pair_idx_gpu"]]
-            for flat_part, coeff_part in zip(pre["c1_flat_parts"], pre["c1_coeff_parts"]):
-                c1_idx = row_offsets + flat_part[None, :]
-                c1_vals = coeff_part[None, :] * ratef_c1
-                _scatter_add_1d(jac_mid_flat, c1_idx.reshape(-1), c1_vals.reshape(-1))
+            c1_idx = row_offsets + pre["c1_flat_cat"][None, :]
+            c1_vals = (
+                pre["c1_coeff_mat"][None, :, :] * ratef_c1[:, None, :]
+            ).reshape(span, -1)
+            _scatter_add_1d(jac_mid_flat, c1_idx.reshape(-1), c1_vals.reshape(-1))
 
-        if pre["c2_flat_parts"] is not None:
+        if pre["c2_flat_cat"] is not None:
             ratef_c2 = ratef[:, pre["c2_pair_idx_gpu"]]
-            for flat_part, coeff_part in zip(pre["c2_flat_parts"], pre["c2_coeff_parts"]):
-                c2_idx = row_offsets + flat_part[None, :]
-                c2_vals = coeff_part[None, :] * ratef_c2
-                _scatter_add_1d(jac_mid_flat, c2_idx.reshape(-1), c2_vals.reshape(-1))
+            c2_idx = row_offsets + pre["c2_flat_cat"][None, :]
+            c2_vals = (
+                pre["c2_coeff_mat"][None, :, :] * ratef_c2[:, None, :]
+            ).reshape(span, -1)
+            _scatter_add_1d(jac_mid_flat, c2_idx.reshape(-1), c2_vals.reshape(-1))
 
-        if pre["ff_flat_parts"] is not None:
+        if pre["ff_flat_cat"] is not None:
             ratef_ff = ratef[:, pre["ff_pair_idx_gpu"]]
-            for flat_part, coeff_part in zip(pre["ff_flat_parts"], pre["ff_coeff_parts"]):
-                ff_idx = row_offsets + flat_part[None, :]
-                ff_vals = coeff_part[None, :] * ratef_ff
-                _scatter_add_1d(jac_mid_flat, ff_idx.reshape(-1), ff_vals.reshape(-1))
+            ff_idx = row_offsets + pre["ff_flat_cat"][None, :]
+            ff_vals = (
+                pre["ff_coeff_mat"][None, :, :] * ratef_ff[:, None, :]
+            ).reshape(span, -1)
+            _scatter_add_1d(jac_mid_flat, ff_idx.reshape(-1), ff_vals.reshape(-1))
 
+    src_i, src_j, row, col, _, _, _, _ = _get_jcoag_pattern_cupy(Nr, Nm, q)
+    dat_gpu = jac[1:-1, src_i, src_j]
     active = Sigma[1:-1] > SigmaFloor[1:-1]
     any_active = cp.any(active, axis=1)
     imax_arr = cp.where(any_active, Nm - cp.argmax(active[:, ::-1], axis=1), 0)
-    col_range = cp.arange(Nm)[None, :]
-    jac[1:-1] *= (col_range < imax_arr[:, None])[:, None, :]
-
-    src_i, src_j, row, col, _ = _get_jcoag_pattern_cupy(Nr, Nm, q)
-    dat_gpu = jac[1:-1, src_i, src_j].reshape(-1)
+    dat_gpu *= (src_j[None, :] < imax_arr[:, None])
+    dat_gpu = dat_gpu.reshape(-1)
     return dat_gpu, row, col
 
 
@@ -1098,16 +1192,15 @@ def _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v):
     w = xp.ones((Nr,))
     w[:-1] = r[1:] - r[:-1]
 
-    ir = np.arange(1, Nr - 1)
+    # Keep all indexing on backend arrays; avoid host NumPy index vectors.
+    A[1:-1, :] += vip[1:-2, :] * r[:-2, None]
+    B[1:-1, :] += -vip[2:-1, :] * r[1:-1, None] + vim[1:-2, :] * r[1:-1, None]
+    C[1:-1, :] += -vim[2:-1, :] * r[2:, None]
 
-    A[ir, :] += vip[ir, :] * r[ir - 1, None]
-    B[ir, :] += -vip[ir + 1, :] * r[ir, None] + vim[ir, :] * r[ir, None]
-    C[ir, :] += -vim[ir + 1, :] * r[ir + 1, None]
-
-    A[ir, :] += Di[ir, :] * hi[ir, None] / (w[ir - 1, None] * h[ir - 1, None]) * r[ir - 1, None]
-    B[ir, :] += -Di[ir, :] * hi[ir, None] / (w[ir - 1, None] * h[ir, None]) * r[ir, None]
-    B[ir, :] += -Di[ir + 1, :] * hi[ir + 1, None] / (w[ir, None] * h[ir, None]) * r[ir, None]
-    C[ir, :] += Di[ir + 1, :] * hi[ir + 1, None] / (w[ir, None] * h[ir + 1, None]) * r[ir + 1, None]
+    A[1:-1, :] += Di[1:-2, :] * hi[1:-2, None] / (w[:-2, None] * h[:-2, None]) * r[:-2, None]
+    B[1:-1, :] += -Di[1:-2, :] * hi[1:-2, None] / (w[:-2, None] * h[1:-1, None]) * r[1:-1, None]
+    B[1:-1, :] += -Di[2:-1, :] * hi[2:-1, None] / (w[1:-1, None] * h[1:-1, None]) * r[1:-1, None]
+    C[1:-1, :] += Di[2:-1, :] * hi[2:-1, None] / (w[1:-1, None] * h[2:, None]) * r[2:, None]
 
     A = A * Vinv[:, None]
     B = B * Vinv[:, None]
@@ -1497,10 +1590,13 @@ def bind_backend_kernels(backend=None):
     global _BOUNDARY_BASIS_CACHE_KEY, _BOUNDARY_BASIS_CACHE_VALUE
     global _JSTICK_MAP_CACHE_KEY, _JSTICK_MAP_CACHE_VALUE
     global _JFRAG_MAP_CACHE_KEY, _JFRAG_MAP_CACHE_VALUE, _JCOAG_WORK_CACHE_KEY, _JCOAG_WORK_CACHE_VALUE
+    global _JCOAG_ROWOFF_CACHE_KEY, _JCOAG_ROWOFF_CACHE_VALUE
+    global _DUST_JHB_PATTERN_CACHE_KEY, _DUST_JHB_PATTERN_CACHE_VALUE
     global _JCOAG_WORKBUF_MODE, _SCATTER_MODE
 
     backend = get_backend() if backend is None else backend
-    mode = os.getenv("DUSTPY_JCOAG_WORKBUF_MODE", "reuse").strip().lower()
+    bind_sparse_solver(backend=backend)
+    mode = os.getenv("DUSTPY_JCOAG_WORKBUF_MODE", "fresh").strip().lower()
     if mode not in ("fresh", "reuse"):
         mode = "reuse"
     scatter_mode = os.getenv("DUSTPY_SCATTER_MODE", "addat").strip().lower()
@@ -1565,6 +1661,10 @@ def bind_backend_kernels(backend=None):
     _JFRAG_MAP_CACHE_VALUE = None
     _JCOAG_WORK_CACHE_KEY = None
     _JCOAG_WORK_CACHE_VALUE = None
+    _JCOAG_ROWOFF_CACHE_KEY = None
+    _JCOAG_ROWOFF_CACHE_VALUE = None
+    _DUST_JHB_PATTERN_CACHE_KEY = None
+    _DUST_JHB_PATTERN_CACHE_VALUE = None
 
     _BOUND_BACKEND = backend
 
@@ -2055,25 +2155,22 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     Nr = int(sim.grid.Nr)
     Nm = int(sim.grid.Nm)
     Ntot = int((Nr * Nm))
+    q = _get_mass_grid_q(cp.asarray(_field_data(m)), Nm)
+    _, _, _, _, _, jcoag_indices, jcoag_indptr, jcoag_perm = _get_jcoag_pattern_cupy(Nr, Nm, q)
 
-    dat, row, col = _jacobian_coagulation_generator_cupy(
+    dat, _, _ = _jacobian_coagulation_generator_cupy(
         A, cstick, eps, ilf, irm, istick, m, phi, Rf, Rs, SigD, SigDfloor
     )
-    J_coag = cp_sparse.csr_matrix((dat, (row, col)), shape=(Ntot, Ntot))
+    dat_csr = dat if jcoag_perm is None else dat[jcoag_perm]
+    J_coag = cp_sparse.csr_matrix((dat_csr, jcoag_indices, jcoag_indptr), shape=(Ntot, Ntot))
 
     A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(
         area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
     )
-    J_hyd = cp_sparse.diags(
-        (A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]),
-        offsets=(-Nm, 0, Nm),
-        shape=(Ntot, Ntot),
-        format="csr"
-    )
+    row_hb, col_hb, n_hyd = _get_dust_hyd_boundary_pattern_cupy(Nr, Nm)
+    dat_hyd = cp.concatenate((A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]))
 
     sim.dust._rhs[Nm:-Nm] = sim.dust.Sigma.ravel()[Nm:-Nm]
-
-    Bin0, Bin1, Bin2, Bout0, Bout1, Bout2 = _get_boundary_basis_cupy(Nr, Nm, SigmaArr.dtype)
     c_in0 = 0.0
     c_in1 = 0.0
     c_in2 = 0.0
@@ -2108,8 +2205,6 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
             c_in1 = -K1 / dt
             sim.dust._rhs[:Nm] = 0.
 
-    J_in = c_in0 * Bin0 + c_in1 * Bin1 + c_in2 * Bin2
-
     c_out0 = 0.0
     c_out1 = 0.0
     c_out2 = 0.0
@@ -2142,9 +2237,19 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
             KNrm2 = - (r[-1] / r[-2])**p
             c_out1 = -KNrm2 / dt
             sim.dust._rhs[-Nm:] = 0.
+    dat_bound = cp.empty((int(6 * Nm),), dtype=dat_hyd.dtype)
+    dat_bound[:Nm] = c_in0
+    dat_bound[Nm:2 * Nm] = c_in1
+    dat_bound[2 * Nm:3 * Nm] = c_in2
+    dat_bound[3 * Nm:4 * Nm] = c_out0
+    dat_bound[4 * Nm:5 * Nm] = c_out1
+    dat_bound[5 * Nm:6 * Nm] = c_out2
 
-    J_out = c_out0 * Bout0 + c_out1 * Bout1 + c_out2 * Bout2
-    return J_in + J_coag + J_hyd + J_out
+    dat_hb = cp.empty((n_hyd + int(6 * Nm),), dtype=dat_hyd.dtype)
+    dat_hb[:n_hyd] = dat_hyd
+    dat_hb[n_hyd:] = dat_bound
+    J_hb = cp_sparse.csr_matrix((dat_hb, (row_hb, col_hb)), shape=(Ntot, Ntot))
+    return J_coag + J_hb
 
 
 def jacobian(sim, x, dx=None, *args, **kwargs):
