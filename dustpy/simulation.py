@@ -13,7 +13,9 @@ from dustpy import std
 
 from simframe.io.writers import hdf5writer
 from dustpy.utils.boundary import Boundary
+from dustpy.utils.backend import call_numpy
 from dustpy.utils.simplenamespace import SimpleNamespace
+from simframe.backends.api import xp
 
 import numpy as np
 
@@ -199,6 +201,9 @@ class Simulation(Frame):
         self.updater = ["star", "grid", "gas", "dust"]
 
         self.t = None
+        self.RL_count_cycle = 0
+        self.RL_ncycle_out = 100
+        self.RL_recent_dts = np.zeros(100)
 
     def run(self):
         """This functions runs the simulation."""
@@ -313,8 +318,13 @@ class Simulation(Frame):
             print(msg)
             msg = colorize("    - Sticking:", color="yellow")
             print(msg)
-            errmax, i, j = std.dust_f.check_mass_conservation_sticking(
-                self.dust.coagulation.stick, self.dust.coagulation.stick_ind, self.grid.m)
+            errmax, i, j = call_numpy(
+                std.dust_f.check_mass_conservation_sticking,
+                self.dust.coagulation.stick,
+                self.dust.coagulation.stick_ind,
+                self.grid.m,
+                to_backend_result=False,
+            )
             tup = (j, i)
             color = "red"
             if (errmax < erracc):
@@ -339,8 +349,14 @@ class Simulation(Frame):
             krm = self.dust.coagulation.rm_ind
             m = self.grid.m
             phi = self.dust.coagulation.phi
-            errmax, i, j = std.dust_f.check_mass_conservation_full_fragmentation(
-                A, klf, m, phi)
+            errmax, i, j = call_numpy(
+                std.dust_f.check_mass_conservation_full_fragmentation,
+                A,
+                klf,
+                m,
+                phi,
+                to_backend_result=False,
+            )
             tup = (j, i)
             color = "red"
             if (errmax < erracc):
@@ -359,8 +375,16 @@ class Simulation(Frame):
             # Checking for erosion error
             msg = colorize("    - Erosion:", color="yellow")
             print(msg)
-            errmax, i, j = std.dust_f.check_mass_conservation_erosion(
-                A, eps, klf, krm, m, phi)
+            errmax, i, j = call_numpy(
+                std.dust_f.check_mass_conservation_erosion,
+                A,
+                eps,
+                klf,
+                krm,
+                m,
+                phi,
+                to_backend_result=False,
+            )
             tup = (j, i)
             color = "red"
             if (errmax < erracc):
@@ -398,6 +422,10 @@ class Simulation(Frame):
 
         # GRID QUANTITIES
         self._initializegrid()
+
+        # Bind backend-specific hot kernels once for this run.
+        std.dust.bind_backend_kernels()
+        std.gas.bind_backend_kernels()
 
         # GAS QUANTITIES
         self._initializegas()
@@ -614,9 +642,11 @@ class Simulation(Frame):
         # Surface density, if not set
         if self.dust.Sigma is None:
             Sigma = std.dust.MRN_distribution(self)
-            Sigma = np.where(Sigma <= self.dust.SigmaFloor,
-                             0.1*self.dust.SigmaFloor,
-                             Sigma)
+            Sigma = xp.where(
+                Sigma <= self.dust.SigmaFloor,
+                0.1 * self.dust.SigmaFloor,
+                Sigma,
+            )
             self.dust.Sigma = Field(
                 self, Sigma, description="Surface density per mass bin [g/cm²]")
         self.dust.Sigma.differentiator = std.dust.Sigma_deriv
@@ -731,9 +761,15 @@ class Simulation(Frame):
                 self, 1.e-100*np.ones(shape1), description="Floor value of surface density [g/cm²]")
         # Surface density
         if self.gas.Sigma is None:
-            SigmaGas = np.array(std.gas.lyndenbellpringle1974(
-                self.grid.r, self.ini.gas.SigmaRc, self.ini.gas.SigmaExp, self.ini.gas.Mdisk))
-            SigmaGas = np.maximum(SigmaGas, self.gas.SigmaFloor)
+            SigmaGas = xp.asarray(
+                std.gas.lyndenbellpringle1974(
+                    self.grid.r,
+                    self.ini.gas.SigmaRc,
+                    self.ini.gas.SigmaExp,
+                    self.ini.gas.Mdisk,
+                )
+            )
+            SigmaGas = xp.maximum(SigmaGas, self.gas.SigmaFloor)
             self.gas.Sigma = Field(self, SigmaGas,
                                    description="Surface density [g/cm²]")
         self.gas.Sigma.jacobinator = std.gas.jacobian

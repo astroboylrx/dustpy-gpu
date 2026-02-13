@@ -1,8 +1,7 @@
 '''Module containing standard functions for the grids.'''
 
 import dustpy.constants as c
-
-import numpy as np
+from simframe.backends.api import xp
 
 
 def OmegaK(sim):
@@ -17,4 +16,4 @@ def OmegaK(sim):
     -------
     OmegaK : Field
         Keplerian frequency"""
-    return np.sqrt(c.G * sim.star.M / sim.grid.r**3)
+    return xp.sqrt(c.G * sim.star.M / sim.grid.r**3)

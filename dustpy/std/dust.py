@@ -2,12 +2,1574 @@
 
 
 import dustpy.constants as c
+import math
+import os
 from dustpy.std import dust_f
+from dustpy.utils.backend import call_numpy
+from dustpy.utils.backend import solve_sparse_linear_system
+from dustpy.utils.backend import to_numpy
+from simframe.backends.api import get_backend
+from simframe.backends.api import select_backend
+from simframe.backends.api import xp
 
 import numpy as np
 import scipy.sparse as sp
 
+try:
+    import cupy as cp
+    import cupyx.scipy.sparse as cp_sparse
+    from cupyx.scipy.interpolate import interp1d as cp_interp1d
+    try:
+        from cupyx import scatter_add as cp_scatter_add
+    except Exception:  # pragma: no cover - optional dependency
+        cp_scatter_add = None
+except Exception:  # pragma: no cover - optional dependency
+    cp = None
+    cp_sparse = None
+    cp_interp1d = None
+    cp_scatter_add = None
+
 from simframe.integration import Scheme
+
+
+def _dust_f_call(func, *args, to_backend_result=True, **kwargs):
+    """Call NumPy/F2PY dust kernels with backend-safe conversions."""
+    return call_numpy(
+        func,
+        *args,
+        to_backend_result=to_backend_result,
+        audit_tag=f"dust_f:{func.__name__}",
+        **kwargs,
+    )
+
+
+def _field_data(value):
+    """Unwrap simframe Field-like containers to backend array data."""
+    return value._data if hasattr(value, "_data") else value
+
+
+def _scatter_add_1d(out, idx, vals):
+    """1D scatter-add helper."""
+    if int(idx.size) == 0:
+        return
+    if _SCATTER_MODE == "scatter" and cp_scatter_add is not None:
+        cp_scatter_add(out, idx, vals)
+    else:
+        cp.add.at(out, idx, vals)
+
+
+_BOUND_BACKEND = None
+_K_A = None
+_K_D = None
+_K_H = None
+_K_F_ADV = None
+_K_F_DIFF = None
+_K_S_COAG = None
+_K_S_HYD = None
+_K_KERNEL = None
+_K_P_FRAG = None
+_K_ST = None
+_K_VRAD = None
+_K_VREL_BROWN = None
+_K_VREL_AZI = None
+_K_VREL_RAD = None
+_K_VREL_TURB = None
+_K_VREL_VERT = None
+_K_COAG_PARAMS = None
+_K_IMPL_1_DIRECT = None
+_K_JACOBIAN = None
+_K_INTERP_TO_INTERFACES = None
+_KERNEL_LOWER_MASK = None
+_COAG_CACHE_KEY = None
+_COAG_CACHE_VALUE = None
+_COAG_PAIR_CACHE_KEY = None
+_COAG_PAIR_CACHE_VALUE = None
+_SCOAG_PAIRMAP_CACHE_KEY = None
+_SCOAG_PAIRMAP_CACHE_VALUE = None
+_SCOAG_PRECOMP_CACHE_KEY = None
+_SCOAG_PRECOMP_CACHE_VALUE = None
+_FRAG_P_CACHE_KEY = None
+_FRAG_P_CACHE_VALUE = None
+_MGRID_Q_CACHE_KEY = None
+_MGRID_Q_CACHE_VALUE = None
+_JCOAG_CONST_CACHE_KEY = None
+_JCOAG_CONST_CACHE_VALUE = None
+_JCOAG_PATTERN_CACHE_KEY = None
+_JCOAG_PATTERN_CACHE_VALUE = None
+_JCOAG_PATTERN_GPU_CACHE_KEY = None
+_JCOAG_PATTERN_GPU_CACHE_VALUE = None
+_JCOAG_PRECOMP_CACHE_KEY = None
+_JCOAG_PRECOMP_CACHE_VALUE = None
+_BOUNDARY_BASIS_CACHE_KEY = None
+_BOUNDARY_BASIS_CACHE_VALUE = None
+_JSTICK_MAP_CACHE_KEY = None
+_JSTICK_MAP_CACHE_VALUE = None
+_JFRAG_MAP_CACHE_KEY = None
+_JFRAG_MAP_CACHE_VALUE = None
+_JCOAG_WORK_CACHE_KEY = None
+_JCOAG_WORK_CACHE_VALUE = None
+_JCOAG_ROWOFF_CACHE_KEY = None
+_JCOAG_ROWOFF_CACHE_VALUE = None
+_JCOAG_WORKBUF_MODE = "fresh"
+_SCATTER_MODE = "addat"
+
+
+def _get_jcoag_chunk_size(Nr_int, Nm):
+    """Return chunk size for CuPy Jacobian radius batching."""
+    val = os.getenv("DUSTPY_JCOAG_CHUNK_SIZE", "auto").strip().lower()
+    if val and val != "auto":
+        try:
+            return max(1, min(int(val), int(Nr_int)))
+        except Exception:
+            pass
+
+    # Conservative default:
+    # larger Nm benefits from wider radial batching on this workload.
+    base = 64 if int(Nm) >= 96 else 32
+    return max(1, min(int(base), int(Nr_int)))
+
+
+def _a_fortran(sim):
+    rho = sim.dust.fill * sim.dust.rhos
+    return _dust_f_call(dust_f.a, sim.grid.m, rho)
+
+
+def _a_cupy(sim):
+    rho = sim.dust.fill * sim.dust.rhos
+    m = xp.asarray(sim.grid.m)[None, :]
+    return (3.0 * m / (4.0 * c.pi * rho)) ** (1.0 / 3.0)
+
+
+def _D_fortran(sim):
+    v2 = sim.dust.delta.rad * sim.gas.cs**2
+    Diff = _dust_f_call(dust_f.d, v2, sim.grid.OmegaK, sim.dust.St)
+    Diff[:2, ...] = 0.
+    Diff[-2:, ...] = 0.
+    return Diff
+
+
+def _D_cupy(sim):
+    v2 = sim.dust.delta.rad * sim.gas.cs**2
+    Diff = v2[:, None] / (sim.grid.OmegaK[:, None] * (1.0 + sim.dust.St**2))
+    Diff[:2, ...] = 0.
+    Diff[-2:, ...] = 0.
+    return Diff
+
+
+def _H_fortran(sim):
+    return _dust_f_call(dust_f.h_dubrulle1995, sim.gas.Hp, sim.dust.St, sim.dust.delta.vert)
+
+
+def _H_cupy(sim):
+    Hp = sim.gas.Hp[:, None]
+    H = Hp / xp.sqrt(1.0 + sim.dust.St / sim.dust.delta.vert[:, None])
+    return xp.minimum(H, Hp)
+
+
+def _F_adv_fortran(sim, Sigma=None):
+    Sigma = Sigma if Sigma is not None else sim.dust.Sigma
+    return _dust_f_call(dust_f.fi_adv, Sigma, sim.dust.v.rad, sim.grid.r, sim.grid.ri)
+
+
+def _F_adv_cupy(sim, Sigma=None):
+    Sigma = Sigma if Sigma is not None else sim.dust.Sigma
+    Sigma = _field_data(Sigma)
+    v = _field_data(sim.dust.v.rad)
+    r = _field_data(sim.grid.r)
+    ri = _field_data(sim.grid.ri)
+
+    Nr = int(sim.grid.Nr)
+    Nm = int(sim.grid.Nm)
+
+    vi = xp.zeros((Nr + 1, Nm))
+    t = ((ri[1:-1] - r[:-1]) / (r[1:] - r[:-1]))[:, None]
+    vi[1:-1, :] = v[:-1, :] + t * (v[1:, :] - v[:-1, :])
+    vi[0, :] = vi[1, :]
+    vi[-1, :] = vi[-2, :]
+
+    Fi = xp.zeros((Nr + 1, Nm))
+    Fi[1:-1, :] = Sigma[:-1, :] * xp.maximum(vi[1:-1, :], 0.0) + Sigma[1:, :] * xp.minimum(vi[1:-1, :], 0.0)
+    Fi[0, :] = Sigma[0, :] * xp.minimum(vi[1, :], 0.0)
+    Fi[-1, :] = Sigma[-1, :] * xp.maximum(vi[-2, :], 0.0)
+    return Fi
+
+
+def _interp_to_interfaces_numpy(values, r, ri):
+    """NumPy/xp linear interpolation to interfaces with endpoint extrapolation."""
+    values = _field_data(values)
+    r = _field_data(r)
+    ri = _field_data(ri)
+
+    if values.ndim == 1:
+        out = xp.zeros((values.shape[0] + 1,), dtype=values.dtype)
+        t = (ri[1:-1] - r[:-1]) / (r[1:] - r[:-1])
+        out[1:-1] = values[:-1] + t * (values[1:] - values[:-1])
+        m0 = (values[1] - values[0]) / (r[1] - r[0])
+        m1 = (values[-1] - values[-2]) / (r[-1] - r[-2])
+        out[0] = values[0] + m0 * (ri[0] - r[0])
+        out[-1] = values[-1] + m1 * (ri[-1] - r[-1])
+        return out
+
+    out = xp.zeros((values.shape[0] + 1, values.shape[1]), dtype=values.dtype)
+    t = ((ri[1:-1] - r[:-1]) / (r[1:] - r[:-1]))[:, None]
+    out[1:-1, :] = values[:-1, :] + t * (values[1:, :] - values[:-1, :])
+    m0 = (values[1, :] - values[0, :]) / (r[1] - r[0])
+    m1 = (values[-1, :] - values[-2, :]) / (r[-1] - r[-2])
+    out[0, :] = values[0, :] + m0 * (ri[0] - r[0])
+    out[-1, :] = values[-1, :] + m1 * (ri[-1] - r[-1])
+    return out
+
+
+def _interp_to_interfaces_cupy(values, r, ri):
+    values = _field_data(values)
+    r = _field_data(r)
+    ri = _field_data(ri)
+    if cp is None or cp_interp1d is None:
+        return _interp_to_interfaces_numpy(values, r, ri)
+    f = cp_interp1d(
+        cp.asarray(r),
+        cp.asarray(values),
+        kind="linear",
+        axis=0,
+        bounds_error=False,
+        fill_value="extrapolate",
+    )
+    return f(cp.asarray(ri))
+
+
+def _interp_to_interfaces(values, r, ri):
+    return _K_INTERP_TO_INTERFACES(values, r, ri)
+
+
+def _F_diff_fortran(sim, Sigma=None):
+    if Sigma is None:
+        Sigma = sim.dust.Sigma
+    Fi = _dust_f_call(
+        dust_f.fi_diff,
+        sim.dust.D,
+        Sigma,
+        sim.gas.Sigma,
+        sim.dust.St,
+        xp.sqrt(sim.dust.delta.rad * sim.gas.cs**2),
+        sim.grid.r,
+        sim.grid.ri,
+    )
+    Fi[:1, :] = 0.
+    Fi[-1:, :] = 0.
+    return Fi
+
+
+def _F_diff_cupy(sim, Sigma=None):
+    if Sigma is None:
+        Sigma = sim.dust.Sigma
+
+    D = _field_data(sim.dust.D)
+    SigmaD = _field_data(Sigma)
+    SigmaG = _field_data(sim.gas.Sigma)
+    St = _field_data(sim.dust.St)
+    u = _field_data(xp.sqrt(sim.dust.delta.rad * sim.gas.cs**2))
+    r = _field_data(sim.grid.r)
+    ri = _field_data(sim.grid.ri)
+
+    SigGi = _interp_to_interfaces(SigmaG, r, ri)
+    ui = _interp_to_interfaces(u, r, ri)
+    Di = _interp_to_interfaces(D, r, ri)
+    SigDi = _interp_to_interfaces(SigmaD, r, ri)
+    Sti = _interp_to_interfaces(St, r, ri)
+
+    eps = SigmaD / SigmaG[:, None]
+    gradepsi = xp.zeros_like(SigDi)
+    gradepsi[1:-1, :] = (eps[1:, :] - eps[:-1, :]) / (r[1:] - r[:-1])[:, None]
+
+    Fi = xp.zeros_like(SigDi)
+
+    w = ui[1:-1, None] * SigDi[1:-1, :] / (1.0 + Sti[1:-1, :]**2)
+    Fi0 = -Di[1:-1, :] * SigGi[1:-1, None] * gradepsi[1:-1, :]
+
+    mask = xp.abs(w) > 0.0
+    P = xp.zeros_like(Fi0)
+    P[mask] = xp.abs(Fi0[mask] / w[mask])
+    lam = (1.0 + P) / (1.0 + P + P**2)
+
+    Fi_int = lam * Fi0
+    Fi_int = xp.where(mask, Fi_int, w)
+    Fi[1:-1, :] = Fi_int
+
+    Fi[0, :] = Fi[1, :]
+    Fi[-1, :] = Fi[-2, :]
+
+    # Preserve current dust.py behavior at boundaries.
+    Fi[:1, :] = 0.
+    Fi[-1:, :] = 0.
+    return Fi
+
+
+def _S_hyd_fortran(sim, Sigma=None):
+    if Sigma is None:
+        Sigma = sim.dust.Sigma
+        Fi = sim.dust.Fi.tot
+    else:
+        Fi = sim.dust.Fi.tot.updater.beat(sim, Sigma=Sigma)
+        if Fi is None:
+            Fi = sim.dust.Fi.tot
+    return _dust_f_call(dust_f.s_hyd, Fi, sim.grid.ri)
+
+
+def _S_hyd_cupy(sim, Sigma=None):
+    if Sigma is None:
+        Sigma = sim.dust.Sigma
+        Fi = sim.dust.Fi.tot
+    else:
+        Fi = sim.dust.Fi.tot.updater.beat(sim, Sigma=Sigma)
+        if Fi is None:
+            Fi = sim.dust.Fi.tot
+    Fi = _field_data(Fi)
+    ri = _field_data(sim.grid.ri)
+    denom = (ri[1:]**2 - ri[:-1]**2)[:, None]
+    return 2.0 * (Fi[:-1, :] * ri[:-1, None] - Fi[1:, :] * ri[1:, None]) / denom
+
+
+def _S_coag_fortran(sim, Sigma=None):
+    if Sigma is None:
+        Sigma = sim.dust.Sigma
+    return _dust_f_call(
+        dust_f.s_coag,
+        sim.dust.coagulation.stick,
+        sim.dust.coagulation.stick_ind,
+        sim.dust.coagulation.A,
+        sim.dust.coagulation.eps,
+        sim.dust.coagulation.lf_ind,
+        sim.dust.coagulation.rm_ind,
+        sim.dust.coagulation.phi,
+        sim.dust.kernel * sim.dust.p.frag,
+        sim.dust.kernel * sim.dust.p.stick,
+        sim.grid.m,
+        Sigma,
+        sim.dust.SigmaFloor,
+    )
+
+
+def _get_coag_pair_indices(Nm):
+    """Cache lower-triangle (j <= i) pair indices for coagulation scatters."""
+    global _COAG_PAIR_CACHE_KEY, _COAG_PAIR_CACHE_VALUE
+    if _COAG_PAIR_CACHE_KEY != Nm or _COAG_PAIR_CACHE_VALUE is None:
+        j_np, i_np = np.tril_indices(Nm)
+        if cp is None:
+            _COAG_PAIR_CACHE_VALUE = (j_np, i_np)
+        else:
+            _COAG_PAIR_CACHE_VALUE = (
+                cp.asarray(j_np, dtype=cp.int64),
+                cp.asarray(i_np, dtype=cp.int64),
+            )
+        _COAG_PAIR_CACHE_KEY = Nm
+    return _COAG_PAIR_CACHE_VALUE
+
+
+def _get_scoag_pair_map(Nm, p, imax):
+    """Cache S_coag pair/erosion masks for each imax."""
+    global _SCOAG_PAIRMAP_CACHE_KEY, _SCOAG_PAIRMAP_CACHE_VALUE
+    key = (int(Nm), int(p))
+    if _SCOAG_PAIRMAP_CACHE_KEY != key or _SCOAG_PAIRMAP_CACHE_VALUE is None:
+        _SCOAG_PAIRMAP_CACHE_KEY = key
+        _SCOAG_PAIRMAP_CACHE_VALUE = [None] * (int(Nm) + 1)
+
+    imax = int(imax)
+    cached = _SCOAG_PAIRMAP_CACHE_VALUE[imax]
+    if cached is None:
+        j_all, i_all = _get_coag_pair_indices(Nm)
+        pair_mask = i_all < imax
+        i_tri = i_all[pair_mask]
+        j_tri = j_all[pair_mask]
+        eros_mask = j_tri <= (i_tri - int(p) - 1)
+        i_er = i_tri[eros_mask]
+        j_er = j_tri[eros_mask]
+        i_full = i_tri[~eros_mask]
+        j_full = j_tri[~eros_mask]
+        cached = (i_tri, j_tri, i_er, j_er, i_full, j_full)
+        _SCOAG_PAIRMAP_CACHE_VALUE[imax] = cached
+    return cached
+
+
+def _get_frag_p(krm, Nm):
+    """Cache fragmentation helper p derived from krm[:, -1] == -1."""
+    global _FRAG_P_CACHE_KEY, _FRAG_P_CACHE_VALUE
+    key = (int(Nm), id(krm))
+    if _FRAG_P_CACHE_KEY == key and _FRAG_P_CACHE_VALUE is not None:
+        return _FRAG_P_CACHE_VALUE
+
+    mask_last = (krm[:, -1] == -1)
+    if bool(cp.any(mask_last)):
+        first_true = int(cp.argmax(mask_last).item())
+        p = int(Nm - first_true - 1)
+    else:
+        p = int(Nm)
+
+    _FRAG_P_CACHE_KEY = key
+    _FRAG_P_CACHE_VALUE = p
+    return p
+
+
+def _get_mass_grid_q(m, Nm):
+    """Cache Jacobian q derived from mass-grid spacing."""
+    global _MGRID_Q_CACHE_KEY, _MGRID_Q_CACHE_VALUE
+    key = (int(Nm), id(m))
+    if _MGRID_Q_CACHE_KEY == key and _MGRID_Q_CACHE_VALUE is not None:
+        return _MGRID_Q_CACHE_VALUE
+
+    if cp is not None and isinstance(m, cp.ndarray):
+        agrid = float((cp.log10(m[0] / m[-1]) / (1.0 - Nm)).item())
+    else:
+        agrid = math.log10(float(m[0]) / float(m[-1])) / (1.0 - Nm)
+    q = int(math.ceil(math.log10(2.0) / agrid))
+    _MGRID_Q_CACHE_KEY = key
+    _MGRID_Q_CACHE_VALUE = q
+    return q
+
+
+def _get_scoag_precomp(cstick, cstick_ind, A, eps, klf, krm, phi, m, Nm):
+    """Cache static pair/mask maps for _S_coag_cupy."""
+    global _SCOAG_PRECOMP_CACHE_KEY, _SCOAG_PRECOMP_CACHE_VALUE
+    disable_cache = os.getenv("DUSTPY_DISABLE_SCOAG_PRECOMP", "0").strip() == "1"
+    key = (
+        int(Nm),
+        id(cstick),
+        id(cstick_ind),
+        id(A),
+        id(eps),
+        id(klf),
+        id(krm),
+        id(phi),
+        id(m),
+    )
+    if (not disable_cache) and _SCOAG_PRECOMP_CACHE_KEY == key and _SCOAG_PRECOMP_CACHE_VALUE is not None:
+        return _SCOAG_PRECOMP_CACHE_VALUE
+
+    i_idx, j_idx = _get_coag_pair_indices(Nm)
+    klf_p = klf[j_idx, i_idx]
+    A_p = A[j_idx, i_idx]
+    krm_p = krm[j_idx, i_idx]
+    eps_p = eps[j_idx, i_idx]
+
+    p_val = _get_frag_p(krm, Nm)
+    erosion_p = j_idx <= (i_idx - p_val - 1)
+    fullfrag_p = ~erosion_p
+    ero_case1 = erosion_p & (krm_p == i_idx - 1)
+    ero_case2 = erosion_p & ~ero_case1
+
+    stick_maps = []
+    for nz in range(4):
+        k = cstick_ind[nz, j_idx, i_idx]
+        valid = cp.where(k >= 0)[0]
+        if int(valid.size) > 0:
+            stick_maps.append(
+                (
+                    k[valid],
+                    cstick[nz, j_idx, i_idx][valid],
+                    valid,
+                )
+            )
+        else:
+            stick_maps.append((None, None, None))
+
+    frag_valid = cp.where(klf_p >= 0)[0]
+    if int(frag_valid.size) > 0:
+        klf_v = klf_p[frag_valid]
+        A_v = A_p[frag_valid]
+    else:
+        klf_v = None
+        A_v = None
+
+    c1 = cp.where(ero_case1)[0]
+    c2 = cp.where(ero_case2)[0]
+    ff = cp.where(fullfrag_p)[0]
+
+    pre = {
+        "i_idx": i_idx,
+        "j_idx": j_idx,
+        "krm_p": krm_p,
+        "eps_p": eps_p,
+        "stick_maps": stick_maps,
+        "frag_valid": frag_valid,
+        "klf_v": klf_v,
+        "A_v": A_v,
+        "c1": c1,
+        "c2": c2,
+        "ff": ff,
+        "phi_lower": cp.tril(phi),
+    }
+    if not disable_cache:
+        _SCOAG_PRECOMP_CACHE_KEY = key
+        _SCOAG_PRECOMP_CACHE_VALUE = pre
+    return pre
+
+
+def _active_imax_per_radius(Sigma, SigmaFloor):
+    """Return per-radius active imax from Sigma > SigmaFloor as host int array."""
+    active = Sigma > SigmaFloor
+    if cp is not None and isinstance(active, cp.ndarray):
+        any_active = cp.any(active, axis=1)
+        last_from_end = cp.argmax(active[:, ::-1], axis=1)
+        imax = cp.where(any_active, Sigma.shape[1] - last_from_end, 0).astype(cp.int64)
+        return cp.asnumpy(imax)
+    any_active = np.any(active, axis=1)
+    last_from_end = np.argmax(active[:, ::-1], axis=1)
+    return np.where(any_active, Sigma.shape[1] - last_from_end, 0).astype(np.int64)
+
+
+def _S_coag_cupy(sim, Sigma=None):
+    if cp is None:
+        return _S_coag_fortran(sim, Sigma=Sigma)
+
+    if Sigma is None:
+        Sigma = sim.dust.Sigma
+
+    global _COAG_CACHE_KEY, _COAG_CACHE_VALUE
+    cache_key = (
+        id(_field_data(sim.dust.coagulation.stick)),
+        id(_field_data(sim.dust.coagulation.stick_ind)),
+        id(_field_data(sim.dust.coagulation.A)),
+        id(_field_data(sim.dust.coagulation.eps)),
+        id(_field_data(sim.dust.coagulation.lf_ind)),
+        id(_field_data(sim.dust.coagulation.rm_ind)),
+        id(_field_data(sim.dust.coagulation.phi)),
+        id(_field_data(sim.grid.m)),
+    )
+    if _COAG_CACHE_KEY != cache_key or _COAG_CACHE_VALUE is None:
+        _COAG_CACHE_KEY = cache_key
+        _COAG_CACHE_VALUE = (
+            cp.asarray(_field_data(sim.dust.coagulation.stick)),
+            cp.asarray(_field_data(sim.dust.coagulation.stick_ind)),
+            cp.asarray(_field_data(sim.dust.coagulation.A)),
+            cp.asarray(_field_data(sim.dust.coagulation.eps)),
+            cp.asarray(_field_data(sim.dust.coagulation.lf_ind)),
+            cp.asarray(_field_data(sim.dust.coagulation.rm_ind)),
+            cp.asarray(_field_data(sim.dust.coagulation.phi)),
+            cp.asarray(_field_data(sim.grid.m)),
+        )
+
+    cstick, cstick_ind, A, eps, klf, krm, phi, m = _COAG_CACHE_VALUE
+    Kf = cp.asarray(_field_data(sim.dust.kernel * sim.dust.p.frag))
+    Ks = cp.asarray(_field_data(sim.dust.kernel * sim.dust.p.stick))
+    SigmaArr = cp.asarray(_field_data(Sigma))
+    SigmaFloor = cp.asarray(_field_data(sim.dust.SigmaFloor))
+
+    Nr, Nm = SigmaArr.shape
+    Nr_int = Nr - 2
+    if Nr_int <= 0:
+        return cp.zeros_like(SigmaArr)
+
+    pre = _get_scoag_precomp(cstick, cstick_ind, A, eps, klf, krm, phi, m, Nm)
+    i_idx = pre["i_idx"]
+    j_idx = pre["j_idx"]
+    krm_p = pre["krm_p"]
+    eps_p = pre["eps_p"]
+
+    S_flat = cp.zeros(Nr_int * Nm, dtype=SigmaArr.dtype)
+    As_flat = cp.zeros(Nr_int * Nm, dtype=SigmaArr.dtype)
+    ir_offsets = cp.arange(Nr_int, dtype=cp.int64)[:, None] * Nm
+
+    # Active-pair mask by interior radial cell.
+    active = SigmaArr[1:-1] > SigmaFloor[1:-1]
+    any_active = cp.any(active, axis=1)
+    imax_arr = cp.where(any_active, Nm - cp.argmax(active[:, ::-1], axis=1), 0)
+    p_active = i_idx[None, :] < imax_arr[:, None]
+
+    n_all = SigmaArr[1:-1] / m[None, :]
+    Rs_all = Ks[1:-1, j_idx, i_idx] * n_all[:, j_idx] * n_all[:, i_idx]
+    Rf_all = Kf[1:-1, j_idx, i_idx] * n_all[:, j_idx] * n_all[:, i_idx]
+    Rs_all = Rs_all * p_active
+    Rf_all = Rf_all * p_active
+
+    # Sticking contribution.
+    for k_v, c_v, valid in pre["stick_maps"]:
+        if k_v is None:
+            continue
+        rates = Rs_all[:, valid]
+        targets = ir_offsets + k_v[None, :]
+        _scatter_add_1d(S_flat, targets.ravel(), (c_v[None, :] * rates).ravel())
+
+    # Fragment distribution contribution.
+    frag_valid = pre["frag_valid"]
+    if int(frag_valid.size) > 0:
+        klf_v = pre["klf_v"]
+        A_v = pre["A_v"]
+        rates_f = Rf_all[:, frag_valid]
+        targets = ir_offsets + klf_v[None, :]
+        _scatter_add_1d(As_flat, targets.ravel(), (A_v[None, :] * rates_f).ravel())
+
+    As = As_flat.reshape(Nr_int, Nm)
+    S_flat += ((As @ pre["phi_lower"]) / m[None, :]).ravel()
+
+    # Erosion case 1: krm == i - 1.
+    c1 = pre["c1"]
+    if int(c1.size) > 0:
+        krm_c1 = krm_p[c1]
+        j_c1 = j_idx[c1]
+        eps_c1 = eps_p[c1]
+        rate_c1 = Rf_all[:, c1]
+        _scatter_add_1d(S_flat, (ir_offsets + krm_c1[None, :]).ravel(), (eps_c1[None, :] * rate_c1).ravel())
+        _scatter_add_1d(S_flat, (ir_offsets + krm_c1[None, :] + 1).ravel(), (-eps_c1[None, :] * rate_c1).ravel())
+        _scatter_add_1d(S_flat, (ir_offsets + j_c1[None, :]).ravel(), (-rate_c1).ravel())
+
+    # Erosion case 2: krm != i - 1.
+    c2 = pre["c2"]
+    if int(c2.size) > 0:
+        i_c2 = i_idx[c2]
+        j_c2 = j_idx[c2]
+        krm_c2 = krm_p[c2]
+        eps_c2 = eps_p[c2]
+        rate_c2 = Rf_all[:, c2]
+        _scatter_add_1d(S_flat, (ir_offsets + krm_c2[None, :]).ravel(), (eps_c2[None, :] * rate_c2).ravel())
+        _scatter_add_1d(S_flat, (ir_offsets + krm_c2[None, :] + 1).ravel(), ((1.0 - eps_c2[None, :]) * rate_c2).ravel())
+        _scatter_add_1d(S_flat, (ir_offsets + i_c2[None, :]).ravel(), (-rate_c2).ravel())
+        _scatter_add_1d(S_flat, (ir_offsets + j_c2[None, :]).ravel(), (-rate_c2).ravel())
+
+    # Full fragmentation.
+    ff = pre["ff"]
+    if int(ff.size) > 0:
+        i_ff = i_idx[ff]
+        j_ff = j_idx[ff]
+        rate_ff = Rf_all[:, ff]
+        _scatter_add_1d(S_flat, (ir_offsets + i_ff[None, :]).ravel(), (-rate_ff).ravel())
+        _scatter_add_1d(S_flat, (ir_offsets + j_ff[None, :]).ravel(), (-rate_ff).ravel())
+
+    S = cp.zeros_like(SigmaArr)
+    S[1:-1] = S_flat.reshape(Nr_int, Nm) * m[None, :]
+    return S
+
+
+def _get_jcoag_const_numpy(sim):
+    """Return cached NumPy constants for jacobian_coagulation_generator."""
+    global _JCOAG_CONST_CACHE_KEY, _JCOAG_CONST_CACHE_VALUE
+
+    key = (
+        id(_field_data(sim.dust.coagulation.A)),
+        id(_field_data(sim.dust.coagulation.stick)),
+        id(_field_data(sim.dust.coagulation.eps)),
+        id(_field_data(sim.dust.coagulation.lf_ind)),
+        id(_field_data(sim.dust.coagulation.rm_ind)),
+        id(_field_data(sim.dust.coagulation.stick_ind)),
+        id(_field_data(sim.grid.m)),
+        id(_field_data(sim.dust.coagulation.phi)),
+        id(_field_data(sim.dust.SigmaFloor)),
+    )
+    if _JCOAG_CONST_CACHE_KEY != key or _JCOAG_CONST_CACHE_VALUE is None:
+        _JCOAG_CONST_CACHE_KEY = key
+        _JCOAG_CONST_CACHE_VALUE = (
+            to_numpy(_field_data(sim.dust.coagulation.A)),
+            to_numpy(_field_data(sim.dust.coagulation.stick)),
+            to_numpy(_field_data(sim.dust.coagulation.eps)),
+            to_numpy(_field_data(sim.dust.coagulation.lf_ind)),
+            to_numpy(_field_data(sim.dust.coagulation.rm_ind)),
+            to_numpy(_field_data(sim.dust.coagulation.stick_ind)),
+            to_numpy(_field_data(sim.grid.m)),
+            to_numpy(_field_data(sim.dust.coagulation.phi)),
+            to_numpy(_field_data(sim.dust.SigmaFloor)),
+        )
+    return _JCOAG_CONST_CACHE_VALUE
+
+
+def _get_jcoag_pattern(Nr, Nm, q):
+    """Return cached sparse-pattern helpers for coagulation Jacobian packing."""
+    global _JCOAG_PATTERN_CACHE_KEY, _JCOAG_PATTERN_CACHE_VALUE
+    key = (int(Nr), int(Nm), int(q))
+    if _JCOAG_PATTERN_CACHE_KEY == key and _JCOAG_PATTERN_CACHE_VALUE is not None:
+        return _JCOAG_PATTERN_CACHE_VALUE
+
+    row_local = []
+    col_local = []
+    src_i = []
+    src_j = []
+    for i in range(Nm):
+        s = max(i - q, 0)
+        for j in range(s, Nm):
+            row_local.append(i)
+            col_local.append(j)
+            src_i.append(i)
+            src_j.append(j)
+
+    row_local = np.asarray(row_local, dtype=np.int64)
+    col_local = np.asarray(col_local, dtype=np.int64)
+    src_i = np.asarray(src_i, dtype=np.int64)
+    src_j = np.asarray(src_j, dtype=np.int64)
+    L = int(src_i.shape[0])
+
+    starts = (np.arange(1, Nr - 1, dtype=np.int64) * Nm)
+    row = (starts[:, None] + row_local[None, :]).reshape(-1)
+    col = (starts[:, None] + col_local[None, :]).reshape(-1)
+
+    _JCOAG_PATTERN_CACHE_KEY = key
+    _JCOAG_PATTERN_CACHE_VALUE = (src_i, src_j, row, col, L)
+    return _JCOAG_PATTERN_CACHE_VALUE
+
+
+def _get_jcoag_pattern_cupy(Nr, Nm, q):
+    """Return cached CuPy sparse-pattern helpers for coagulation Jacobian packing."""
+    global _JCOAG_PATTERN_GPU_CACHE_KEY, _JCOAG_PATTERN_GPU_CACHE_VALUE
+    global _JSTICK_MAP_CACHE_KEY, _JSTICK_MAP_CACHE_VALUE
+    key = (int(Nr), int(Nm), int(q))
+    if _JCOAG_PATTERN_GPU_CACHE_KEY == key and _JCOAG_PATTERN_GPU_CACHE_VALUE is not None:
+        return _JCOAG_PATTERN_GPU_CACHE_VALUE
+
+    src_i, src_j, row, col, L = _get_jcoag_pattern(Nr, Nm, q)
+    _JCOAG_PATTERN_GPU_CACHE_KEY = key
+    _JCOAG_PATTERN_GPU_CACHE_VALUE = (
+        cp.asarray(src_i),
+        cp.asarray(src_j),
+        cp.asarray(row),
+        cp.asarray(col),
+        L,
+    )
+    return _JCOAG_PATTERN_GPU_CACHE_VALUE
+
+
+def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
+    """Cache Jacobian scatter targets/constants to avoid per-step host transfers."""
+    global _JCOAG_PRECOMP_CACHE_KEY, _JCOAG_PRECOMP_CACHE_VALUE
+    Nm = int(m.shape[0])
+    key = (int(Nm), id(A), id(cStick), id(eps), id(iLF), id(iRM), id(iStick), id(m), id(phi))
+    if _JCOAG_PRECOMP_CACHE_KEY == key and _JCOAG_PRECOMP_CACHE_VALUE is not None:
+        return _JCOAG_PRECOMP_CACHE_VALUE
+
+    iStick_cpu = cp.asnumpy(iStick)
+    cStick_cpu = cp.asnumpy(cStick)
+    iLF_cpu = cp.asnumpy(iLF)
+    iRM_cpu = cp.asnumpy(iRM)
+    A_cpu = cp.asnumpy(A)
+    eps_cpu = cp.asnumpy(eps)
+    m_cpu = cp.asnumpy(m)
+    phi_cpu = cp.asnumpy(phi)
+
+    agrid = float(np.log10(m_cpu[0] / m_cpu[Nm - 1])) / (1.0 - Nm)
+    q = int(np.ceil(np.log10(2.0) / agrid))
+
+    neg1_col = iRM_cpu[:, Nm - 1]
+    neg1_positions = np.where(neg1_col == -1)[0]
+    p_val = int(Nm - (neg1_positions[0] + 1)) if len(neg1_positions) > 0 else 0
+    D_cpu = m_cpu[:, None] / m_cpu[None, :]
+
+    tri = np.tri(Nm, dtype=bool)
+    i_all, j_all = np.nonzero(tri)
+
+    stick_targets = []
+    for l in range(4):
+        k_all = iStick_cpu[l, j_all, i_all]
+        valid = k_all >= 0
+        valid_idx = np.where(valid)[0]
+        k_v = k_all[valid]
+        i_v = i_all[valid]
+        coeff_v = D_cpu[k_v, i_v] * cStick_cpu[l, j_all[valid], i_all[valid]]
+        flat = k_v * Nm + i_v
+        stick_targets.append(
+            (
+                cp.asarray(flat.astype(np.int64)),
+                cp.asarray(coeff_v),
+                cp.asarray(valid_idx.astype(np.int64)),
+            )
+        )
+
+    klf_vals = iLF_cpu[j_all, i_all]
+    frag_valid = klf_vals >= 0
+    klf_v = klf_vals[frag_valid]
+    A_v = A_cpu[j_all[frag_valid], i_all[frag_valid]]
+    m_i_v = m_cpu[i_all[frag_valid]]
+    i_frag = i_all[frag_valid]
+    n_frag = int(np.sum(frag_valid))
+    frag_dist_gpu = cp.asarray((A_v[:, None] * phi_cpu[klf_v, :]) / m_i_v[:, None])
+    k_range = np.arange(Nm)
+    frag_flat_gpu = cp.asarray((k_range[:, None] * Nm + i_frag[None, :]).ravel().astype(np.int64))
+
+    is_erosion = j_all <= i_all - p_val - 1
+    ero_idx = np.where(is_erosion)[0]
+    ero_i = i_all[ero_idx]
+    ero_j = j_all[ero_idx]
+    ero_krm = iRM_cpu[ero_j, ero_i]
+    ero_eps = eps_cpu[ero_j, ero_i]
+    case1 = ero_krm == ero_i - 1
+    case2 = ~case1
+
+    c1_i = ero_i[case1]
+    c1_j = ero_j[case1]
+    c1_eps = ero_eps[case1]
+    c1_pair_idx = ero_idx[case1]
+    if len(c1_i) > 0:
+        c1_flat_parts = (
+            cp.asarray(((c1_i - 1) * Nm + c1_i).astype(np.int64)),
+            cp.asarray((c1_i * Nm + c1_i).astype(np.int64)),
+            cp.asarray((c1_j * Nm + c1_i).astype(np.int64)),
+        )
+        c1_coeff_parts = (
+            cp.asarray(D_cpu[c1_i - 1, c1_i] * c1_eps),
+            cp.asarray(-c1_eps),
+            cp.asarray(-D_cpu[c1_j, c1_i]),
+        )
+        c1_pair_idx_gpu = cp.asarray(c1_pair_idx.astype(np.int64))
+    else:
+        c1_flat_parts = c1_coeff_parts = c1_pair_idx_gpu = None
+
+    c2_i = ero_i[case2]
+    c2_j = ero_j[case2]
+    c2_eps = ero_eps[case2]
+    c2_krm = ero_krm[case2]
+    c2_pair_idx = ero_idx[case2]
+    if len(c2_i) > 0:
+        c2_flat_parts = (
+            cp.asarray((c2_krm * Nm + c2_i).astype(np.int64)),
+            cp.asarray(((c2_krm + 1) * Nm + c2_i).astype(np.int64)),
+            cp.asarray((c2_i * Nm + c2_i).astype(np.int64)),
+            cp.asarray((c2_j * Nm + c2_i).astype(np.int64)),
+        )
+        c2_coeff_parts = (
+            cp.asarray(D_cpu[c2_krm, c2_i] * c2_eps),
+            cp.asarray(D_cpu[c2_krm + 1, c2_i] * (1.0 - c2_eps)),
+            cp.asarray(-np.ones(len(c2_i))),
+            cp.asarray(-D_cpu[c2_j, c2_i]),
+        )
+        c2_pair_idx_gpu = cp.asarray(c2_pair_idx.astype(np.int64))
+    else:
+        c2_flat_parts = c2_coeff_parts = c2_pair_idx_gpu = None
+
+    ff_idx = np.where(~is_erosion)[0]
+    ff_i = i_all[ff_idx]
+    ff_j = j_all[ff_idx]
+    if len(ff_i) > 0:
+        ff_flat_parts = (
+            cp.asarray((ff_i * Nm + ff_i).astype(np.int64)),
+            cp.asarray((ff_j * Nm + ff_i).astype(np.int64)),
+        )
+        ff_coeff_parts = (
+            cp.asarray(-np.ones(len(ff_i))),
+            cp.asarray(-D_cpu[ff_j, ff_i]),
+        )
+        ff_pair_idx_gpu = cp.asarray(ff_idx.astype(np.int64))
+    else:
+        ff_flat_parts = ff_coeff_parts = ff_pair_idx_gpu = None
+
+    pre = {
+        "q": q,
+        "j_gpu": cp.asarray(j_all.astype(np.int64)),
+        "i_gpu": cp.asarray(i_all.astype(np.int64)),
+        "stick_targets": stick_targets,
+        "frag_valid_gpu": cp.asarray(np.where(frag_valid)[0].astype(np.int64)),
+        "frag_dist_gpu": frag_dist_gpu,
+        "frag_flat_gpu": frag_flat_gpu,
+        "n_frag": n_frag,
+        "c1_flat_parts": c1_flat_parts,
+        "c1_coeff_parts": c1_coeff_parts,
+        "c1_pair_idx_gpu": c1_pair_idx_gpu,
+        "c2_flat_parts": c2_flat_parts,
+        "c2_coeff_parts": c2_coeff_parts,
+        "c2_pair_idx_gpu": c2_pair_idx_gpu,
+        "ff_flat_parts": ff_flat_parts,
+        "ff_coeff_parts": ff_coeff_parts,
+        "ff_pair_idx_gpu": ff_pair_idx_gpu,
+    }
+    _JCOAG_PRECOMP_CACHE_KEY = key
+    _JCOAG_PRECOMP_CACHE_VALUE = pre
+    return pre
+
+
+def _get_boundary_basis_cupy(Nr, Nm, dtype):
+    """Return cached sparse basis matrices for dust inner/outer boundaries."""
+    global _BOUNDARY_BASIS_CACHE_KEY, _BOUNDARY_BASIS_CACHE_VALUE
+    key = (int(Nr), int(Nm), str(dtype))
+    if _BOUNDARY_BASIS_CACHE_KEY == key and _BOUNDARY_BASIS_CACHE_VALUE is not None:
+        return _BOUNDARY_BASIS_CACHE_VALUE
+
+    Ntot = int(Nr * Nm)
+    row0 = cp.arange(int(Nm), dtype=cp.int64)
+    offset = int((Nr - 1) * Nm)
+    one = cp.ones((int(Nm),), dtype=dtype)
+
+    Bin0 = cp_sparse.csr_matrix((one, (row0, row0)), shape=(Ntot, Ntot))
+    Bin1 = cp_sparse.csr_matrix((one, (row0, row0 + int(Nm))), shape=(Ntot, Ntot))
+    Bin2 = cp_sparse.csr_matrix((one, (row0, row0 + int(2 * Nm))), shape=(Ntot, Ntot))
+
+    row_out = row0 + offset
+    Bout0 = cp_sparse.csr_matrix((one, (row_out, row_out)), shape=(Ntot, Ntot))
+    Bout1 = cp_sparse.csr_matrix((one, (row_out, row_out - int(Nm))), shape=(Ntot, Ntot))
+    Bout2 = cp_sparse.csr_matrix((one, (row_out, row_out - int(2 * Nm))), shape=(Ntot, Ntot))
+
+    _BOUNDARY_BASIS_CACHE_KEY = key
+    _BOUNDARY_BASIS_CACHE_VALUE = (Bin0, Bin1, Bin2, Bout0, Bout1, Bout2)
+    return _BOUNDARY_BASIS_CACHE_VALUE
+
+
+def _get_jstick_map_cupy(iStick, cStick, Nm):
+    """Cache static sticking scatter maps per i: (kv, jv, cv)."""
+    global _JSTICK_MAP_CACHE_KEY, _JSTICK_MAP_CACHE_VALUE
+    key = (int(Nm), id(iStick), id(cStick))
+    if _JSTICK_MAP_CACHE_KEY == key and _JSTICK_MAP_CACHE_VALUE is not None:
+        return _JSTICK_MAP_CACHE_VALUE
+
+    maps = []
+    for i in range(int(Nm)):
+        j_idx = cp.arange(i + 1, dtype=cp.int64)
+        k4 = iStick[:, j_idx, i]
+        c4 = cStick[:, j_idx, i]
+        valid = k4 >= 0
+        kv = k4[valid]
+        jv = cp.broadcast_to(j_idx[None, :], k4.shape)[valid]
+        cv = c4[valid]
+        maps.append((kv, jv, cv))
+
+    _JSTICK_MAP_CACHE_KEY = key
+    _JSTICK_MAP_CACHE_VALUE = maps
+    return maps
+
+
+def _get_jfrag_map_cupy(A, eps, iLF, iRM, Nm, p):
+    """Cache static fragmentation maps per i."""
+    global _JFRAG_MAP_CACHE_KEY, _JFRAG_MAP_CACHE_VALUE
+    key = (int(Nm), int(p), id(A), id(eps), id(iLF), id(iRM))
+    if _JFRAG_MAP_CACHE_KEY == key and _JFRAG_MAP_CACHE_VALUE is not None:
+        return _JFRAG_MAP_CACHE_VALUE
+
+    maps = []
+    for i in range(int(Nm)):
+        j_idx = cp.arange(i + 1, dtype=cp.int64)
+        a_i = A[j_idx, i]
+        lf_i = iLF[j_idx, i]
+
+        eros_idx = j_idx <= (i - int(p) - 1)
+        j_er = j_idx[eros_idx]
+        k_er = iRM[j_er, i]
+        eps_er = eps[j_er, i]
+        eq_er = k_er == (i - 1)
+
+        j_full = j_idx[~eros_idx]
+        maps.append((a_i, lf_i, j_er, k_er, eps_er, eq_er, j_full))
+
+    _JFRAG_MAP_CACHE_KEY = key
+    _JFRAG_MAP_CACHE_VALUE = maps
+    return maps
+
+
+def _get_jcoag_work_buffer(Nr, Nm, dtype):
+    """Cache reusable Jacobian work buffer to reduce allocator churn."""
+    global _JCOAG_WORK_CACHE_KEY, _JCOAG_WORK_CACHE_VALUE
+    key = (int(Nr), int(Nm), str(dtype))
+    if _JCOAG_WORK_CACHE_KEY != key or _JCOAG_WORK_CACHE_VALUE is None:
+        _JCOAG_WORK_CACHE_KEY = key
+        _JCOAG_WORK_CACHE_VALUE = cp.zeros((int(Nr), int(Nm), int(Nm)), dtype=dtype)
+    else:
+        _JCOAG_WORK_CACHE_VALUE.fill(0.0)
+    return _JCOAG_WORK_CACHE_VALUE
+
+
+def _get_jcoag_row_offsets(Nr_int, Nm):
+    """Cache flattened row offsets for Jacobian chunk scatters."""
+    global _JCOAG_ROWOFF_CACHE_KEY, _JCOAG_ROWOFF_CACHE_VALUE
+    key = (int(Nr_int), int(Nm))
+    if _JCOAG_ROWOFF_CACHE_KEY != key or _JCOAG_ROWOFF_CACHE_VALUE is None:
+        row_stride = int(Nm * Nm)
+        _JCOAG_ROWOFF_CACHE_KEY = key
+        _JCOAG_ROWOFF_CACHE_VALUE = cp.arange(int(Nr_int), dtype=cp.int64) * row_stride
+    return _JCOAG_ROWOFF_CACHE_VALUE
+
+
+def _jacobian_coagulation_generator_cupy(
+    A, cStick, eps, iLF, iRM, iStick, m, phi, Rf, Rs, Sigma, SigmaFloor
+):
+    """CuPy-native equivalent of dust_f.jacobian_coagulation_generator."""
+    A = cp.asarray(_field_data(A))
+    cStick = cp.asarray(_field_data(cStick))
+    eps = cp.asarray(_field_data(eps))
+    iLF = cp.asarray(_field_data(iLF))
+    iRM = cp.asarray(_field_data(iRM))
+    iStick = cp.asarray(_field_data(iStick))
+    m = cp.asarray(_field_data(m))
+    phi = cp.asarray(_field_data(phi))
+    Rf = cp.asarray(_field_data(Rf))
+    Rs = cp.asarray(_field_data(Rs))
+    Sigma = cp.asarray(_field_data(Sigma))
+    SigmaFloor = cp.asarray(_field_data(SigmaFloor))
+
+    Nr = int(Sigma.shape[0])
+    Nm = int(Sigma.shape[1])
+    N = Sigma / m[None, :]
+
+    pre = _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi)
+    q = pre["q"]
+    j_gpu = pre["j_gpu"]
+    i_gpu = pre["i_gpu"]
+    stick_targets = pre["stick_targets"]
+
+    if _JCOAG_WORKBUF_MODE == "reuse":
+        jac = _get_jcoag_work_buffer(Nr, Nm, Sigma.dtype)
+    else:
+        jac = cp.zeros((Nr, Nm, Nm), dtype=Sigma.dtype)
+
+    Nr_int = Nr - 2
+    jac_mid_flat = jac[1:-1].reshape(-1)
+    n_mid = N[1:-1]
+    Rs_mid = Rs[1:-1]
+    Rf_mid = Rf[1:-1]
+    row_offsets_all = _get_jcoag_row_offsets(Nr_int, Nm)
+
+    # Chunk over radius to reduce Python/kernel-launch overhead while keeping
+    # temporary allocations bounded on large production grids.
+    chunk_size = _get_jcoag_chunk_size(Nr_int, Nm)
+    for start in range(0, Nr_int, chunk_size):
+        stop = min(start + chunk_size, Nr_int)
+        span = stop - start
+        row_offsets = row_offsets_all[start:stop, None]
+
+        rates_s = n_mid[start:stop, j_gpu] * Rs_mid[start:stop, j_gpu, i_gpu]
+        ratef = n_mid[start:stop, j_gpu] * Rf_mid[start:stop, j_gpu, i_gpu]
+
+        for flat, coeff, valid in stick_targets:
+            if int(flat.size) > 0:
+                idx = row_offsets + flat[None, :]
+                vals = coeff[None, :] * rates_s[:, valid]
+                _scatter_add_1d(jac_mid_flat, idx.reshape(span * int(flat.size)), vals.reshape(span * int(flat.size)))
+
+        if pre["n_frag"] > 0:
+            ratef_v = ratef[:, pre["frag_valid_gpu"]]
+            frag_vals = (
+                pre["frag_dist_gpu"][None, :, :] * ratef_v[:, :, None]
+            ).transpose(0, 2, 1).reshape(span, -1)
+            frag_idx = row_offsets + pre["frag_flat_gpu"][None, :]
+            _scatter_add_1d(
+                jac_mid_flat,
+                frag_idx.reshape(-1),
+                frag_vals.reshape(-1),
+            )
+
+        if pre["c1_flat_parts"] is not None:
+            ratef_c1 = ratef[:, pre["c1_pair_idx_gpu"]]
+            for flat_part, coeff_part in zip(pre["c1_flat_parts"], pre["c1_coeff_parts"]):
+                c1_idx = row_offsets + flat_part[None, :]
+                c1_vals = coeff_part[None, :] * ratef_c1
+                _scatter_add_1d(jac_mid_flat, c1_idx.reshape(-1), c1_vals.reshape(-1))
+
+        if pre["c2_flat_parts"] is not None:
+            ratef_c2 = ratef[:, pre["c2_pair_idx_gpu"]]
+            for flat_part, coeff_part in zip(pre["c2_flat_parts"], pre["c2_coeff_parts"]):
+                c2_idx = row_offsets + flat_part[None, :]
+                c2_vals = coeff_part[None, :] * ratef_c2
+                _scatter_add_1d(jac_mid_flat, c2_idx.reshape(-1), c2_vals.reshape(-1))
+
+        if pre["ff_flat_parts"] is not None:
+            ratef_ff = ratef[:, pre["ff_pair_idx_gpu"]]
+            for flat_part, coeff_part in zip(pre["ff_flat_parts"], pre["ff_coeff_parts"]):
+                ff_idx = row_offsets + flat_part[None, :]
+                ff_vals = coeff_part[None, :] * ratef_ff
+                _scatter_add_1d(jac_mid_flat, ff_idx.reshape(-1), ff_vals.reshape(-1))
+
+    active = Sigma[1:-1] > SigmaFloor[1:-1]
+    any_active = cp.any(active, axis=1)
+    imax_arr = cp.where(any_active, Nm - cp.argmax(active[:, ::-1], axis=1), 0)
+    col_range = cp.arange(Nm)[None, :]
+    jac[1:-1] *= (col_range < imax_arr[:, None])[:, None, :]
+
+    src_i, src_j, row, col, _ = _get_jcoag_pattern_cupy(Nr, Nm, q)
+    dat_gpu = jac[1:-1, src_i, src_j].reshape(-1)
+    return dat_gpu, row, col
+
+
+def _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v):
+    """CuPy-native equivalent of dust_f.jacobian_hydrodynamic_generator."""
+    area = _field_data(area)
+    D = _field_data(D)
+    r = _field_data(r)
+    ri = _field_data(ri)
+    SigmaGas = _field_data(SigmaGas)
+    v = _field_data(v)
+
+    Nr = int(r.shape[0])
+    Nm = int(D.shape[1])
+
+    h = SigmaGas * r
+    hi = _interp_to_interfaces(h, r, ri)
+    vi = _interp_to_interfaces(v, r, ri)
+    Di = _interp_to_interfaces(D, r, ri)
+
+    vim = xp.minimum(vi, 0.0)
+    vip = xp.maximum(vi, 0.0)
+
+    A = xp.zeros((Nr, Nm))
+    B = xp.zeros((Nr, Nm))
+    C = xp.zeros((Nr, Nm))
+
+    Vinv = xp.zeros((Nr,))
+    Vinv[:-1] = (2.0 * c.pi) / area[:-1]
+
+    w = xp.ones((Nr,))
+    w[:-1] = r[1:] - r[:-1]
+
+    ir = np.arange(1, Nr - 1)
+
+    A[ir, :] += vip[ir, :] * r[ir - 1, None]
+    B[ir, :] += -vip[ir + 1, :] * r[ir, None] + vim[ir, :] * r[ir, None]
+    C[ir, :] += -vim[ir + 1, :] * r[ir + 1, None]
+
+    A[ir, :] += Di[ir, :] * hi[ir, None] / (w[ir - 1, None] * h[ir - 1, None]) * r[ir - 1, None]
+    B[ir, :] += -Di[ir, :] * hi[ir, None] / (w[ir - 1, None] * h[ir, None]) * r[ir, None]
+    B[ir, :] += -Di[ir + 1, :] * hi[ir + 1, None] / (w[ir, None] * h[ir, None]) * r[ir, None]
+    C[ir, :] += Di[ir + 1, :] * hi[ir + 1, None] / (w[ir, None] * h[ir + 1, None]) * r[ir + 1, None]
+
+    A = A * Vinv[:, None]
+    B = B * Vinv[:, None]
+    C = C * Vinv[:, None]
+
+    return A, B, C
+
+
+def _kernel_fortran(sim):
+    return _dust_f_call(
+        dust_f.kernel,
+        sim.dust.a,
+        sim.dust.H,
+        sim.dust.Sigma,
+        sim.dust.SigmaFloor,
+        sim.dust.v.rel.tot,
+    )
+
+
+def _kernel_cupy(sim):
+    global _KERNEL_LOWER_MASK
+    a = _field_data(sim.dust.a)
+    H = _field_data(sim.dust.H)
+    Sigma = _field_data(sim.dust.Sigma)
+    SigmaFloor = _field_data(sim.dust.SigmaFloor)
+    vrel = _field_data(sim.dust.v.rel.tot)
+    Nm = int(sim.grid.Nm)
+
+    if _KERNEL_LOWER_MASK is None or int(_KERNEL_LOWER_MASK.shape[0]) != Nm:
+        # Fortran kernels are stored/accessed as K(ir, j, i) with j <= i active.
+        # In array form this is the upper triangle along mass axes (axis1 <= axis2).
+        _KERNEL_LOWER_MASK = xp.asarray(np.triu(np.ones((Nm, Nm), dtype=bool), k=0))
+
+    eye = xp.eye(Nm)
+    lower_mask = _KERNEL_LOWER_MASK
+    fac = (1.0 - 0.5 * eye)[None, :, :]
+
+    area_term = c.pi * (a[:, :, None] + a[:, None, :])**2
+    height_term = xp.sqrt(2.0 * c.pi * (H[:, :, None]**2 + H[:, None, :]**2))
+    Kfull = fac * area_term * vrel / height_term
+
+    active = (Sigma > SigmaFloor)
+    mask = active[:, :, None] & active[:, None, :]
+    mask = mask & lower_mask[None, :, :]
+
+    K = xp.zeros_like(vrel)
+    K[1:-1, :, :] = xp.where(mask[1:-1, :, :], Kfull[1:-1, :, :], 0.0)
+    return K
+
+
+def _St_Epstein_StokesI_fortran(sim):
+    rho = sim.dust.rhos * sim.dust.fill
+    return _dust_f_call(dust_f.st_epstein_stokes1, sim.dust.a, sim.gas.mfp, rho, sim.gas.Sigma)
+
+
+def _St_Epstein_StokesI_cupy(sim):
+    rho = sim.dust.rhos * sim.dust.fill
+    a = sim.dust.a
+    mfp = sim.gas.mfp[:, None]
+    Sigma = sim.gas.Sigma[:, None]
+    St_ep = 0.5 * c.pi * a * rho / Sigma
+    St_st1 = (2.0 / 9.0) * c.pi * a**2 * rho / (mfp * Sigma)
+    return xp.where(a < 2.25 * mfp, St_ep, St_st1)
+
+
+def _vrad_fortran(sim):
+    return _dust_f_call(dust_f.vrad, sim.dust.St, sim.dust.v.driftmax, sim.gas.v.rad)
+
+
+def _vrad_cupy(sim):
+    St = sim.dust.St
+    return (sim.gas.v.rad[:, None] + 2.0 * sim.dust.v.driftmax[:, None] * St) / (St**2 + 1.0)
+
+
+def _vrel_brownian_motion_fortran(sim):
+    return _dust_f_call(dust_f.vrel_brownian_motion, sim.gas.cs, sim.grid.m, sim.gas.T)
+
+
+def _vrel_brownian_motion_cupy(sim):
+    cs = _field_data(sim.gas.cs)[:, None, None]
+    T = _field_data(sim.gas.T)[:, None, None]
+    m = _field_data(sim.grid.m)
+    mj = m[None, :, None]
+    mi = m[None, None, :]
+    fac = 8.0 * c.k_B / c.pi
+    v = xp.sqrt(fac * T * (mj + mi) / (mj * mi))
+    return xp.minimum(v, cs)
+
+
+def _vrel_azimuthal_drift_fortran(sim):
+    return _dust_f_call(dust_f.vrel_azimuthal_drift, sim.dust.v.driftmax, sim.dust.St)
+
+
+def _vrel_azimuthal_drift_cupy(sim):
+    St2p1 = sim.dust.St**2 + 1.0
+    num = St2p1[:, :, None] - St2p1[:, None, :]
+    den = St2p1[:, :, None] * St2p1[:, None, :]
+    return xp.abs(sim.dust.v.driftmax[:, None, None] * num / den)
+
+
+def _vrel_radial_drift_fortran(sim):
+    return _dust_f_call(dust_f.vrel_radial_drift, sim.dust.v.rad)
+
+
+def _vrel_radial_drift_cupy(sim):
+    vr = sim.dust.v.rad
+    return xp.abs(vr[:, :, None] - vr[:, None, :])
+
+
+def _vrel_vertical_settling_fortran(sim):
+    return _dust_f_call(dust_f.vrel_vertical_settling, sim.dust.H, sim.grid.OmegaK, sim.dust.St)
+
+
+def _vrel_vertical_settling_cupy(sim):
+    om_h_st = sim.grid.OmegaK[:, None] * sim.dust.H * xp.minimum(sim.dust.St, 0.5)
+    return xp.abs(om_h_st[:, :, None] - om_h_st[:, None, :])
+
+
+def _vrel_turbulent_motion_fortran(sim):
+    return _dust_f_call(
+        dust_f.vrel_ormel_cuzzi_2007,
+        sim.dust.delta.turb,
+        sim.gas.cs,
+        sim.gas.mu,
+        sim.grid.OmegaK,
+        sim.gas.Sigma,
+        sim.dust.St,
+    )
+
+
+def _vrel_turbulent_motion_cupy(sim):
+    alpha = _field_data(sim.dust.delta.turb)
+    cs = _field_data(sim.gas.cs)
+    mump = _field_data(sim.gas.mu)
+    OmegaK = _field_data(sim.grid.OmegaK)
+    SigmaGas = _field_data(sim.gas.Sigma)
+    St = _field_data(sim.dust.St)
+
+    c0 = 1.6015125
+    c1 = -0.63119577
+    c2 = 0.32938936
+    c3 = -0.29847604
+    ya = 1.6
+    yap1inv = 1.0 / (1.0 + ya)
+
+    OmKinv = 1.0 / (OmegaK + 1e-300)
+    Re = 0.5 * alpha * SigmaGas * c.sigma_H2 / (mump + 1e-300)
+    ReInvSqrt = xp.sqrt(1.0 / (Re + 1e-300))
+    vn = xp.sqrt(alpha) * cs
+    vs = Re**(-0.25) * vn
+    ts = OmKinv * ReInvSqrt
+    vg2 = 1.5 * vn**2
+
+    StL = xp.maximum(St[:, :, None], St[:, None, :])
+    StS = xp.minimum(St[:, :, None], St[:, None, :])
+    eps = StS / (StL + 1e-300)
+
+    OmKinv3 = OmKinv[:, None, None]
+    ReInvSqrt3 = ReInvSqrt[:, None, None]
+    ts3 = ts[:, None, None]
+    vg23 = vg2[:, None, None]
+    vs3 = vs[:, None, None]
+
+    tauL = StL * OmKinv3
+    tauS = StS * OmKinv3
+
+    ys = c0 + c1 * StL + c2 * StL**2 + c3 * StL**3
+    h1 = (StL - StS) / (StL + StS + 1e-300) * (
+        StL * yap1inv - StS**2 / (StS + ya * StL + 1e-300)
+    )
+    h2 = (
+        2.0 * (ya * StL - ReInvSqrt3)
+        + StL * yap1inv
+        - StL**2 / (StL + ReInvSqrt3 + 1e-300)
+        + StS**2 / (ya * StL + StS + 1e-300)
+        - StS**2 / (StS + ReInvSqrt3 + 1e-300)
+    )
+
+    val1 = 1.5 * (vs3 / (ts3 + 1e-300) * (tauL - tauS))**2
+    val2 = vg23 * (StL - StS) / (StL + StS + 1e-300) * (
+        StL**2 / (StL + ReInvSqrt3 + 1e-300)
+        - StS**2 / (StS + ReInvSqrt3 + 1e-300)
+    )
+    val3 = vg23 * (h1 + h2)
+    val4 = vg23 * StL * (
+        2.0 * ya
+        - 1.0
+        - eps
+        + 2.0 / (1.0 + eps + 1e-300) * (yap1inv + eps**3 / (ya + eps + 1e-300))
+    )
+    val5 = vg23 * StL * (
+        2.0 * ys
+        - 1.0
+        - eps
+        + 2.0 / (1.0 + eps + 1e-300)
+        * (1.0 / (1.0 + ys + 1e-300) + eps**3 / (ys + eps + 1e-300))
+    )
+    val6 = vg23 * (2.0 + StL + StS) / (1.0 + StL + StS + StL * StS + 1e-300)
+
+    cond1 = tauL < 0.2 * ts3
+    cond2 = tauL * ya < ts3
+    cond3 = tauL < 5.0 * ts3
+    cond4 = tauL < 0.2 * OmKinv3
+    cond5 = tauL < OmKinv3
+
+    v2 = xp.where(
+        cond1,
+        val1,
+        xp.where(
+            cond2,
+            val2,
+            xp.where(cond3, val3, xp.where(cond4, val4, xp.where(cond5, val5, val6))),
+        ),
+    )
+
+    return xp.sqrt(xp.maximum(v2, 0.0))
+
+
+def _p_frag_fortran(sim):
+    return _dust_f_call(dust_f.pfrag, sim.dust.v.rel.tot, sim.dust.v.frag)
+
+
+def _p_frag_cupy(sim):
+    vrel = _field_data(sim.dust.v.rel.tot)
+    vfrag = _field_data(sim.dust.v.frag)[:, None, None]
+    mask = vrel != 0.0
+    denom = xp.where(mask, vrel, 1.0)
+    dum = (vfrag / denom) ** 2
+    pf = xp.where(mask, (1.5 * dum + 1.0) * xp.exp(-1.5 * dum), 0.0)
+    pf[0, :, :] = 0.0
+    pf[-1, :, :] = 0.0
+    return pf
+
+
+def _coagulation_parameters_fortran(sim):
+    return _dust_f_call(
+        dust_f.coagulation_parameters,
+        sim.ini.dust.erosionMassRatio,
+        sim.ini.dust.excavatedMass,
+        sim.ini.dust.fragmentDistribution,
+        sim.grid.m,
+    )
+
+
+def _coagulation_parameters_python(sim):
+    """Python equivalent of dust_f.coagulation_parameters for CuPy backend."""
+    m_src = _field_data(sim.grid.m)
+    if xp.is_array(m_src):
+        m = np.asarray(xp.to_numpy(m_src), dtype=np.float64)
+    else:
+        m = np.asarray(m_src, dtype=np.float64)
+
+    cratRatio = float(sim.ini.dust.erosionMassRatio)
+    fExcav = float(sim.ini.dust.excavatedMass)
+    fragSlope = float(sim.ini.dust.fragmentDistribution)
+    Nm = int(m.shape[0])
+
+    AFrag = np.zeros((Nm, Nm), dtype=np.float64)
+    epsFrag = np.zeros((Nm, Nm), dtype=np.float64)
+    klf = -np.ones((Nm, Nm), dtype=np.int64)
+    krm = -np.ones((Nm, Nm), dtype=np.int64)
+    cstick = np.zeros((4, Nm, Nm), dtype=np.float64)
+    cstick_ind = -np.ones((4, Nm, Nm), dtype=np.int64)
+    phiFrag = np.zeros((Nm, Nm), dtype=np.float64)
+
+    cpod = np.zeros((Nm, Nm, Nm), dtype=np.float64)
+    cpodmod = np.zeros((Nm, Nm, Nm), dtype=np.float64)
+    D = -np.ones((Nm, Nm), dtype=np.float64)
+    E = np.zeros((Nm, Nm), dtype=np.float64)
+
+    a = np.log10(m[0] / m[-1]) / (1.0 - Nm)
+    ce = int(-1.0 / a * np.log10(1.0 - 10.0**(-a))) + 1
+    p = int(np.floor(np.log10(cratRatio) / a))
+
+    mi_m_mim1 = m * (1.0 - 10.0**(-a))
+    mip1_m_mi = m * (10.0**a - 1.0)
+    mip1_m_mim1 = m * (10.0**a - 10.0**(-a))
+
+    mtot = m[:, None] + m[None, :]
+    valid = mtot < m[-1]
+    jv, iv = np.where(valid)
+    upper = np.searchsorted(m, mtot[jv, iv], side="right")
+    lower = upper - 1
+    epsv = (m[lower + 1] - mtot[jv, iv]) / mip1_m_mi[lower]
+    cpod[lower, jv, iv] = epsv
+    cpod[lower + 1, jv, iv] = 1.0 - epsv
+
+    j_idx = np.arange(Nm)[:, None]
+    i_idx = np.arange(Nm)[None, :]
+    J = np.broadcast_to(m[:, None], (Nm, Nm))
+    Mp = np.broadcast_to(mip1_m_mi[None, :], (Nm, Nm))
+    Mm = np.broadcast_to(mi_m_mim1[None, :], (Nm, Nm))
+    Mpm = np.broadcast_to(mip1_m_mim1[None, :], (Nm, Nm))
+
+    maskD = j_idx <= (i_idx + 1 - ce)
+    D[maskD] = -J[maskD] / Mp[maskD]
+
+    maskE1 = j_idx <= (i_idx - ce)
+    E[maskE1] = J[maskE1] / Mm[maskE1]
+    tmpE = 1.0 - (J - Mm) / Mp
+    tmpE *= (Mpm - J >= 0.0).astype(np.float64)
+    E[~maskE1] = tmpE[~maskE1]
+
+    for i in range(Nm - 1):
+        jmax = min(Nm - 1, int(np.log10(10.0**(a * Nm) - 10.0**(a * (i + 1))) / a))
+        for j in range(jmax):
+            out = np.zeros((Nm,), dtype=np.float64)
+            cpod_slice = cpod[:, j, i]
+            if j == i:
+                out += 0.5 * cpod_slice
+            if j >= i + 1 and (j + 2) < Nm:
+                out[j + 2:] += cpod_slice[j + 2:]
+            out[j] += D[i, j]
+            if j >= i + 1 and (j + 1) < Nm:
+                out[j + 1] += E[i, j + 1]
+            cpodmod[:, j, i] = out
+
+    dum = cpodmod.copy()
+    for i in range(Nm):
+        for j in range(i + 1):
+            cpodmod[:, i, j] = 0.0
+            cpodmod[:, j, i] = dum[:, j, i] + dum[:, i, j]
+
+    for i in range(Nm):
+        for j in range(i + 1):
+            nz = np.nonzero(cpodmod[:, j, i])[0]
+            nnz = min(4, nz.shape[0])
+            if nnz > 0:
+                cstick_ind[:nnz, j, i] = nz[:nnz]
+                cstick[:nnz, j, i] = cpodmod[nz[:nnz], j, i]
+
+    for i in range(Nm):
+        phiFrag[i, : i + 1] = m[: i + 1] ** (2.0 + fragSlope)
+        norm = np.sum(phiFrag[i, : i + 1])
+        if norm > 0.0:
+            phiFrag[i, : i + 1] /= norm
+
+    for i in range(Nm):
+        upper = i - p
+        if upper > 0:
+            jarr = np.arange(0, upper)
+            klf[jarr, i] = jarr
+            mrm = m[i] - fExcav * m[jarr]
+            AFrag[jarr, i] = (1.0 + fExcav) * m[jarr]
+
+            kr = np.searchsorted(m, mrm, side="left") - 1
+            eq = (mrm == m[i])
+            if np.any(eq):
+                kr[eq] = i - 1
+                epsFrag[jarr[eq], i] = fExcav * m[jarr[eq]] / mi_m_mim1[i]
+            ne = ~eq
+            if np.any(ne):
+                krn = kr[ne]
+                epsFrag[jarr[ne], i] = (m[krn + 1] - mrm[ne]) / mip1_m_mi[krn]
+            krm[jarr, i] = kr
+
+        jmin = max(0, i - p)
+        if jmin <= i:
+            jarr = np.arange(jmin, i + 1)
+            klf[jarr, i] = i
+            AFrag[jarr, i] = m[i] + m[jarr]
+
+    if get_backend() == "cupy" and cp is not None:
+        return (
+            cp.asarray(cstick),
+            cp.asarray(cstick_ind),
+            cp.asarray(AFrag),
+            cp.asarray(epsFrag),
+            cp.asarray(klf),
+            cp.asarray(krm),
+            cp.asarray(phiFrag),
+        )
+    return cstick, cstick_ind, AFrag, epsFrag, klf, krm, phiFrag
+
+
+def bind_backend_kernels(backend=None):
+    """Bind hot dust kernels to backend-specific implementations once."""
+    global _BOUND_BACKEND, _K_A, _K_D, _K_H, _K_F_ADV, _K_F_DIFF, _K_S_COAG, _K_S_HYD
+    global _K_KERNEL, _K_P_FRAG, _K_ST, _K_VRAD, _K_VREL_BROWN, _K_VREL_AZI, _K_VREL_RAD, _K_VREL_TURB, _K_VREL_VERT
+    global _K_COAG_PARAMS, _K_IMPL_1_DIRECT, _K_JACOBIAN, _K_INTERP_TO_INTERFACES
+    global _KERNEL_LOWER_MASK, _COAG_CACHE_KEY, _COAG_CACHE_VALUE
+    global _COAG_PAIR_CACHE_KEY, _COAG_PAIR_CACHE_VALUE, _SCOAG_PAIRMAP_CACHE_KEY, _SCOAG_PAIRMAP_CACHE_VALUE
+    global _FRAG_P_CACHE_KEY, _FRAG_P_CACHE_VALUE, _MGRID_Q_CACHE_KEY, _MGRID_Q_CACHE_VALUE
+    global _JCOAG_CONST_CACHE_KEY, _JCOAG_CONST_CACHE_VALUE, _JCOAG_PATTERN_CACHE_KEY, _JCOAG_PATTERN_CACHE_VALUE
+    global _JCOAG_PATTERN_GPU_CACHE_KEY, _JCOAG_PATTERN_GPU_CACHE_VALUE
+    global _JCOAG_PRECOMP_CACHE_KEY, _JCOAG_PRECOMP_CACHE_VALUE
+    global _BOUNDARY_BASIS_CACHE_KEY, _BOUNDARY_BASIS_CACHE_VALUE
+    global _JSTICK_MAP_CACHE_KEY, _JSTICK_MAP_CACHE_VALUE
+    global _JFRAG_MAP_CACHE_KEY, _JFRAG_MAP_CACHE_VALUE, _JCOAG_WORK_CACHE_KEY, _JCOAG_WORK_CACHE_VALUE
+    global _JCOAG_WORKBUF_MODE, _SCATTER_MODE
+
+    backend = get_backend() if backend is None else backend
+    mode = os.getenv("DUSTPY_JCOAG_WORKBUF_MODE", "reuse").strip().lower()
+    if mode not in ("fresh", "reuse"):
+        mode = "reuse"
+    scatter_mode = os.getenv("DUSTPY_SCATTER_MODE", "addat").strip().lower()
+    if scatter_mode not in ("addat", "scatter"):
+        scatter_mode = "addat"
+    if (
+        backend == _BOUND_BACKEND
+        and _K_A is not None
+        and mode == _JCOAG_WORKBUF_MODE
+        and scatter_mode == _SCATTER_MODE
+    ):
+        return
+
+    _K_A = select_backend({"cupy": _a_cupy}, backend=backend, default=_a_fortran)
+    _K_D = select_backend({"cupy": _D_cupy}, backend=backend, default=_D_fortran)
+    _K_H = select_backend({"cupy": _H_cupy}, backend=backend, default=_H_fortran)
+    _K_F_ADV = select_backend({"cupy": _F_adv_cupy}, backend=backend, default=_F_adv_fortran)
+    _K_F_DIFF = select_backend({"cupy": _F_diff_cupy}, backend=backend, default=_F_diff_fortran)
+    _K_S_COAG = select_backend({"cupy": _S_coag_cupy}, backend=backend, default=_S_coag_fortran)
+    _K_S_HYD = select_backend({"cupy": _S_hyd_cupy}, backend=backend, default=_S_hyd_fortran)
+    _K_KERNEL = select_backend({"cupy": _kernel_cupy}, backend=backend, default=_kernel_fortran)
+    _K_P_FRAG = select_backend({"cupy": _p_frag_cupy}, backend=backend, default=_p_frag_fortran)
+    _K_ST = select_backend({"cupy": _St_Epstein_StokesI_cupy}, backend=backend, default=_St_Epstein_StokesI_fortran)
+    _K_VRAD = select_backend({"cupy": _vrad_cupy}, backend=backend, default=_vrad_fortran)
+    _K_VREL_BROWN = select_backend({"cupy": _vrel_brownian_motion_cupy}, backend=backend, default=_vrel_brownian_motion_fortran)
+    _K_VREL_AZI = select_backend({"cupy": _vrel_azimuthal_drift_cupy}, backend=backend, default=_vrel_azimuthal_drift_fortran)
+    _K_VREL_RAD = select_backend({"cupy": _vrel_radial_drift_cupy}, backend=backend, default=_vrel_radial_drift_fortran)
+    _K_VREL_TURB = select_backend({"cupy": _vrel_turbulent_motion_cupy}, backend=backend, default=_vrel_turbulent_motion_fortran)
+    _K_VREL_VERT = select_backend({"cupy": _vrel_vertical_settling_cupy}, backend=backend, default=_vrel_vertical_settling_fortran)
+    _K_COAG_PARAMS = select_backend({"cupy": _coagulation_parameters_python}, backend=backend, default=_coagulation_parameters_fortran)
+    _K_IMPL_1_DIRECT = select_backend({"cupy": _f_impl_1_direct_cupy}, backend=backend, default=_f_impl_1_direct_numpy)
+    _K_JACOBIAN = select_backend({"cupy": _jacobian_cupy}, backend=backend, default=_jacobian_numpy)
+    _K_INTERP_TO_INTERFACES = select_backend({"cupy": _interp_to_interfaces_cupy}, backend=backend, default=_interp_to_interfaces_numpy)
+
+    _JCOAG_WORKBUF_MODE = mode
+    _SCATTER_MODE = scatter_mode
+
+    _KERNEL_LOWER_MASK = None
+    _COAG_CACHE_KEY = None
+    _COAG_CACHE_VALUE = None
+    _COAG_PAIR_CACHE_KEY = None
+    _COAG_PAIR_CACHE_VALUE = None
+    _SCOAG_PAIRMAP_CACHE_KEY = None
+    _SCOAG_PAIRMAP_CACHE_VALUE = None
+    _FRAG_P_CACHE_KEY = None
+    _FRAG_P_CACHE_VALUE = None
+    _MGRID_Q_CACHE_KEY = None
+    _MGRID_Q_CACHE_VALUE = None
+    _JCOAG_CONST_CACHE_KEY = None
+    _JCOAG_CONST_CACHE_VALUE = None
+    _JCOAG_PATTERN_CACHE_KEY = None
+    _JCOAG_PATTERN_CACHE_VALUE = None
+    _JCOAG_PATTERN_GPU_CACHE_KEY = None
+    _JCOAG_PATTERN_GPU_CACHE_VALUE = None
+    _JCOAG_PRECOMP_CACHE_KEY = None
+    _JCOAG_PRECOMP_CACHE_VALUE = None
+    _BOUNDARY_BASIS_CACHE_KEY = None
+    _BOUNDARY_BASIS_CACHE_VALUE = None
+    _JSTICK_MAP_CACHE_KEY = None
+    _JSTICK_MAP_CACHE_VALUE = None
+    _JFRAG_MAP_CACHE_KEY = None
+    _JFRAG_MAP_CACHE_VALUE = None
+    _JCOAG_WORK_CACHE_KEY = None
+    _JCOAG_WORK_CACHE_VALUE = None
+
+    _BOUND_BACKEND = backend
+
+
+# Initialize default bindings at import time.
 
 
 def boundary(sim):
@@ -29,7 +1591,7 @@ def enforce_floor_value(sim):
     ----------
     sim : Frame
         Parent simulation frame"""
-    sim.dust.Sigma = np.where(
+    sim.dust.Sigma = xp.where(
         sim.dust.Sigma > sim.dust.SigmaFloor,
         sim.dust.Sigma,
         0.1*sim.dust.SigmaFloor)
@@ -128,15 +1690,13 @@ def dt(sim):
     -------
     dt : float
         Dust time step"""
-    if np.any(sim.dust.S.tot[1:-1, ...] < 0.):
-        mask = np.logical_and(
-            sim.dust.Sigma > sim.dust.SigmaFloor,
-            sim.dust.S.tot < 0.)
+    if xp.any(sim.dust.S.tot[1:-1, ...] < 0.):
+        mask = (sim.dust.Sigma > sim.dust.SigmaFloor) & (sim.dust.S.tot < 0.)
         mask[0, :] = False
         mask[-1:, :] = False
         rate = sim.dust.Sigma[mask] / sim.dust.S.tot[mask]
         try:
-            return np.min(np.abs(rate))
+            return xp.min(xp.abs(rate))
         except:
             return None
 
@@ -153,8 +1713,7 @@ def a(sim):
     -------
     a : Field
         Particle sizes"""
-    rho = sim.dust.fill * sim.dust.rhos
-    return dust_f.a(sim.grid.m, rho)
+    return _K_A(sim)
 
 
 def D(sim):
@@ -175,11 +1734,7 @@ def D(sim):
     The diffusivity at the first and last two radial
     grid cells will be set to zero to avoid unwanted
     behavior at the boundaries."""
-    v2 = sim.dust.delta.rad * sim.gas.cs**2
-    Diff = dust_f.d(v2, sim.grid.OmegaK, sim.dust.St)
-    Diff[:2, ...] = 0.
-    Diff[-2:, ...] = 0.
-    return Diff
+    return _K_D(sim)
 
 
 def eps(sim):
@@ -194,7 +1749,7 @@ def eps(sim):
     -------
     eps : Field
         vertically integrated dust-to-gas ratio"""
-    return np.sum(sim.dust.Sigma, axis=-1) / sim.gas.Sigma
+    return xp.sum(sim.dust.Sigma, axis=-1) / sim.gas.Sigma
 
 
 def F_adv(sim, Sigma=None):
@@ -213,26 +1768,12 @@ def F_adv(sim, Sigma=None):
     -------
     Fi : Field
         Advective mass fluxes through the grid cell interfaces"""
-    Sigma = Sigma if Sigma is not None else sim.dust.Sigma
-    return dust_f.fi_adv(sim.dust.Sigma, sim.dust.v.rad, sim.grid.r, sim.grid.ri)
+    return _K_F_ADV(sim, Sigma=Sigma)
 
 
 def F_diff(sim, Sigma=None):
     '''Function calculates the diffusive flux at the cell interfaces'''
-    if Sigma is None:
-        Sigma = sim.dust.Sigma
-
-    Fi = dust_f.fi_diff(sim.dust.D,
-                        Sigma,
-                        sim.gas.Sigma,
-                        sim.dust.St,
-                        np.sqrt(sim.dust.delta.rad*sim.gas.cs**2),
-                        sim.grid.r,
-                        sim.grid.ri)
-    Fi[:1, :] = 0.
-    Fi[-1:, :] = 0.
-
-    return Fi
+    return _K_F_DIFF(sim, Sigma=Sigma)
 
 
 def F_tot(sim, Sigma=None):
@@ -249,7 +1790,7 @@ def F_tot(sim, Sigma=None):
     -------
     Ftot : Field
         Total mass flux through interfaces"""
-    Fi = np.zeros_like(sim.dust.Fi.tot)
+    Fi = xp.zeros_like(sim.dust.Fi.tot)
     if Sigma is None:
         Fdiff = sim.dust.Fi.diff
         Fadv = sim.dust.Fi.adv
@@ -257,9 +1798,9 @@ def F_tot(sim, Sigma=None):
         Fdiff = sim.dust.Fi.diff.updater.beat(sim, Sigma=Sigma)
         Fadv = sim.dust.Fi.adv.updater.beat(sim, Sigma=Sigma)
     if Fdiff is not None:
-        Fi += Fdiff
+        Fi += _field_data(Fdiff)
     if Fadv is not None:
-        Fi += Fadv
+        Fi += _field_data(Fadv)
     return Fi
 
 
@@ -275,10 +1816,10 @@ def H(sim):
     -------
     H : Field
         Dust scale heights"""
-    return dust_f.h_dubrulle1995(sim.gas.Hp, sim.dust.St, sim.dust.delta.vert)
+    return _K_H(sim)
 
 
-def jacobian(sim, x, dx=None, *args, **kwargs):
+def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
     """Function calculates the Jacobian for implicit dust integration.
 
     Parameters
@@ -322,8 +1863,15 @@ def jacobian(sim, x, dx=None, *args, **kwargs):
         dt = x.stepsize
     else:
         dt = dx
+    try:
+        dt = float(dt)
+    except Exception:
+        dt = float(to_numpy(dt))
     r = sim.grid.r
     ri = sim.grid.ri
+    r_np = to_numpy(r)
+    ri_np = to_numpy(ri)
+    Sigma_np = to_numpy(sim.dust.Sigma)
     area = sim.grid.A
     Nr = int(sim.grid.Nr)
     Nm = int(sim.grid.Nm)
@@ -332,24 +1880,26 @@ def jacobian(sim, x, dx=None, *args, **kwargs):
 
     # Total problem size
     Ntot = int((Nr*Nm))
-    # Getting data vector and coordinates in sparse matrix
-    dat, row, col = dust_f.jacobian_coagulation_generator(
-        A, cstick, eps, ilf, irm, istick, m, phi, Rf, Rs, SigD, SigDfloor)
+    dat, row, col = _dust_f_call(
+        dust_f.jacobian_coagulation_generator,
+        A, cstick, eps, ilf, irm, istick, m, phi, Rf, Rs, SigD, SigDfloor,
+        to_backend_result=False,
+    )
     gen = (dat, (row, col))
-    # Building sparse matrix of coagulation Jacobian
     J_coag = sp.csc_matrix(
         gen,
         shape=(Ntot, Ntot)
     )
 
-    # Building the hydrodynamic Jacobian
-    A, B, C = dust_f.jacobian_hydrodynamic_generator(
+    A, B, C = _dust_f_call(
+        dust_f.jacobian_hydrodynamic_generator,
         area,
         sim.dust.D,
         r,
         ri,
         sim.gas.Sigma,
-        sim.dust.v.rad
+        sim.dust.v.rad,
+        to_backend_result=False,
     )
     J_hyd = sp.diags(
         (A.ravel()[Nm:], B.ravel(), C.ravel()[:-Nm]),
@@ -385,15 +1935,15 @@ def jacobian(sim, x, dx=None, *args, **kwargs):
             sim.dust._rhs[:Nm] = 0.
         # Given gradient
         elif sim.dust.boundary.inner.condition == "grad":
-            K1 = - r[1]/r[0]
+            K1 = - r_np[1]/r_np[0]
             dat[Nm:2*Nm] = -K1/dt
-            sim.dust._rhs[:Nm] = - ri[1]/r[0] * \
-                (r[1]-r[0])*sim.dust.boundary.inner.value
+            sim.dust._rhs[:Nm] = - ri_np[1]/r_np[0] * \
+                (r_np[1]-r_np[0])*sim.dust.boundary.inner.value
         # Constant gradient
         elif sim.dust.boundary.inner.condition == "const_grad":
-            Di = ri[1]/ri[2] * (r[1]-r[0]) / (r[2]-r[0])
-            K1 = - r[1]/r[0] * (1. + Di)
-            K2 = r[2]/r[0] * Di
+            Di = ri_np[1]/ri_np[2] * (r_np[1]-r_np[0]) / (r_np[2]-r_np[0])
+            K1 = - r_np[1]/r_np[0] * (1. + Di)
+            K2 = r_np[2]/r_np[0] * Di
             dat[:Nm] = 0.
             dat[Nm:2*Nm] = -K1/dt
             dat[2*Nm:] = -K2/dt
@@ -401,12 +1951,12 @@ def jacobian(sim, x, dx=None, *args, **kwargs):
         # Given power law
         elif sim.dust.boundary.inner.condition == "pow":
             p = sim.dust.boundary.inner.value
-            sim.dust._rhs[:Nm] = sim.dust.Sigma[1] * (r[0]/r[1])**p
+            sim.dust._rhs[:Nm] = sim.dust.Sigma[1] * (r_np[0]/r_np[1])**p
         # Constant power law
         elif sim.dust.boundary.inner.condition == "const_pow":
-            p = np.log(sim.dust.Sigma[2] /
-                       sim.dust.Sigma[1]) / np.log(r[2]/r[1])
-            K1 = - (r[0]/r[1])**p
+            p = np.log(Sigma_np[2] /
+                       Sigma_np[1]) / np.log(r_np[2]/r_np[1])
+            K1 = - (r_np[0]/r_np[1])**p
             dat[Nm:2*Nm] = -K1/dt
             sim.dust._rhs[:Nm] = 0.
 
@@ -440,27 +1990,27 @@ def jacobian(sim, x, dx=None, *args, **kwargs):
             sim.dust._rhs[-Nm:] = 0.
         # Given gradient
         elif sim.dust.boundary.outer.condition == "grad":
-            KNrm2 = -r[-2]/r[-1]
+            KNrm2 = -r_np[-2]/r_np[-1]
             dat[-2*Nm:-Nm] = -KNrm2/dt
-            sim.dust._rhs[-Nm:] = ri[-2]/r[-1] * \
-                (r[-1]-r[-2])*sim.dust.boundary.outer.value
+            sim.dust._rhs[-Nm:] = ri_np[-2]/r_np[-1] * \
+                (r_np[-1]-r_np[-2])*sim.dust.boundary.outer.value
         # Constant gradient
         elif sim.dust.boundary.outer.condition == "const_grad":
-            Do = ri[-2]/ri[-3] * (r[-1]-r[-2]) / (r[-2]-r[-3])
-            KNrm2 = - r[-2]/r[-1] * (1. + Do)
-            KNrm3 = r[-3]/r[-1] * Do
+            Do = ri_np[-2]/ri_np[-3] * (r_np[-1]-r_np[-2]) / (r_np[-2]-r_np[-3])
+            KNrm2 = - r_np[-2]/r_np[-1] * (1. + Do)
+            KNrm3 = r_np[-3]/r_np[-1] * Do
             dat[-2*Nm:-Nm] = -KNrm2/dt
             dat[-3*Nm:-2*Nm] = -KNrm3/dt
             sim.dust._rhs[-Nm:] = 0.
         # Given power law
         elif sim.dust.boundary.outer.condition == "pow":
             p = sim.dust.boundary.outer.value
-            sim.dust._rhs[-Nm:] = sim.dust.Sigma[-2] * (r[-1]/r[-2])**p
+            sim.dust._rhs[-Nm:] = sim.dust.Sigma[-2] * (r_np[-1]/r_np[-2])**p
         # Constant power law
         elif sim.dust.boundary.outer.condition == "const_pow":
-            p = np.log(sim.dust.Sigma[-2] /
-                       sim.dust.Sigma[-3]) / np.log(r[-2]/r[-3])
-            KNrm2 = - (r[-1]/r[-2])**p
+            p = np.log(Sigma_np[-2] /
+                       Sigma_np[-3]) / np.log(r_np[-2]/r_np[-3])
+            KNrm2 = - (r_np[-1]/r_np[-2])**p
             dat[-2*Nm:-Nm] = -KNrm2/dt
             sim.dust._rhs[-Nm:] = 0.
 
@@ -471,8 +2021,134 @@ def jacobian(sim, x, dx=None, *args, **kwargs):
         shape=(Ntot, Ntot)
     )
 
-    # Adding and returning all matrix components
     return J_in + J_coag + J_hyd + J_out
+
+
+def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
+    # Parameters for function call
+    A = sim.dust.coagulation.A
+    cstick = sim.dust.coagulation.stick
+    eps = sim.dust.coagulation.eps
+    ilf = sim.dust.coagulation.lf_ind
+    irm = sim.dust.coagulation.rm_ind
+    istick = sim.dust.coagulation.stick_ind
+    m = sim.grid.m
+    phi = sim.dust.coagulation.phi
+    Rf = sim.dust.kernel * sim.dust.p.frag
+    Rs = sim.dust.kernel * sim.dust.p.stick
+    SigD = sim.dust.Sigma
+    SigDfloor = sim.dust.SigmaFloor
+
+    if dx is None:
+        dt = x.stepsize
+    else:
+        dt = dx
+    try:
+        dt = float(dt)
+    except Exception:
+        dt = float(to_numpy(dt))
+
+    r = _field_data(sim.grid.r)
+    ri = _field_data(sim.grid.ri)
+    SigmaArr = _field_data(sim.dust.Sigma)
+    area = sim.grid.A
+    Nr = int(sim.grid.Nr)
+    Nm = int(sim.grid.Nm)
+    Ntot = int((Nr * Nm))
+
+    dat, row, col = _jacobian_coagulation_generator_cupy(
+        A, cstick, eps, ilf, irm, istick, m, phi, Rf, Rs, SigD, SigDfloor
+    )
+    J_coag = cp_sparse.csr_matrix((dat, (row, col)), shape=(Ntot, Ntot))
+
+    A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(
+        area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
+    )
+    J_hyd = cp_sparse.diags(
+        (A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]),
+        offsets=(-Nm, 0, Nm),
+        shape=(Ntot, Ntot),
+        format="csr"
+    )
+
+    sim.dust._rhs[Nm:-Nm] = sim.dust.Sigma.ravel()[Nm:-Nm]
+
+    Bin0, Bin1, Bin2, Bout0, Bout1, Bout2 = _get_boundary_basis_cupy(Nr, Nm, SigmaArr.dtype)
+    c_in0 = 0.0
+    c_in1 = 0.0
+    c_in2 = 0.0
+
+    if sim.dust.boundary.inner is not None:
+        if sim.dust.boundary.inner.condition == "val":
+            sim.dust._rhs[:Nm] = sim.dust.boundary.inner.value
+        elif sim.dust.boundary.inner.condition == "const_val":
+            c_in1 = 1. / dt
+            sim.dust._rhs[:Nm] = 0.
+        elif sim.dust.boundary.inner.condition == "grad":
+            K1 = - (r[1] / r[0])
+            c_in1 = -K1 / dt
+            fac = - (ri[1] / r[0] * (r[1] - r[0]))
+            sim.dust._rhs[:Nm] = fac * sim.dust.boundary.inner.value
+        elif sim.dust.boundary.inner.condition == "const_grad":
+            Di = (ri[1] / ri[2] * (r[1] - r[0]) / (r[2] - r[0]))
+            K1 = - (r[1] / r[0]) * (1. + Di)
+            K2 = (r[2] / r[0]) * Di
+            c_in0 = 0.0
+            c_in1 = -K1 / dt
+            c_in2 = -K2 / dt
+            sim.dust._rhs[:Nm] = 0.
+        elif sim.dust.boundary.inner.condition == "pow":
+            p = sim.dust.boundary.inner.value
+            ratio = (r[0] / r[1])
+            sim.dust._rhs[:Nm] = SigmaArr[1] * ratio**p
+        elif sim.dust.boundary.inner.condition == "const_pow":
+            logr = cp.log(r[2] / r[1])
+            p = cp.log(SigmaArr[2] / SigmaArr[1]) / logr
+            K1 = - (r[0] / r[1])**p
+            c_in1 = -K1 / dt
+            sim.dust._rhs[:Nm] = 0.
+
+    J_in = c_in0 * Bin0 + c_in1 * Bin1 + c_in2 * Bin2
+
+    c_out0 = 0.0
+    c_out1 = 0.0
+    c_out2 = 0.0
+
+    if sim.dust.boundary.outer is not None:
+        if sim.dust.boundary.outer.condition == "val":
+            sim.dust._rhs[-Nm:] = sim.dust.boundary.outer.value
+        elif sim.dust.boundary.outer.condition == "const_val":
+            c_out1 = 1. / dt
+            sim.dust._rhs[-Nm:] = 0.
+        elif sim.dust.boundary.outer.condition == "grad":
+            KNrm2 = - (r[-2] / r[-1])
+            c_out1 = -KNrm2 / dt
+            fac = (ri[-2] / r[-1] * (r[-1] - r[-2]))
+            sim.dust._rhs[-Nm:] = fac * sim.dust.boundary.outer.value
+        elif sim.dust.boundary.outer.condition == "const_grad":
+            Do = (ri[-2] / ri[-3] * (r[-1] - r[-2]) / (r[-2] - r[-3]))
+            KNrm2 = - (r[-2] / r[-1]) * (1. + Do)
+            KNrm3 = (r[-3] / r[-1]) * Do
+            c_out1 = -KNrm2 / dt
+            c_out0 = -KNrm3 / dt
+            sim.dust._rhs[-Nm:] = 0.
+        elif sim.dust.boundary.outer.condition == "pow":
+            p = sim.dust.boundary.outer.value
+            ratio = (r[-1] / r[-2])
+            sim.dust._rhs[-Nm:] = SigmaArr[-2] * ratio**p
+        elif sim.dust.boundary.outer.condition == "const_pow":
+            logr = cp.log(r[-2] / r[-3])
+            p = cp.log(SigmaArr[-2] / SigmaArr[-3]) / logr
+            KNrm2 = - (r[-1] / r[-2])**p
+            c_out1 = -KNrm2 / dt
+            sim.dust._rhs[-Nm:] = 0.
+
+    J_out = c_out0 * Bout0 + c_out1 * Bout1 + c_out2 * Bout2
+    return J_in + J_coag + J_hyd + J_out
+
+
+def jacobian(sim, x, dx=None, *args, **kwargs):
+    return _K_JACOBIAN(sim, x, dx=dx, *args, **kwargs)
 
 
 def kernel(sim):
@@ -487,11 +2163,7 @@ def kernel(sim):
     -------
     K : Field
         Collision kernel"""
-    return dust_f.kernel(sim.dust.a,
-                         sim.dust.H,
-                         sim.dust.Sigma,
-                         sim.dust.SigmaFloor,
-                         sim.dust.v.rel.tot)
+    return _K_KERNEL(sim)
 
 
 def MRN_distribution(sim):
@@ -518,28 +2190,32 @@ def MRN_distribution(sim):
     such that there are no drifting particles initially. This prevents a particle wave traveling
     though the simulation, that is already drifting initially."""
     exp = sim.ini.dust.distExp
+    a_arr = _field_data(sim.dust.a)
+    sigma_g = _field_data(sim.gas.Sigma)
     # Set maximum particle size
     if sim.ini.dust.allowDriftingParticles:
         aIni = sim.ini.dust.aIniMax
     else:
         # Calculating pressure gradient
-        P = sim.gas.P
-        Pi = np.interp(sim.grid.ri, sim.grid.r, P)
-        gamma = (Pi[1:] - Pi[:-1]) / (sim.grid.ri[1:] - sim.grid.ri[:-1])
-        gamma = np.abs(gamma)
+        P = _field_data(sim.gas.P)
+        grid_ri = _field_data(sim.grid.ri)
+        grid_r = _field_data(sim.grid.r)
+        Pi = _interp_to_interfaces(P, grid_r, grid_ri)
+        gamma = (Pi[1:] - Pi[:-1]) / (grid_ri[1:] - grid_ri[:-1])
+        gamma = xp.abs(gamma)
         # Exponent of pressure gradient
-        gamma *= sim.grid.r / P
+        gamma *= grid_r / (P + 1e-300)
         # Maximum drift limited particle size with safety margin
-        ad = 5.e-3 * 2./np.pi * sim.ini.dust.d2gRatio * sim.gas.Sigma \
-            / (sim.dust.fill[:, 0] * sim.dust.rhos[:, 0]) * (sim.grid.OmegaK * sim.grid.r)**2. \
-            / sim.gas.cs**2. / gamma
-        aIni = np.minimum(sim.ini.dust.aIniMax, ad)[:, None]
+        ad = 5.e-3 * 2. / c.pi * sim.ini.dust.d2gRatio * sigma_g \
+            / (_field_data(sim.dust.fill[:, 0]) * _field_data(sim.dust.rhos[:, 0])) * (_field_data(sim.grid.OmegaK) * grid_r)**2. \
+            / (_field_data(sim.gas.cs)**2. * (gamma + 1e-300))
+        aIni = xp.minimum(sim.ini.dust.aIniMax, ad)[:, None]
     # Fill distribution
-    ret = np.where(sim.dust.a <= aIni, sim.dust.a**(exp+4), 0.)
-    s = np.sum(ret, axis=1)[..., None]
-    s = np.where(s > 0., s, 1.)
+    ret = xp.where(a_arr <= aIni, a_arr**(exp+4), 0.)
+    s = xp.sum(ret, axis=1)[..., None]
+    s = xp.where(s > 0., s, 1.)
     # Normalize to mass
-    ret = ret / s * sim.gas.Sigma[..., None] * sim.ini.dust.d2gRatio
+    ret = ret / s * sigma_g[..., None] * sim.ini.dust.d2gRatio
     return ret
 
 
@@ -577,7 +2253,7 @@ def p_frag(sim):
     -------
     pf : Field
         Fragmentation propability."""
-    return dust_f.pfrag(sim.dust.v.rel.tot, sim.dust.v.frag)
+    return _K_P_FRAG(sim)
 
 
 def rho_midplane(sim):
@@ -592,7 +2268,7 @@ def rho_midplane(sim):
     -------
     rho : Field
         Midplane mass density"""
-    return sim.dust.Sigma / (np.sqrt(2 * c.pi) * sim.dust.H)
+    return sim.dust.Sigma / (xp.sqrt(2 * c.pi) * sim.dust.H)
 
 
 def S_coag(sim, Sigma=None):
@@ -609,20 +2285,7 @@ def S_coag(sim, Sigma=None):
     -------
     Scoag : Field
         Coagulation source terms"""
-    if Sigma is None:
-        Sigma = sim.dust.Sigma
-    return dust_f.s_coag(sim.dust.coagulation.stick,
-                         sim.dust.coagulation.stick_ind,
-                         sim.dust.coagulation.A,
-                         sim.dust.coagulation.eps,
-                         sim.dust.coagulation.lf_ind,
-                         sim.dust.coagulation.rm_ind,
-                         sim.dust.coagulation.phi,
-                         sim.dust.kernel * sim.dust.p.frag,
-                         sim.dust.kernel * sim.dust.p.stick,
-                         sim.grid.m,
-                         Sigma,
-                         sim.dust.SigmaFloor)
+    return _K_S_COAG(sim, Sigma=Sigma)
 
 
 def S_hyd(sim, Sigma=None):
@@ -639,14 +2302,7 @@ def S_hyd(sim, Sigma=None):
     -------
     Shyd : Field
         Hydrodynamic source terms"""
-    if Sigma is None:
-        Sigma = sim.dust.Sigma
-        Fi = sim.dust.Fi.tot
-    else:
-        Fi = sim.dust.Fi.tot.updater.beat(sim, Sigma=Sigma)
-        if Fi is None:
-            Fi = sim.dust.Fi.tot
-    return dust_f.s_hyd(Fi, sim.grid.ri)
+    return _K_S_HYD(sim, Sigma=Sigma)
 
 
 def S_tot(sim, Sigma=None):
@@ -726,8 +2382,7 @@ def St_Epstein_StokesI(sim):
     -------
     St : Field
         Stokes number"""
-    rho = sim.dust.rhos * sim.dust.fill
-    return dust_f.st_epstein_stokes1(sim.dust.a, sim.gas.mfp, rho, sim.gas.Sigma)
+    return _K_ST(sim)
 
 
 def coagulation_parameters(sim):
@@ -755,11 +2410,7 @@ def coagulation_parameters(sim):
     only the non-zero elemts are stored in ``cstick`` of shape ``(4, Nm, Nm)``.
     The positions of the non-zero elements along the first axis are stored
     in ``cstick_ind``. For details see Brauer et al. (2008)."""
-    cstick, cstick_ind, A, eps, klf, krm, phi = dust_f.coagulation_parameters(sim.ini.dust.erosionMassRatio,
-                                                                              sim.ini.dust.excavatedMass,
-                                                                              sim.ini.dust.fragmentDistribution,
-                                                                              sim.grid.m)
-    return cstick, cstick_ind, A, eps, klf, krm, phi
+    return _K_COAG_PARAMS(sim)
 
 
 def vdriftmax(sim):
@@ -793,7 +2444,7 @@ def vrad(sim):
     -------
     vrad : Field
         Radial dust velocity"""
-    return dust_f.vrad(sim.dust.St, sim.dust.v.driftmax, sim.gas.v.rad)
+    return _K_VRAD(sim)
 
 
 def vrel_azimuthal_drift(sim):
@@ -808,7 +2459,7 @@ def vrel_azimuthal_drift(sim):
     -------
     vrel : Field
         Relative velocities"""
-    return dust_f.vrel_azimuthal_drift(sim.dust.v.driftmax, sim.dust.St)
+    return _K_VREL_AZI(sim)
 
 
 def vrel_brownian_motion(sim):
@@ -824,7 +2475,7 @@ def vrel_brownian_motion(sim):
     -------
     vrel : Field
         Relative velocities"""
-    return dust_f.vrel_brownian_motion(sim.gas.cs, sim.grid.m, sim.gas.T)
+    return _K_VREL_BROWN(sim)
 
 
 def vrel_radial_drift(sim):
@@ -839,7 +2490,7 @@ def vrel_radial_drift(sim):
     -------
     vrel : Field
         Relative velocities"""
-    return dust_f.vrel_radial_drift(sim.dust.v.rad)
+    return _K_VREL_RAD(sim)
 
 
 def vrel_tot(sim):
@@ -855,7 +2506,13 @@ def vrel_tot(sim):
     -------
     vrel : Field
         Relative velocities"""
-    return np.sqrt(sim.dust.v.rel.azi**2 + sim.dust.v.rel.brown**2 + sim.dust.v.rel.rad**2 + sim.dust.v.rel.turb**2 + sim.dust.v.rel.vert**2)
+    return xp.sqrt(
+        sim.dust.v.rel.azi**2
+        + sim.dust.v.rel.brown**2
+        + sim.dust.v.rel.rad**2
+        + sim.dust.v.rel.turb**2
+        + sim.dust.v.rel.vert**2
+    )
 
 
 def vrel_turbulent_motion(sim):
@@ -871,13 +2528,7 @@ def vrel_turbulent_motion(sim):
     -------
     vrel : Field
         Relative velocities"""
-    return dust_f.vrel_ormel_cuzzi_2007(
-        sim.dust.delta.turb,
-        sim.gas.cs,
-        sim.gas.mu,
-        sim.grid.OmegaK,
-        sim.gas.Sigma,
-        sim.dust.St)
+    return _K_VREL_TURB(sim)
 
 
 def vrel_vertical_settling(sim):
@@ -892,10 +2543,10 @@ def vrel_vertical_settling(sim):
     -------
     vrel : Field
         Relative velocities"""
-    return dust_f.vrel_vertical_settling(sim.dust.H, sim.grid.OmegaK, sim.dust.St)
+    return _K_VREL_VERT(sim)
 
 
-def _f_impl_1_direct(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
+def _f_impl_1_direct_numpy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
     """Implicit 1st-order integration scheme with direct matrix inversion
 
     Parameters
@@ -922,30 +2573,49 @@ def _f_impl_1_direct(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
     ---|---
        | 1
     """
+    dx = float(to_numpy(dx))
+
     if jac is None:
         jac = Y0.jacobian(x0, dx)
     if rhs is None:
-        rhs = np.array(Y0.ravel())
+        rhs = np.asarray(_field_data(Y0.ravel()))
 
     Nm = Y0._owner.dust.Sigma.shape[1]
 
     # Add external source terms to right-hand side
-    rhs[Nm:-Nm] += dx*Y0._owner.dust.S.ext[1:-1, ...].ravel()
+    rhs[Nm:-Nm] += dx * _field_data(Y0._owner.dust.S.ext[1:-1, ...]).ravel()
 
     N = jac.shape[0]
     eye = sp.identity(N, format="csc")
-
     A = eye - dx * jac
 
-    A_LU = sp.linalg.splu(A,
-                          permc_spec="MMD_AT_PLUS_A",
-                          diag_pivot_thresh=0.0,
-                          options=dict(SymmetricMode=True))
-    Y1_ravel = A_LU.solve(rhs)
+    Y1_ravel = solve_sparse_linear_system(A, rhs)
 
     Y1 = Y1_ravel.reshape(Y0.shape)
 
     return Y1 - Y0
+
+
+def _f_impl_1_direct_cupy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
+    """CuPy-only implicit 1st-order integration scheme with GPU sparse solve."""
+    if jac is None:
+        jac = Y0.jacobian(x0, dx)
+    if rhs is None:
+        rhs = cp.asarray(_field_data(Y0.ravel()))
+
+    Nm = Y0._owner.dust.Sigma.shape[1]
+    rhs[Nm:-Nm] += dx * _field_data(Y0._owner.dust.S.ext[1:-1, ...]).ravel()
+
+    jac_gpu = jac.tocsr() if isinstance(jac, cp_sparse.spmatrix) else cp_sparse.csr_matrix(jac)
+    A = cp_sparse.identity(jac_gpu.shape[0], format="csr", dtype=jac_gpu.dtype) - dx * jac_gpu
+
+    Y1_ravel = solve_sparse_linear_system(A, rhs)
+    Y1 = Y1_ravel.reshape(Y0.shape)
+    return Y1 - Y0
+
+
+def _f_impl_1_direct(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
+    return _K_IMPL_1_DIRECT(x0, Y0, dx, jac=jac, rhs=rhs, *args, **kwargs)
 
 
 class impl_1_direct(Scheme):
@@ -953,3 +2623,7 @@ class impl_1_direct(Scheme):
 
     def __init__(self):
         super().__init__(_f_impl_1_direct, description="Implicit 1st-order direct solver")
+
+
+# Initialize default bindings at import time after all functions are defined.
+bind_backend_kernels()
