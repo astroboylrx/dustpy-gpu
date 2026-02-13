@@ -109,8 +109,6 @@ _JFRAG_MAP_CACHE_KEY = None
 _JFRAG_MAP_CACHE_VALUE = None
 _JCOAG_WORK_CACHE_KEY = None
 _JCOAG_WORK_CACHE_VALUE = None
-_JCOAG_ROWOFF_CACHE_KEY = None
-_JCOAG_ROWOFF_CACHE_VALUE = None
 _DUST_JHB_PATTERN_CACHE_KEY = None
 _DUST_JHB_PATTERN_CACHE_VALUE = None
 _JCOAG_WORKBUF_MODE = "fresh"
@@ -127,7 +125,7 @@ def _get_jcoag_chunk_size(Nr_int, Nm):
             pass
 
     # Auto heuristic tuned for production-like grids:
-    # use full-radius batches for moderate grids, otherwise keep memory bounded.
+    # use one wide batch when grids are moderate, otherwise cap temporary size.
     if int(Nr_int) <= 256 and int(Nm) <= 128:
         return int(Nr_int)
     base = 128 if int(Nm) >= 96 else 64
@@ -760,6 +758,8 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
 
     agrid = float(np.log10(m_cpu[0] / m_cpu[Nm - 1])) / (1.0 - Nm)
     q = int(np.ceil(np.log10(2.0) / agrid))
+    src_i_cpu, src_j_cpu, _, _, _ = _get_jcoag_pattern(3, Nm, q)
+    flat_sel = (src_i_cpu * Nm + src_j_cpu).astype(np.int64, copy=False)
 
     neg1_col = iRM_cpu[:, Nm - 1]
     neg1_positions = np.where(neg1_col == -1)[0]
@@ -769,40 +769,39 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
     tri = np.tri(Nm, dtype=bool)
     i_all, j_all = np.nonzero(tri)
 
-    stick_targets = []
+    # Build sticking as a sparse linear operator over pair-rates:
+    # (Nm*Nm, n_pairs) @ (n_pairs, span) -> (Nm*Nm, span).
+    n_pairs = int(i_all.size)
+    stick_rows_parts = []
+    stick_cols_parts = []
+    stick_vals_parts = []
     for l in range(4):
         k_all = iStick_cpu[l, j_all, i_all]
         valid = k_all >= 0
-        valid_idx = np.where(valid)[0]
+        if not np.any(valid):
+            continue
+        valid_idx = np.where(valid)[0].astype(np.int64, copy=False)
         k_v = k_all[valid]
         i_v = i_all[valid]
         coeff_v = D_cpu[k_v, i_v] * cStick_cpu[l, j_all[valid], i_all[valid]]
-        flat = k_v * Nm + i_v
-        stick_targets.append(
-            (
-                cp.asarray(flat.astype(np.int64)),
-                cp.asarray(coeff_v),
-                cp.asarray(valid_idx.astype(np.int64)),
-            )
-        )
+        stick_rows_parts.append((k_v * Nm + i_v).astype(np.int64, copy=False))
+        stick_cols_parts.append(valid_idx)
+        stick_vals_parts.append(coeff_v)
+    if len(stick_rows_parts) > 0:
+        stick_rows = np.concatenate(stick_rows_parts)
+        stick_cols = np.concatenate(stick_cols_parts)
+        stick_vals = np.concatenate(stick_vals_parts)
+        stick_mat_cpu = sp.coo_matrix(
+            (stick_vals, (stick_rows, stick_cols)),
+            shape=(int(Nm * Nm), n_pairs),
+        ).tocsr()
+        stick_sel_mat_gpu = cp_sparse.csr_matrix(stick_mat_cpu[flat_sel, :])
+        stick_idx_count = int(stick_rows.size)
+    else:
+        stick_sel_mat_gpu = None
+        stick_idx_count = 0
 
-    stick_cat_flat = None
-    stick_cat_coeff = None
-    stick_cat_src = None
-    if len(stick_targets) > 0:
-        flat_parts = []
-        coeff_parts = []
-        src_parts = []
-        for flat, coeff, src in stick_targets:
-            if int(flat.size) > 0:
-                flat_parts.append(flat)
-                coeff_parts.append(coeff)
-                src_parts.append(src)
-        if len(flat_parts) > 0:
-            stick_cat_flat = cp.concatenate(flat_parts)
-            stick_cat_coeff = cp.concatenate(coeff_parts)
-            stick_cat_src = cp.concatenate(src_parts)
-
+    # Precompute fragmentation redistribution once in packed (flat) form.
     klf_vals = iLF_cpu[j_all, i_all]
     frag_valid = klf_vals >= 0
     klf_v = klf_vals[frag_valid]
@@ -810,10 +809,25 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
     m_i_v = m_cpu[i_all[frag_valid]]
     i_frag = i_all[frag_valid]
     n_frag = int(np.sum(frag_valid))
-    frag_dist_gpu = cp.asarray((A_v[:, None] * phi_cpu[klf_v, :]) / m_i_v[:, None])
-    k_range = np.arange(Nm)
-    frag_flat_gpu = cp.asarray((k_range[:, None] * Nm + i_frag[None, :]).ravel().astype(np.int64))
+    frag_dist_cpu = (A_v[:, None] * phi_cpu[klf_v, :]) / m_i_v[:, None]
+    k_range = np.arange(Nm, dtype=np.int64)
+    # Prebuild sparse redistribution operator (Nm*Nm, n_frag): each column is
+    # one pair's mass redistribution over k for a fixed destination i.
+    if n_frag > 0:
+        frag_rows = (k_range[:, None] * Nm + i_frag[None, :]).ravel()
+        frag_cols = np.broadcast_to(np.arange(n_frag, dtype=np.int64)[None, :], (Nm, n_frag)).ravel()
+        frag_vals = frag_dist_cpu.T.ravel()
+        frag_mat_cpu = sp.coo_matrix(
+            (frag_vals, (frag_rows, frag_cols)),
+            shape=(int(Nm * Nm), n_frag),
+        ).tocsr()
+        frag_sel_mat_gpu = cp_sparse.csr_matrix(frag_mat_cpu[flat_sel, :])
+        frag_idx_count = int(frag_rows.size)
+    else:
+        frag_sel_mat_gpu = None
+        frag_idx_count = 0
 
+    # Split pair space into erosion and full-fragmentation branches.
     is_erosion = j_all <= i_all - p_val - 1
     ero_idx = np.where(is_erosion)[0]
     ero_i = i_all[ero_idx]
@@ -823,26 +837,41 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
     case1 = ero_krm == ero_i - 1
     case2 = ~case1
 
+    # Build erosion/full-fragmentation branch operators once so runtime can use
+    # sparse matmul instead of repeated scatter-index expansion.
     c1_i = ero_i[case1]
     c1_j = ero_j[case1]
     c1_eps = ero_eps[case1]
     c1_pair_idx = ero_idx[case1]
     if len(c1_i) > 0:
-        c1_flat_parts = (
-            cp.asarray(((c1_i - 1) * Nm + c1_i).astype(np.int64)),
-            cp.asarray((c1_i * Nm + c1_i).astype(np.int64)),
-            cp.asarray((c1_j * Nm + c1_i).astype(np.int64)),
+        c1_n = int(len(c1_i))
+        c1_cols = np.arange(c1_n, dtype=np.int64)
+        c1_rows = np.concatenate(
+            (
+                ((c1_i - 1) * Nm + c1_i).astype(np.int64, copy=False),
+                (c1_i * Nm + c1_i).astype(np.int64, copy=False),
+                (c1_j * Nm + c1_i).astype(np.int64, copy=False),
+            )
         )
-        c1_coeff_parts = (
-            cp.asarray(D_cpu[c1_i - 1, c1_i] * c1_eps),
-            cp.asarray(-c1_eps),
-            cp.asarray(-D_cpu[c1_j, c1_i]),
+        c1_cols_rep = np.concatenate((c1_cols, c1_cols, c1_cols))
+        c1_vals = np.concatenate(
+            (
+                D_cpu[c1_i - 1, c1_i] * c1_eps,
+                -c1_eps,
+                -D_cpu[c1_j, c1_i],
+            )
         )
-        c1_flat_cat = cp.concatenate(c1_flat_parts)
-        c1_coeff_mat = cp.stack(c1_coeff_parts, axis=0)
-        c1_pair_idx_gpu = cp.asarray(c1_pair_idx.astype(np.int64))
+        c1_mat_cpu = sp.coo_matrix(
+            (c1_vals, (c1_rows, c1_cols_rep)),
+            shape=(int(Nm * Nm), c1_n),
+        ).tocsr()
+        c1_sel_mat_gpu = cp_sparse.csr_matrix(c1_mat_cpu[flat_sel, :])
+        c1_pair_idx_gpu = cp.asarray(c1_pair_idx.astype(np.int64, copy=False))
+        c1_idx_count = int(c1_rows.size)
     else:
-        c1_flat_cat = c1_coeff_mat = c1_pair_idx_gpu = None
+        c1_sel_mat_gpu = None
+        c1_pair_idx_gpu = None
+        c1_idx_count = 0
 
     c2_i = ero_i[case2]
     c2_j = ero_j[case2]
@@ -850,63 +879,88 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
     c2_krm = ero_krm[case2]
     c2_pair_idx = ero_idx[case2]
     if len(c2_i) > 0:
-        c2_flat_parts = (
-            cp.asarray((c2_krm * Nm + c2_i).astype(np.int64)),
-            cp.asarray(((c2_krm + 1) * Nm + c2_i).astype(np.int64)),
-            cp.asarray((c2_i * Nm + c2_i).astype(np.int64)),
-            cp.asarray((c2_j * Nm + c2_i).astype(np.int64)),
+        c2_n = int(len(c2_i))
+        c2_cols = np.arange(c2_n, dtype=np.int64)
+        c2_rows = np.concatenate(
+            (
+                (c2_krm * Nm + c2_i).astype(np.int64, copy=False),
+                ((c2_krm + 1) * Nm + c2_i).astype(np.int64, copy=False),
+                (c2_i * Nm + c2_i).astype(np.int64, copy=False),
+                (c2_j * Nm + c2_i).astype(np.int64, copy=False),
+            )
         )
-        c2_coeff_parts = (
-            cp.asarray(D_cpu[c2_krm, c2_i] * c2_eps),
-            cp.asarray(D_cpu[c2_krm + 1, c2_i] * (1.0 - c2_eps)),
-            cp.asarray(-np.ones(len(c2_i))),
-            cp.asarray(-D_cpu[c2_j, c2_i]),
+        c2_cols_rep = np.concatenate((c2_cols, c2_cols, c2_cols, c2_cols))
+        c2_vals = np.concatenate(
+            (
+                D_cpu[c2_krm, c2_i] * c2_eps,
+                D_cpu[c2_krm + 1, c2_i] * (1.0 - c2_eps),
+                -np.ones(c2_n, dtype=np.float64),
+                -D_cpu[c2_j, c2_i],
+            )
         )
-        c2_flat_cat = cp.concatenate(c2_flat_parts)
-        c2_coeff_mat = cp.stack(c2_coeff_parts, axis=0)
-        c2_pair_idx_gpu = cp.asarray(c2_pair_idx.astype(np.int64))
+        c2_mat_cpu = sp.coo_matrix(
+            (c2_vals, (c2_rows, c2_cols_rep)),
+            shape=(int(Nm * Nm), c2_n),
+        ).tocsr()
+        c2_sel_mat_gpu = cp_sparse.csr_matrix(c2_mat_cpu[flat_sel, :])
+        c2_pair_idx_gpu = cp.asarray(c2_pair_idx.astype(np.int64, copy=False))
+        c2_idx_count = int(c2_rows.size)
     else:
-        c2_flat_cat = c2_coeff_mat = c2_pair_idx_gpu = None
+        c2_sel_mat_gpu = None
+        c2_pair_idx_gpu = None
+        c2_idx_count = 0
 
     ff_idx = np.where(~is_erosion)[0]
     ff_i = i_all[ff_idx]
     ff_j = j_all[ff_idx]
     if len(ff_i) > 0:
-        ff_flat_parts = (
-            cp.asarray((ff_i * Nm + ff_i).astype(np.int64)),
-            cp.asarray((ff_j * Nm + ff_i).astype(np.int64)),
+        ff_n = int(len(ff_i))
+        ff_cols = np.arange(ff_n, dtype=np.int64)
+        ff_rows = np.concatenate(
+            (
+                (ff_i * Nm + ff_i).astype(np.int64, copy=False),
+                (ff_j * Nm + ff_i).astype(np.int64, copy=False),
+            )
         )
-        ff_coeff_parts = (
-            cp.asarray(-np.ones(len(ff_i))),
-            cp.asarray(-D_cpu[ff_j, ff_i]),
+        ff_cols_rep = np.concatenate((ff_cols, ff_cols))
+        ff_vals = np.concatenate(
+            (
+                -np.ones(ff_n, dtype=np.float64),
+                -D_cpu[ff_j, ff_i],
+            )
         )
-        ff_flat_cat = cp.concatenate(ff_flat_parts)
-        ff_coeff_mat = cp.stack(ff_coeff_parts, axis=0)
-        ff_pair_idx_gpu = cp.asarray(ff_idx.astype(np.int64))
+        ff_mat_cpu = sp.coo_matrix(
+            (ff_vals, (ff_rows, ff_cols_rep)),
+            shape=(int(Nm * Nm), ff_n),
+        ).tocsr()
+        ff_sel_mat_gpu = cp_sparse.csr_matrix(ff_mat_cpu[flat_sel, :])
+        ff_pair_idx_gpu = cp.asarray(ff_idx.astype(np.int64, copy=False))
+        ff_idx_count = int(ff_rows.size)
     else:
-        ff_flat_cat = ff_coeff_mat = ff_pair_idx_gpu = None
+        ff_sel_mat_gpu = None
+        ff_pair_idx_gpu = None
+        ff_idx_count = 0
 
     pre = {
         "q": q,
         "j_gpu": cp.asarray(j_all.astype(np.int64)),
         "i_gpu": cp.asarray(i_all.astype(np.int64)),
-        "stick_targets": stick_targets,
-        "stick_cat_flat": stick_cat_flat,
-        "stick_cat_coeff": stick_cat_coeff,
-        "stick_cat_src": stick_cat_src,
+        "n_pairs": n_pairs,
+        "stick_sel_mat_gpu": stick_sel_mat_gpu,
+        "stick_idx_count": stick_idx_count,
         "frag_valid_gpu": cp.asarray(np.where(frag_valid)[0].astype(np.int64)),
-        "frag_dist_gpu": frag_dist_gpu,
-        "frag_flat_gpu": frag_flat_gpu,
+        "frag_sel_mat_gpu": frag_sel_mat_gpu,
+        "frag_idx_count": frag_idx_count,
         "n_frag": n_frag,
-        "c1_flat_cat": c1_flat_cat,
-        "c1_coeff_mat": c1_coeff_mat,
+        "c1_sel_mat_gpu": c1_sel_mat_gpu,
         "c1_pair_idx_gpu": c1_pair_idx_gpu,
-        "c2_flat_cat": c2_flat_cat,
-        "c2_coeff_mat": c2_coeff_mat,
+        "c1_idx_count": c1_idx_count,
+        "c2_sel_mat_gpu": c2_sel_mat_gpu,
         "c2_pair_idx_gpu": c2_pair_idx_gpu,
-        "ff_flat_cat": ff_flat_cat,
-        "ff_coeff_mat": ff_coeff_mat,
+        "c2_idx_count": c2_idx_count,
+        "ff_sel_mat_gpu": ff_sel_mat_gpu,
         "ff_pair_idx_gpu": ff_pair_idx_gpu,
+        "ff_idx_count": ff_idx_count,
     }
     _JCOAG_PRECOMP_CACHE_KEY = key
     _JCOAG_PRECOMP_CACHE_VALUE = pre
@@ -940,7 +994,7 @@ def _get_boundary_basis_cupy(Nr, Nm, dtype):
 
 
 def _get_dust_hyd_boundary_pattern_cupy(Nr, Nm):
-    """Return cached COO pattern for (J_hyd + J_in + J_out) assembly."""
+    """Return cached duplicate-aware CSR helpers for (J_hyd + J_in + J_out)."""
     global _DUST_JHB_PATTERN_CACHE_KEY, _DUST_JHB_PATTERN_CACHE_VALUE
     key = (int(Nr), int(Nm))
     if _DUST_JHB_PATTERN_CACHE_KEY == key and _DUST_JHB_PATTERN_CACHE_VALUE is not None:
@@ -972,12 +1026,35 @@ def _get_dust_hyd_boundary_pattern_cupy(Nr, Nm):
 
     row_all = np.hstack((row_hyd, row_b))
     col_all = np.hstack((col_hyd, col_b))
+    # Build CSR structure once and map each original COO entry to the unique
+    # CSR data slot so runtime can reduce duplicates with a single scatter.
+    coo_struct = sp.coo_matrix(
+        (np.ones(int(row_all.size), dtype=np.float64), (row_all, col_all)),
+        shape=(Ntot, Ntot),
+    )
+    csr_struct = coo_struct.tocsr()
+    indptr = csr_struct.indptr.astype(np.int64, copy=False)
+    indices = csr_struct.indices.astype(np.int64, copy=False)
+
+    pair_to_pos = {}
+    for r in range(Ntot):
+        s = int(indptr[r])
+        e = int(indptr[r + 1])
+        cols = indices[s:e]
+        for off, c in enumerate(cols):
+            pair_to_pos[(r, int(c))] = s + off
+    map_idx = np.fromiter(
+        (pair_to_pos[(int(r), int(c))] for r, c in zip(row_all, col_all)),
+        dtype=np.int64,
+        count=int(row_all.size),
+    )
 
     _DUST_JHB_PATTERN_CACHE_KEY = key
     _DUST_JHB_PATTERN_CACHE_VALUE = (
-        cp.asarray(row_all),
-        cp.asarray(col_all),
         int(row_hyd.size),
+        cp.asarray(map_idx),
+        cp.asarray(indices),
+        cp.asarray(indptr),
     )
     return _DUST_JHB_PATTERN_CACHE_VALUE
 
@@ -1044,17 +1121,6 @@ def _get_jcoag_work_buffer(Nr, Nm, dtype):
     return _JCOAG_WORK_CACHE_VALUE
 
 
-def _get_jcoag_row_offsets(Nr_int, Nm):
-    """Cache flattened row offsets for Jacobian chunk scatters."""
-    global _JCOAG_ROWOFF_CACHE_KEY, _JCOAG_ROWOFF_CACHE_VALUE
-    key = (int(Nr_int), int(Nm))
-    if _JCOAG_ROWOFF_CACHE_KEY != key or _JCOAG_ROWOFF_CACHE_VALUE is None:
-        row_stride = int(Nm * Nm)
-        _JCOAG_ROWOFF_CACHE_KEY = key
-        _JCOAG_ROWOFF_CACHE_VALUE = cp.arange(int(Nr_int), dtype=cp.int64) * row_stride
-    return _JCOAG_ROWOFF_CACHE_VALUE
-
-
 def _jacobian_coagulation_generator_cupy(
     A, cStick, eps, iLF, iRM, iStick, m, phi, Rf, Rs, Sigma, SigmaFloor
 ):
@@ -1080,85 +1146,52 @@ def _jacobian_coagulation_generator_cupy(
     q = pre["q"]
     j_gpu = pre["j_gpu"]
     i_gpu = pre["i_gpu"]
-    stick_cat_flat = pre["stick_cat_flat"]
-    stick_cat_coeff = pre["stick_cat_coeff"]
-    stick_cat_src = pre["stick_cat_src"]
-
-    if _JCOAG_WORKBUF_MODE == "reuse":
-        jac = _get_jcoag_work_buffer(Nr, Nm, Sigma.dtype)
-    else:
-        jac = cp.zeros((Nr, Nm, Nm), dtype=Sigma.dtype)
+    _, src_j, row, col, _, _, _, _ = _get_jcoag_pattern_cupy(Nr, Nm, q)
 
     Nr_int = Nr - 2
-    jac_mid_flat = jac[1:-1].reshape(-1)
+    L = int(src_j.size)
+    dat_mid = cp.zeros((Nr_int, L), dtype=Sigma.dtype)
     n_mid = N[1:-1]
     Rs_mid = Rs[1:-1]
     Rf_mid = Rf[1:-1]
-    row_offsets_all = _get_jcoag_row_offsets(Nr_int, Nm)
 
-    # Chunk over radius to reduce Python/kernel-launch overhead while keeping
-    # temporary allocations bounded on large production grids.
+    # Chunk over radius to balance launch overhead and temporary memory.
     chunk_size = _get_jcoag_chunk_size(Nr_int, Nm)
     for start in range(0, Nr_int, chunk_size):
         stop = min(start + chunk_size, Nr_int)
-        span = stop - start
-        row_offsets = row_offsets_all[start:stop, None]
+        dat_chunk = dat_mid[start:stop]
 
         rates_s = n_mid[start:stop, j_gpu] * Rs_mid[start:stop, j_gpu, i_gpu]
         ratef = n_mid[start:stop, j_gpu] * Rf_mid[start:stop, j_gpu, i_gpu]
 
-        if stick_cat_flat is not None:
-            idx = row_offsets + stick_cat_flat[None, :]
-            vals = stick_cat_coeff[None, :] * rates_s[:, stick_cat_src]
-            _scatter_add_1d(
-                jac_mid_flat,
-                idx.reshape(span * int(stick_cat_flat.size)),
-                vals.reshape(span * int(stick_cat_flat.size)),
-            )
+        if pre["stick_sel_mat_gpu"] is not None:
+            # Sticking contribution from all pair-rates in one sparse matmul.
+            dat_chunk += pre["stick_sel_mat_gpu"].dot(rates_s.T).T
 
         if pre["n_frag"] > 0:
+            # Apply fragmentation via sparse operator to avoid building massive
+            # per-step flat index tensors for (k, pair) redistribution.
             ratef_v = ratef[:, pre["frag_valid_gpu"]]
-            frag_vals = (
-                pre["frag_dist_gpu"][None, :, :] * ratef_v[:, :, None]
-            ).transpose(0, 2, 1).reshape(span, -1)
-            frag_idx = row_offsets + pre["frag_flat_gpu"][None, :]
-            _scatter_add_1d(
-                jac_mid_flat,
-                frag_idx.reshape(-1),
-                frag_vals.reshape(-1),
-            )
+            dat_chunk += pre["frag_sel_mat_gpu"].dot(ratef_v.T).T
 
-        if pre["c1_flat_cat"] is not None:
+        if pre["c1_sel_mat_gpu"] is not None:
             ratef_c1 = ratef[:, pre["c1_pair_idx_gpu"]]
-            c1_idx = row_offsets + pre["c1_flat_cat"][None, :]
-            c1_vals = (
-                pre["c1_coeff_mat"][None, :, :] * ratef_c1[:, None, :]
-            ).reshape(span, -1)
-            _scatter_add_1d(jac_mid_flat, c1_idx.reshape(-1), c1_vals.reshape(-1))
+            dat_chunk += pre["c1_sel_mat_gpu"].dot(ratef_c1.T).T
 
-        if pre["c2_flat_cat"] is not None:
+        if pre["c2_sel_mat_gpu"] is not None:
             ratef_c2 = ratef[:, pre["c2_pair_idx_gpu"]]
-            c2_idx = row_offsets + pre["c2_flat_cat"][None, :]
-            c2_vals = (
-                pre["c2_coeff_mat"][None, :, :] * ratef_c2[:, None, :]
-            ).reshape(span, -1)
-            _scatter_add_1d(jac_mid_flat, c2_idx.reshape(-1), c2_vals.reshape(-1))
+            dat_chunk += pre["c2_sel_mat_gpu"].dot(ratef_c2.T).T
 
-        if pre["ff_flat_cat"] is not None:
+        if pre["ff_sel_mat_gpu"] is not None:
             ratef_ff = ratef[:, pre["ff_pair_idx_gpu"]]
-            ff_idx = row_offsets + pre["ff_flat_cat"][None, :]
-            ff_vals = (
-                pre["ff_coeff_mat"][None, :, :] * ratef_ff[:, None, :]
-            ).reshape(span, -1)
-            _scatter_add_1d(jac_mid_flat, ff_idx.reshape(-1), ff_vals.reshape(-1))
+            dat_chunk += pre["ff_sel_mat_gpu"].dot(ratef_ff.T).T
 
-    src_i, src_j, row, col, _, _, _, _ = _get_jcoag_pattern_cupy(Nr, Nm, q)
-    dat_gpu = jac[1:-1, src_i, src_j]
+    # Apply active-mass masking directly on packed sparse data values.
     active = Sigma[1:-1] > SigmaFloor[1:-1]
     any_active = cp.any(active, axis=1)
     imax_arr = cp.where(any_active, Nm - cp.argmax(active[:, ::-1], axis=1), 0)
-    dat_gpu *= (src_j[None, :] < imax_arr[:, None])
-    dat_gpu = dat_gpu.reshape(-1)
+    dat_mid *= (src_j[None, :] < imax_arr[:, None])
+    dat_gpu = dat_mid.reshape(-1)
     return dat_gpu, row, col
 
 
@@ -1590,7 +1623,6 @@ def bind_backend_kernels(backend=None):
     global _BOUNDARY_BASIS_CACHE_KEY, _BOUNDARY_BASIS_CACHE_VALUE
     global _JSTICK_MAP_CACHE_KEY, _JSTICK_MAP_CACHE_VALUE
     global _JFRAG_MAP_CACHE_KEY, _JFRAG_MAP_CACHE_VALUE, _JCOAG_WORK_CACHE_KEY, _JCOAG_WORK_CACHE_VALUE
-    global _JCOAG_ROWOFF_CACHE_KEY, _JCOAG_ROWOFF_CACHE_VALUE
     global _DUST_JHB_PATTERN_CACHE_KEY, _DUST_JHB_PATTERN_CACHE_VALUE
     global _JCOAG_WORKBUF_MODE, _SCATTER_MODE
 
@@ -1661,8 +1693,6 @@ def bind_backend_kernels(backend=None):
     _JFRAG_MAP_CACHE_VALUE = None
     _JCOAG_WORK_CACHE_KEY = None
     _JCOAG_WORK_CACHE_VALUE = None
-    _JCOAG_ROWOFF_CACHE_KEY = None
-    _JCOAG_ROWOFF_CACHE_VALUE = None
     _DUST_JHB_PATTERN_CACHE_KEY = None
     _DUST_JHB_PATTERN_CACHE_VALUE = None
 
@@ -2167,7 +2197,7 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(
         area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
     )
-    row_hb, col_hb, n_hyd = _get_dust_hyd_boundary_pattern_cupy(Nr, Nm)
+    n_hyd, jhb_map, jhb_indices, jhb_indptr = _get_dust_hyd_boundary_pattern_cupy(Nr, Nm)
     dat_hyd = cp.concatenate((A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]))
 
     sim.dust._rhs[Nm:-Nm] = sim.dust.Sigma.ravel()[Nm:-Nm]
@@ -2248,7 +2278,9 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     dat_hb = cp.empty((n_hyd + int(6 * Nm),), dtype=dat_hyd.dtype)
     dat_hb[:n_hyd] = dat_hyd
     dat_hb[n_hyd:] = dat_bound
-    J_hb = cp_sparse.csr_matrix((dat_hb, (row_hb, col_hb)), shape=(Ntot, Ntot))
+    dat_hb_csr = cp.zeros((int(jhb_indices.size),), dtype=dat_hyd.dtype)
+    _scatter_add_1d(dat_hb_csr, jhb_map, dat_hb)
+    J_hb = cp_sparse.csr_matrix((dat_hb_csr, jhb_indices, jhb_indptr), shape=(Ntot, Ntot))
     return J_coag + J_hb
 
 
