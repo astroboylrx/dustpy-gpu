@@ -63,16 +63,16 @@ def _env_bool(name, default=False):
 def _load_cupy_gmres_config():
     return {
         "tier1": {
-            "rtol": float(os.getenv("DUSTPY_CUPY_GMRES_RTOL", "1e-10")),
-            "atol": float(os.getenv("DUSTPY_CUPY_GMRES_ATOL", "1e-10")),
+            "rtol": float(os.getenv("DUSTPY_CUPY_GMRES_RTOL", "1e-14")),
+            "atol": float(os.getenv("DUSTPY_CUPY_GMRES_ATOL", "1e-14")),
             "maxiter": int(os.getenv("DUSTPY_CUPY_GMRES_MAXITER", "1000")),
-            "restart": int(os.getenv("DUSTPY_CUPY_GMRES_RESTART", "42")),
+            "restart": int(os.getenv("DUSTPY_CUPY_GMRES_RESTART", "64")),
         },
         "tier2": {
-            "rtol": float(os.getenv("DUSTPY_CUPY_GMRES_FALLBACK_RTOL", "1e-8")),
-            "atol": float(os.getenv("DUSTPY_CUPY_GMRES_FALLBACK_ATOL", "1e-8")),
+            "rtol": float(os.getenv("DUSTPY_CUPY_GMRES_FALLBACK_RTOL", "1e-10")),
+            "atol": float(os.getenv("DUSTPY_CUPY_GMRES_FALLBACK_ATOL", "1e-10")),
             "maxiter": int(os.getenv("DUSTPY_CUPY_GMRES_FALLBACK_MAXITER", "2000")),
-            "restart": int(os.getenv("DUSTPY_CUPY_GMRES_FALLBACK_RESTART", "128")),
+            "restart": int(os.getenv("DUSTPY_CUPY_GMRES_FALLBACK_RESTART", "150")),
         },
         "cpu_fallback": _env_bool("DUSTPY_CUPY_GMRES_CPU_FALLBACK", default=False),
     }
@@ -81,12 +81,32 @@ def _load_cupy_gmres_config():
 _CUPY_GMRES_CONFIG = _load_cupy_gmres_config()
 _BOUND_SOLVER_BACKEND = None
 _SOLVE_SPARSE_IMPL = None
+_BOUND_GAS_SOLVER_BACKEND = None
+_BOUND_GAS_SOLVER_MODE = None
+_SOLVE_GAS_SPARSE_IMPL = None
+
+
+def _load_cupy_gas_solver_config():
+    mode = os.getenv("DUSTPY_CUPY_GAS_SOLVER", "cpu_direct").strip().lower()
+    aliases = {
+        "cpu": "cpu_direct",
+        "cpu_direct": "cpu_direct",
+        "direct_cpu": "cpu_direct",
+        "gpu": "gpu_gmres",
+        "gpu_gmres": "gpu_gmres",
+        "gmres": "gpu_gmres",
+    }
+    return {"mode": aliases.get(mode, "cpu_direct")}
+
+
+_CUPY_GAS_SOLVER_CONFIG = _load_cupy_gas_solver_config()
 
 
 def reload_cupy_gmres_config():
     """Reload CuPy GMRES settings from environment variables."""
-    global _CUPY_GMRES_CONFIG
+    global _CUPY_GMRES_CONFIG, _CUPY_GAS_SOLVER_CONFIG
     _CUPY_GMRES_CONFIG = _load_cupy_gmres_config()
+    _CUPY_GAS_SOLVER_CONFIG = _load_cupy_gas_solver_config()
 
 
 def _cupy_gmres_kwargs(*, rtol, atol, maxiter, restart, precond, x0):
@@ -378,6 +398,30 @@ def _solve_sparse_linear_system_numpy(matrix, rhs):
     return matrix_lu.solve(np.asarray(to_numpy(rhs)))
 
 
+def _solve_sparse_linear_system_cupy_cpu_direct(matrix, rhs):
+    if cp is None or cp_sparse is None:
+        raise RuntimeError("CuPy backend requested but cupy/cupyx is unavailable.")
+
+    if isinstance(matrix, cp_sparse.spmatrix):
+        matrix_cpu = matrix.get()
+    elif sp.issparse(matrix):
+        matrix_cpu = matrix
+    else:
+        matrix_cpu = sp.csr_matrix(np.asarray(to_numpy(matrix)))
+    matrix_cpu = matrix_cpu if sp.isspmatrix_csc(matrix_cpu) else matrix_cpu.tocsc()
+    rhs_cpu = np.asarray(to_numpy(rhs))
+
+    matrix_lu = sp.linalg.splu(
+        matrix_cpu,
+        permc_spec="MMD_AT_PLUS_A",
+        diag_pivot_thresh=0.0,
+        options=dict(SymmetricMode=True),
+    )
+    sol_cpu = matrix_lu.solve(rhs_cpu)
+    _record_transfer("host_to_device:gas_cpu_direct")
+    return cp.asarray(sol_cpu)
+
+
 def bind_sparse_solver(backend=None):
     """Bind sparse linear solver implementation for the selected backend."""
     global _BOUND_SOLVER_BACKEND, _SOLVE_SPARSE_IMPL
@@ -401,5 +445,37 @@ def solve_sparse_linear_system(matrix, rhs):
     return _SOLVE_SPARSE_IMPL(matrix, rhs)
 
 
+def bind_gas_sparse_solver(backend=None):
+    """Bind gas sparse solver implementation for selected backend."""
+    global _BOUND_GAS_SOLVER_BACKEND, _BOUND_GAS_SOLVER_MODE, _SOLVE_GAS_SPARSE_IMPL
+    backend = get_backend() if backend is None else backend
+    mode = _CUPY_GAS_SOLVER_CONFIG["mode"] if backend == "cupy" else "default"
+    if (
+        backend == _BOUND_GAS_SOLVER_BACKEND
+        and mode == _BOUND_GAS_SOLVER_MODE
+        and _SOLVE_GAS_SPARSE_IMPL is not None
+    ):
+        return
+
+    if backend == "cupy" and mode == "cpu_direct":
+        _SOLVE_GAS_SPARSE_IMPL = _solve_sparse_linear_system_cupy_cpu_direct
+    elif backend == "cupy":
+        _SOLVE_GAS_SPARSE_IMPL = _solve_sparse_linear_system_cupy
+    elif backend == "torch":
+        _SOLVE_GAS_SPARSE_IMPL = _solve_sparse_linear_system_torch
+    else:
+        _SOLVE_GAS_SPARSE_IMPL = _solve_sparse_linear_system_numpy
+    _BOUND_GAS_SOLVER_BACKEND = backend
+    _BOUND_GAS_SOLVER_MODE = mode
+
+
+def solve_gas_sparse_linear_system(matrix, rhs):
+    """Solve gas linear system with gas-specific bound solver path."""
+    if _SOLVE_GAS_SPARSE_IMPL is None:
+        bind_gas_sparse_solver()
+    return _SOLVE_GAS_SPARSE_IMPL(matrix, rhs)
+
+
 # Default binding at import time (normally overwritten during run initialize).
 bind_sparse_solver()
+bind_gas_sparse_solver()

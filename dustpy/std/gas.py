@@ -19,9 +19,9 @@ from simframe.backends.api import get_backend
 from simframe.backends.api import select_backend
 from simframe.backends.api import xp
 from dustpy.std import gas_f
-from dustpy.utils.backend import bind_sparse_solver
+from dustpy.utils.backend import bind_gas_sparse_solver
 from dustpy.utils.backend import call_numpy
-from dustpy.utils.backend import solve_sparse_linear_system
+from dustpy.utils.backend import solve_gas_sparse_linear_system
 from dustpy.utils.backend import to_backend
 from dustpy.utils.backend import to_numpy
 import dustpy.constants as c
@@ -454,7 +454,7 @@ def bind_backend_kernels(backend=None):
     if backend == _BOUND_BACKEND and _K_FI is not None:
         return
 
-    bind_sparse_solver(backend=backend)
+    bind_gas_sparse_solver(backend=backend)
 
     _K_ENFORCE_FLOOR = select_backend({"cupy": _enforce_floor_cupy}, backend=backend, default=_enforce_floor_fortran)
     _K_CS = select_backend({"cupy": _cs_isothermal_cupy}, backend=backend, default=_cs_isothermal_fortran)
@@ -998,7 +998,7 @@ def _f_impl_1_direct_numpy(x0, Y0, dx, *args, **kwargs):
 
     jac.data[:] = _modified_jacobian_python(dx, jac.data, jac.indices, jac.indptr)
 
-    Y1 = solve_sparse_linear_system(jac, rhs)
+    Y1 = solve_gas_sparse_linear_system(jac, rhs)
 
     return to_backend(Y1) - Y0
 
@@ -1095,7 +1095,7 @@ def _f_impl_1_direct_cupy(x0, Y0, dx, *args, **kwargs):
     rhs = _modified_rhs_cupy(dx, rhs, Sext)
     jac_gpu = (-dx) * jac_gpu
     jac_gpu = jac_gpu + cp_sparse.identity(nrow, dtype=jac_gpu.dtype, format="csr")
-    Y1 = solve_sparse_linear_system(jac_gpu, rhs)
+    Y1 = solve_gas_sparse_linear_system(jac_gpu, rhs)
     return Y1 - _field_data(Y0)
 
 
