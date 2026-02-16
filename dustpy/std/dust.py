@@ -9,6 +9,7 @@ from dustpy.utils.backend import call_numpy
 from dustpy.utils.backend import bind_sparse_solver
 from dustpy.utils.backend import solve_sparse_linear_system
 from dustpy.utils.backend import to_numpy
+from dustpy.utils.boundary_modes import is_zero_flux_enabled
 from simframe.backends.api import get_backend
 from simframe.backends.api import select_backend
 from simframe.backends.api import xp
@@ -196,6 +197,9 @@ def _F_adv_cupy(sim, Sigma=None):
     Fi[1:-1, :] = Sigma[:-1, :] * xp.maximum(vi[1:-1, :], 0.0) + Sigma[1:, :] * xp.minimum(vi[1:-1, :], 0.0)
     Fi[0, :] = Sigma[0, :] * xp.minimum(vi[1, :], 0.0)
     Fi[-1, :] = Sigma[-1, :] * xp.maximum(vi[-2, :], 0.0)
+    if is_zero_flux_enabled(sim):
+        Fi[0, :] = 0.0
+        Fi[-1, :] = 0.0
     return Fi
 
 
@@ -1242,6 +1246,106 @@ def _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v):
     return A, B, C
 
 
+def _apply_zero_flux_dust_hyd_edges_numpy(A, B, C, area, D, r, ri, SigmaGas, v):
+    """Inject conservative zero-flux boundary rows into dust hydrodynamic Jacobian."""
+    Nr = int(A.shape[0])
+    if Nr < 2:
+        return A, B, C
+
+    area = np.asarray(area)
+    D = np.asarray(D)
+    r = np.asarray(r)
+    ri = np.asarray(ri)
+    SigmaGas = np.asarray(SigmaGas)
+    v = np.asarray(v)
+
+    h = SigmaGas * r
+    hi = np.asarray(_interp_to_interfaces_numpy(h, r, ri))
+    Di = np.asarray(_interp_to_interfaces_numpy(D, r, ri))
+    vi = np.asarray(_interp_to_interfaces_numpy(v, r, ri))
+    vip = np.maximum(vi, 0.0)
+    vim = np.minimum(vi, 0.0)
+    Vinv = (2.0 * c.pi) / area
+    w_in = r[1] - r[0]
+    w_out = r[-1] - r[-2]
+
+    h0 = h[0] + 1.0e-300
+    h1 = h[1] + 1.0e-300
+    hm2 = h[-2] + 1.0e-300
+    hm1 = h[-1] + 1.0e-300
+
+    A[0, :] = 0.0
+    B[0, :] = (
+        -vip[1, :] * r[0]
+        - Di[1, :] * hi[1] / (w_in * h0) * r[0]
+    ) * Vinv[0]
+    C[0, :] = (
+        -vim[1, :] * r[1]
+        + Di[1, :] * hi[1] / (w_in * h1) * r[1]
+    ) * Vinv[0]
+
+    A[-1, :] = (
+        vip[-2, :] * r[-2]
+        + Di[-2, :] * hi[-2] / (w_out * hm2) * r[-2]
+    ) * Vinv[-1]
+    B[-1, :] = (
+        vim[-2, :] * r[-1]
+        - Di[-2, :] * hi[-2] / (w_out * hm1) * r[-1]
+    ) * Vinv[-1]
+    C[-1, :] = 0.0
+    return A, B, C
+
+
+def _apply_zero_flux_dust_hyd_edges_cupy(A, B, C, area, D, r, ri, SigmaGas, v):
+    """Inject conservative zero-flux boundary rows into dust hydrodynamic Jacobian."""
+    Nr = int(A.shape[0])
+    if Nr < 2:
+        return A, B, C
+
+    area = _field_data(area)
+    D = _field_data(D)
+    r = _field_data(r)
+    ri = _field_data(ri)
+    SigmaGas = _field_data(SigmaGas)
+    v = _field_data(v)
+
+    h = SigmaGas * r
+    hi = _interp_to_interfaces(h, r, ri)
+    Di = _interp_to_interfaces(D, r, ri)
+    vi = _interp_to_interfaces(v, r, ri)
+    vip = xp.maximum(vi, 0.0)
+    vim = xp.minimum(vi, 0.0)
+    Vinv = (2.0 * c.pi) / area
+    w_in = r[1] - r[0]
+    w_out = r[-1] - r[-2]
+
+    h0 = h[0] + 1.0e-300
+    h1 = h[1] + 1.0e-300
+    hm2 = h[-2] + 1.0e-300
+    hm1 = h[-1] + 1.0e-300
+
+    A[0, :] = 0.0
+    B[0, :] = (
+        -vip[1, :] * r[0]
+        - Di[1, :] * hi[1] / (w_in * h0) * r[0]
+    ) * Vinv[0]
+    C[0, :] = (
+        -vim[1, :] * r[1]
+        + Di[1, :] * hi[1] / (w_in * h1) * r[1]
+    ) * Vinv[0]
+
+    A[-1, :] = (
+        vip[-2, :] * r[-2]
+        + Di[-2, :] * hi[-2] / (w_out * hm2) * r[-2]
+    ) * Vinv[-1]
+    B[-1, :] = (
+        vim[-2, :] * r[-1]
+        - Di[-2, :] * hi[-2] / (w_out * hm1) * r[-1]
+    ) * Vinv[-1]
+    C[-1, :] = 0.0
+    return A, B, C
+
+
 def _kernel_fortran(sim):
     return _dust_f_call(
         dust_f.kernel,
@@ -1749,7 +1853,9 @@ def finalize_explicit(sim):
     ----------
     sim : Frame
         Parent integration frame"""
-    boundary(sim)
+    # Closed-box mode must not re-impose value/gradient boundary forcing.
+    if not is_zero_flux_enabled(sim):
+        boundary(sim)
     enforce_floor_value(sim)
 
 
@@ -1760,7 +1866,9 @@ def finalize_implicit(sim):
     ----------
     sim : Frame
         Parent integration frame"""
-    boundary(sim)
+    # Closed-box mode must not re-impose value/gradient boundary forcing.
+    if not is_zero_flux_enabled(sim):
+        boundary(sim)
     enforce_floor_value(sim)
     sim.dust.v.rad.update()
     sim.dust.Fi.update()
@@ -1781,16 +1889,22 @@ def set_implicit_boundaries(sim):
                          sim.dust._SigmaOld[0])/(sim.t.prevstepsize+1.e-100)
     sim.dust.S.tot[-1] = (sim.dust.Sigma[-1] -
                           sim.dust._SigmaOld[-1])/(sim.t.prevstepsize+1.e-100)
-    # Hydrodynamic source terms
-    sim.dust.S.hyd[0] = sim.dust.S.tot[0]
-    sim.dust.S.hyd[-1] = sim.dust.S.tot[-1]
-    # Fluxes
-    sim.dust.Fi.adv[0] = (0.5*sim.dust.S.hyd[0]*(sim.grid.ri[1]**2 -
-                                                 sim.grid.ri[0]**2) + sim.grid.ri[1]*sim.dust.Fi.adv[1])/sim.grid.ri[0]
-    sim.dust.Fi.adv[-1] = (sim.dust.Fi.adv[-2]*sim.grid.ri[-2] - 0.5*sim.dust.S.hyd[-1]
-                           * (sim.grid.ri[-1]**2-sim.grid.ri[-2]**2))/sim.grid.ri[-1]
-    sim.dust.Fi.tot[0] = sim.dust.Fi.adv[0]
-    sim.dust.Fi.tot[-1] = sim.dust.Fi.adv[-1]
+    if is_zero_flux_enabled(sim):
+        sim.dust.Fi.adv[0] = 0.0
+        sim.dust.Fi.adv[-1] = 0.0
+        sim.dust.Fi.tot[0] = 0.0
+        sim.dust.Fi.tot[-1] = 0.0
+    else:
+        # Hydrodynamic source terms
+        sim.dust.S.hyd[0] = sim.dust.S.tot[0]
+        sim.dust.S.hyd[-1] = sim.dust.S.tot[-1]
+        # Fluxes
+        sim.dust.Fi.adv[0] = (0.5*sim.dust.S.hyd[0]*(sim.grid.ri[1]**2 -
+                                                     sim.grid.ri[0]**2) + sim.grid.ri[1]*sim.dust.Fi.adv[1])/sim.grid.ri[0]
+        sim.dust.Fi.adv[-1] = (sim.dust.Fi.adv[-2]*sim.grid.ri[-2] - 0.5*sim.dust.S.hyd[-1]
+                               * (sim.grid.ri[-1]**2-sim.grid.ri[-2]**2))/sim.grid.ri[-1]
+        sim.dust.Fi.tot[0] = sim.dust.Fi.adv[0]
+        sim.dust.Fi.tot[-1] = sim.dust.Fi.adv[-1]
 
 
 def dt_adaptive(sim):
@@ -1898,7 +2012,11 @@ def F_adv(sim, Sigma=None):
     -------
     Fi : Field
         Advective mass fluxes through the grid cell interfaces"""
-    return _K_F_ADV(sim, Sigma=Sigma)
+    Fi = _K_F_ADV(sim, Sigma=Sigma)
+    if is_zero_flux_enabled(sim):
+        Fi[0, :] = 0.0
+        Fi[-1, :] = 0.0
+    return Fi
 
 
 def F_diff(sim, Sigma=None):
@@ -1931,6 +2049,9 @@ def F_tot(sim, Sigma=None):
         Fi += _field_data(Fdiff)
     if Fadv is not None:
         Fi += _field_data(Fadv)
+    if is_zero_flux_enabled(sim):
+        Fi[0, :] = 0.0
+        Fi[-1, :] = 0.0
     return Fi
 
 
@@ -2005,6 +2126,7 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
     area = sim.grid.A
     Nr = int(sim.grid.Nr)
     Nm = int(sim.grid.Nm)
+    zero_flux = is_zero_flux_enabled(sim)
 
     # Building coagulation Jacobian
 
@@ -2021,7 +2143,7 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
         shape=(Ntot, Ntot)
     )
 
-    A, B, C = _dust_f_call(
+    A_h, B_h, C_h = _dust_f_call(
         dust_f.jacobian_hydrodynamic_generator,
         area,
         sim.dust.D,
@@ -2031,15 +2153,19 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
         sim.dust.v.rad,
         to_backend_result=False,
     )
+    if zero_flux:
+        A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_numpy(
+            A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
+        )
     J_hyd = sp.diags(
-        (A.ravel()[Nm:], B.ravel(), C.ravel()[:-Nm]),
+        (A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]),
         offsets=(-Nm, 0, Nm),
         shape=(Ntot, Ntot),
         format="csc"
     )
 
-    # Right-hand side
-    sim.dust._rhs[Nm:-Nm] = sim.dust.Sigma.ravel()[Nm:-Nm]
+    # Right-hand side defaults to the current state for all rows.
+    sim.dust._rhs[:] = sim.dust.Sigma.ravel()
 
     # BOUNDARIES
 
@@ -2055,7 +2181,7 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
     col = np.concatenate((col0, col1, col2))
 
     # Filling data vector depending on boundary condition
-    if sim.dust.boundary.inner is not None:
+    if (not zero_flux) and sim.dust.boundary.inner is not None:
         # Given value
         if sim.dust.boundary.inner.condition == "val":
             sim.dust._rhs[:Nm] = sim.dust.boundary.inner.value
@@ -2110,7 +2236,7 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
     col = np.concatenate((col0, col1, col2)) + offset
 
     # Filling data vector depending on boundary condition
-    if sim.dust.boundary.outer is not None:
+    if (not zero_flux) and sim.dust.boundary.outer is not None:
         # Given value
         if sim.dust.boundary.outer.condition == "val":
             sim.dust._rhs[-Nm:] = sim.dust.boundary.outer.value
@@ -2185,6 +2311,7 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     Nr = int(sim.grid.Nr)
     Nm = int(sim.grid.Nm)
     Ntot = int((Nr * Nm))
+    zero_flux = is_zero_flux_enabled(sim)
     q = _get_mass_grid_q(cp.asarray(_field_data(m)), Nm)
     _, _, _, _, _, jcoag_indices, jcoag_indptr, jcoag_perm = _get_jcoag_pattern_cupy(Nr, Nm, q)
 
@@ -2197,15 +2324,20 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(
         area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
     )
+    if zero_flux:
+        A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(
+            A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
+        )
     n_hyd, jhb_map, jhb_indices, jhb_indptr = _get_dust_hyd_boundary_pattern_cupy(Nr, Nm)
     dat_hyd = cp.concatenate((A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]))
 
-    sim.dust._rhs[Nm:-Nm] = sim.dust.Sigma.ravel()[Nm:-Nm]
+    # Right-hand side defaults to the current state for all rows.
+    sim.dust._rhs[:] = sim.dust.Sigma.ravel()
     c_in0 = 0.0
     c_in1 = 0.0
     c_in2 = 0.0
 
-    if sim.dust.boundary.inner is not None:
+    if (not zero_flux) and sim.dust.boundary.inner is not None:
         if sim.dust.boundary.inner.condition == "val":
             sim.dust._rhs[:Nm] = sim.dust.boundary.inner.value
         elif sim.dust.boundary.inner.condition == "const_val":
@@ -2239,7 +2371,7 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     c_out1 = 0.0
     c_out2 = 0.0
 
-    if sim.dust.boundary.outer is not None:
+    if (not zero_flux) and sim.dust.boundary.outer is not None:
         if sim.dust.boundary.outer.condition == "val":
             sim.dust._rhs[-Nm:] = sim.dust.boundary.outer.value
         elif sim.dust.boundary.outer.condition == "const_val":
@@ -2711,6 +2843,7 @@ def _f_impl_1_direct_numpy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
        | 1
     """
     dx = float(to_numpy(dx))
+    zero_flux = is_zero_flux_enabled(Y0._owner)
 
     if jac is None:
         jac = Y0.jacobian(x0, dx)
@@ -2719,8 +2852,11 @@ def _f_impl_1_direct_numpy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
 
     Nm = Y0._owner.dust.Sigma.shape[1]
 
-    # Add external source terms to right-hand side
-    rhs[Nm:-Nm] += dx * _field_data(Y0._owner.dust.S.ext[1:-1, ...]).ravel()
+    # Add external source terms to right-hand side.
+    if zero_flux:
+        rhs[:] += dx * _field_data(Y0._owner.dust.S.ext).ravel()
+    else:
+        rhs[Nm:-Nm] += dx * _field_data(Y0._owner.dust.S.ext[1:-1, ...]).ravel()
 
     N = jac.shape[0]
     eye = sp.identity(N, format="csc")
@@ -2735,13 +2871,17 @@ def _f_impl_1_direct_numpy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
 
 def _f_impl_1_direct_cupy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
     """CuPy-only implicit 1st-order integration scheme with GPU sparse solve."""
+    zero_flux = is_zero_flux_enabled(Y0._owner)
     if jac is None:
         jac = Y0.jacobian(x0, dx)
     if rhs is None:
         rhs = cp.asarray(_field_data(Y0.ravel()))
 
     Nm = Y0._owner.dust.Sigma.shape[1]
-    rhs[Nm:-Nm] += dx * _field_data(Y0._owner.dust.S.ext[1:-1, ...]).ravel()
+    if zero_flux:
+        rhs[:] += dx * _field_data(Y0._owner.dust.S.ext).ravel()
+    else:
+        rhs[Nm:-Nm] += dx * _field_data(Y0._owner.dust.S.ext[1:-1, ...]).ravel()
 
     jac_gpu = jac.tocsr() if isinstance(jac, cp_sparse.spmatrix) else cp_sparse.csr_matrix(jac)
     A = cp_sparse.identity(jac_gpu.shape[0], format="csr", dtype=jac_gpu.dtype) - dx * jac_gpu

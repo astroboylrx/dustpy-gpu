@@ -63,9 +63,10 @@ class Simulation(Frame):
                                                                   "mmax": 1.e5,
                                                                   "Nr": 100,
                                                                   "rmin": 1.*c.au,
-                                                                  "rmax": 1000.*c.au
-                                                                  }
+                                                                 "rmax": 1000.*c.au
+                                                                 }
                                                                ),
+                                       "boundary": SimpleNamespace(**{"zeroFlux": False}),
                                        "star": SimpleNamespace(**{"M": 1.*c.M_sun,
                                                                   "R": 2.*c.R_sun,
                                                                   "T": 5772.,

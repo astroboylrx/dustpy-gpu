@@ -5,6 +5,7 @@ from dustpy.utils.backend import call_numpy
 from dustpy.utils.backend import solve_sparse_linear_system
 from dustpy.utils.backend import to_backend
 from dustpy.utils.backend import to_numpy
+from dustpy.utils.boundary_modes import is_zero_flux_enabled
 from dustpy.utils.data import read_data
 from dustpy.utils.simplenamespace import SimpleNamespace
 from dustpy.utils.version import print_version_warning
@@ -12,6 +13,7 @@ from dustpy.utils.version import print_version_warning
 __all__ = [
     "Boundary",
     "call_numpy",
+    "is_zero_flux_enabled",
     "read_data",
     "print_version_warning",
     "solve_sparse_linear_system",

@@ -24,6 +24,7 @@ from dustpy.utils.backend import call_numpy
 from dustpy.utils.backend import solve_gas_sparse_linear_system
 from dustpy.utils.backend import to_backend
 from dustpy.utils.backend import to_numpy
+from dustpy.utils.boundary_modes import is_zero_flux_enabled
 import dustpy.constants as c
 
 
@@ -107,6 +108,68 @@ def _jac_abc_cupy(area, nu, r, ri, v):
     A *= Vinv
     B *= Vinv
     C *= Vinv
+    return A, B, C
+
+
+def _apply_zero_flux_gas_edges_numpy(A, B, C, area, nu, r, ri, v):
+    """Inject conservative zero-flux boundary rows into gas tridiagonal coeffs."""
+    Nr = int(B.shape[0])
+    if Nr < 2:
+        return A, B, C
+
+    r = np.asarray(r)
+    ri = np.asarray(ri)
+    area = np.asarray(area)
+    nu = np.asarray(nu)
+    v = np.asarray(v)
+
+    vi = np.asarray(_interp_to_interfaces_1d_numpy(v, r, ri))
+    vip = np.maximum(vi, 0.0)
+    vim = np.minimum(vi, 0.0)
+    g = nu / np.sqrt(r)
+    Di = 3.0 * np.sqrt(ri)
+    Vinv = (2.0 * c.pi) / area
+    w_in = r[1] - r[0]
+    w_out = r[-1] - r[-2]
+
+    A[0] = 0.0
+    B[0] = (-vip[1] * r[0] - Di[1] * g[0] / w_in * r[0]) * Vinv[0]
+    C[0] = (-vim[1] * r[1] + Di[1] * g[1] / w_in * r[1]) * Vinv[0]
+
+    A[-1] = (vip[-2] * r[-2] + Di[-2] * g[-2] / w_out * r[-2]) * Vinv[-1]
+    B[-1] = (vim[-2] * r[-1] - Di[-2] * g[-1] / w_out * r[-1]) * Vinv[-1]
+    C[-1] = 0.0
+    return A, B, C
+
+
+def _apply_zero_flux_gas_edges_cupy(A, B, C, area, nu, r, ri, v):
+    """Inject conservative zero-flux boundary rows into gas tridiagonal coeffs."""
+    Nr = int(B.shape[0])
+    if Nr < 2:
+        return A, B, C
+
+    area = _field_data(area)
+    nu = _field_data(nu)
+    r = _field_data(r)
+    ri = _field_data(ri)
+    v = _field_data(v)
+
+    vi = _interp_to_interfaces_1d(v, r, ri)
+    vip = xp.maximum(vi, 0.0)
+    vim = xp.minimum(vi, 0.0)
+    g = nu / xp.sqrt(r)
+    Di = 3.0 * xp.sqrt(ri)
+    Vinv = (2.0 * c.pi) / area
+    w_in = r[1] - r[0]
+    w_out = r[-1] - r[-2]
+
+    A[0] = 0.0
+    B[0] = (-vip[1] * r[0] - Di[1] * g[0] / w_in * r[0]) * Vinv[0]
+    C[0] = (-vim[1] * r[1] + Di[1] * g[1] / w_in * r[1]) * Vinv[0]
+
+    A[-1] = (vip[-2] * r[-2] + Di[-2] * g[-2] / w_out * r[-2]) * Vinv[-1]
+    B[-1] = (vim[-2] * r[-1] - Di[-2] * g[-1] / w_out * r[-1]) * Vinv[-1]
+    C[-1] = 0.0
     return A, B, C
 
 
@@ -285,6 +348,9 @@ def _fi_cupy(sim):
     Fi[1:-1] = Sigma[:-1] * vip[1:-1] + Sigma[1:] * vim[1:-1]
     Fi[0] = Sigma[0] * vim[0]
     Fi[-1] = Sigma[-1] * vip[-1]
+    if is_zero_flux_enabled(sim):
+        Fi[0] = 0.0
+        Fi[-1] = 0.0
     return Fi
 
 
@@ -527,7 +593,9 @@ def finalize(sim):
     ----------
     sim : Frame
         Parent simulation frame"""
-    boundary(sim)
+    # Closed-box mode must not re-impose value/gradient boundary forcing.
+    if not is_zero_flux_enabled(sim):
+        boundary(sim)
     enforce_floor_value(sim)
     sim.gas.v.update()
     sim.gas.Fi.update()
@@ -544,15 +612,20 @@ def set_implicit_boundaries(sim):
         Parent simulation frame"""
     ret = _K_IMPLICIT_BOUNDARIES(sim)
 
-    # Source terms
+    # Source terms at domain edges are inferred from implicit update.
     sim.gas.S.tot[0] = ret[0]
-    sim.gas.S.hyd[0] = ret[0]
     sim.gas.S.tot[-1] = ret[1]
-    sim.gas.S.hyd[-1] = ret[1]
 
-    # Fluxes through boundaries
-    sim.gas.Fi[0] = ret[2]
-    sim.gas.Fi[-1] = ret[3]
+    # Closed-box mode keeps transport fluxes exactly zero at both boundaries.
+    if is_zero_flux_enabled(sim):
+        # Keep hydrodynamic boundary sources from flux update in closed-box mode.
+        sim.gas.Fi[0] = 0.0
+        sim.gas.Fi[-1] = 0.0
+    else:
+        sim.gas.S.hyd[0] = ret[0]
+        sim.gas.S.hyd[-1] = ret[1]
+        sim.gas.Fi[0] = ret[2]
+        sim.gas.Fi[-1] = ret[3]
 
 
 def dt(sim):
@@ -613,7 +686,11 @@ def Fi(sim):
     -------
     Fi : Field
         Mass flux through grid cell interfaces"""
-    return _K_FI(sim)
+    Fi = _K_FI(sim)
+    if is_zero_flux_enabled(sim):
+        Fi[0] = 0.0
+        Fi[-1] = 0.0
+    return Fi
 
 
 def Hp(sim):
@@ -644,8 +721,11 @@ def _jacobian_numpy(sim, x, *args, **kwargs):
     ri = sim.grid.ri
     area = sim.grid.A
     Nr = int(sim.grid.Nr)
+    zero_flux = is_zero_flux_enabled(sim)
 
     A, B, C = _gas_f_call(gas_f.jac_abc, area, nu, r, ri, v, to_backend_result=False)
+    if zero_flux:
+        A, B, C = _apply_zero_flux_gas_edges_numpy(A, B, C, area, nu, r, ri, v)
     sim.gas._rhs[:] = sim.gas.Sigma
 
     indptr, indices = _get_gas_jac_pattern_numpy(Nr)
@@ -663,8 +743,11 @@ def _jacobian_cupy(sim, x, *args, **kwargs):
     ri = sim.grid.ri
     area = sim.grid.A
     Nr = int(sim.grid.Nr)
+    zero_flux = is_zero_flux_enabled(sim)
 
     A, B, C = _jac_abc_cupy(area, nu, r, ri, v)
+    if zero_flux:
+        A, B, C = _apply_zero_flux_gas_edges_cupy(A, B, C, area, nu, r, ri, v)
     sim.gas._rhs[:] = sim.gas.Sigma
 
     indptr, indices = _get_gas_jac_pattern_cupy(Nr)
@@ -900,6 +983,7 @@ def _f_impl_1_direct_numpy(x0, Y0, dx, *args, **kwargs):
     # Getting keyword arguments. Default is standard gas.
     boundary = kwargs.get("boundary", Y0._owner.gas.boundary)
     Sext = kwargs.get("Sext", Y0._owner.gas.S.ext)
+    zero_flux = is_zero_flux_enabled(Y0._owner)
     dx = float(to_numpy(dx))
 
     jac = Y0.jacobian(x0, dx)
@@ -915,7 +999,7 @@ def _f_impl_1_direct_numpy(x0, Y0, dx, *args, **kwargs):
     # Setting boundary values in jac and rhs
 
     # Inner boundary
-    if boundary.inner is not None:
+    if (not zero_flux) and boundary.inner is not None:
         r_in = _boundary_backend_array(boundary.inner, "_r")
         ri_in = _boundary_backend_array(boundary.inner, "_ri")
         # Given value
@@ -955,7 +1039,7 @@ def _f_impl_1_direct_numpy(x0, Y0, dx, *args, **kwargs):
             rhs[0] = 0.
 
     # Outer boundary
-    if boundary.outer is not None:
+    if (not zero_flux) and boundary.outer is not None:
         r_out = _boundary_backend_array(boundary.outer, "_r")
         ri_out = _boundary_backend_array(boundary.outer, "_ri")
         # Given value
@@ -995,6 +1079,10 @@ def _f_impl_1_direct_numpy(x0, Y0, dx, *args, **kwargs):
 
     # Add external source terms to right-hand side
     rhs[:] = _modified_rhs_python(dx, rhs, Sext)
+    if zero_flux:
+        Sext_np = np.asarray(to_numpy(Sext))
+        rhs[0] += dx * Sext_np[0]
+        rhs[-1] += dx * Sext_np[-1]
 
     jac.data[:] = _modified_jacobian_python(dx, jac.data, jac.indices, jac.indptr)
 
@@ -1007,6 +1095,7 @@ def _f_impl_1_direct_cupy(x0, Y0, dx, *args, **kwargs):
     """CuPy-only implicit 1st-order Euler integration with GPU sparse solve."""
     boundary = kwargs.get("boundary", Y0._owner.gas.boundary)
     Sext = kwargs.get("Sext", Y0._owner.gas.S.ext)
+    zero_flux = is_zero_flux_enabled(Y0._owner)
 
     jac = Y0.jacobian(x0, dx)
     rhs = cp.asarray(_field_data(Y0)).copy()
@@ -1031,7 +1120,7 @@ def _f_impl_1_direct_cupy(x0, Y0, dx, *args, **kwargs):
             if pos.size > 0:
                 mat.data[start + int(pos[0])] = val
 
-    if boundary.inner is not None:
+    if (not zero_flux) and boundary.inner is not None:
         r_in = _boundary_backend_array(boundary.inner, "_r")
         ri_in = _boundary_backend_array(boundary.inner, "_ri")
         if boundary.inner.condition == "val":
@@ -1058,7 +1147,7 @@ def _f_impl_1_direct_cupy(x0, Y0, dx, *args, **kwargs):
             _set_csr_row(jac_gpu, 0, {1: -K1 / dx})
             rhs[0] = 0.
 
-    if boundary.outer is not None:
+    if (not zero_flux) and boundary.outer is not None:
         r_out = _boundary_backend_array(boundary.outer, "_r")
         ri_out = _boundary_backend_array(boundary.outer, "_ri")
         if boundary.outer.condition == "val":
@@ -1093,6 +1182,10 @@ def _f_impl_1_direct_cupy(x0, Y0, dx, *args, **kwargs):
             rhs[-1] = 0.
 
     rhs = _modified_rhs_cupy(dx, rhs, Sext)
+    if zero_flux:
+        Sext_arr = _field_data(Sext)
+        rhs[0] += dx * Sext_arr[0]
+        rhs[-1] += dx * Sext_arr[-1]
     jac_gpu = (-dx) * jac_gpu
     jac_gpu = jac_gpu + cp_sparse.identity(nrow, dtype=jac_gpu.dtype, format="csr")
     Y1 = solve_gas_sparse_linear_system(jac_gpu, rhs)

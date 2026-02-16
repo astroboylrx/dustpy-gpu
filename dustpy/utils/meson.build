@@ -1,6 +1,7 @@
 python_sources = [
   '__init__.py',
   'backend.py',
+  'boundary_modes.py',
   'data.py',
   'boundary.py',
   'simplenamespace.py',
