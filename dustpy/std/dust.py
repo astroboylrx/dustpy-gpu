@@ -114,6 +114,7 @@ _DUST_JHB_PATTERN_CACHE_KEY = None
 _DUST_JHB_PATTERN_CACHE_VALUE = None
 _JCOAG_WORKBUF_MODE = "fresh"
 _SCATTER_MODE = "addat"
+_CUPY_DUST_SOLVER_MODE = "sparse"
 
 
 def _get_jcoag_chunk_size(Nr_int, Nm):
@@ -133,6 +134,19 @@ def _get_jcoag_chunk_size(Nr_int, Nm):
     if int(Nr_int) > 384:
         base = 96 if int(Nm) >= 96 else 48
     return max(1, min(int(base), int(Nr_int)))
+
+
+def _get_cupy_dust_solver_mode():
+    """Return CuPy dust implicit solver mode."""
+    raw = os.getenv("DUSTPY_CUPY_DUST_SOLVER", "sparse").strip().lower()
+    aliases = {
+        "sparse": "sparse",
+        "sparse_gpu": "sparse",
+        "gmres": "sparse",
+        "dense": "dense_gpu",
+        "dense_gpu": "dense_gpu",
+    }
+    return aliases.get(raw, "sparse")
 
 
 def _a_fortran(sim):
@@ -1728,7 +1742,7 @@ def bind_backend_kernels(backend=None):
     global _JSTICK_MAP_CACHE_KEY, _JSTICK_MAP_CACHE_VALUE
     global _JFRAG_MAP_CACHE_KEY, _JFRAG_MAP_CACHE_VALUE, _JCOAG_WORK_CACHE_KEY, _JCOAG_WORK_CACHE_VALUE
     global _DUST_JHB_PATTERN_CACHE_KEY, _DUST_JHB_PATTERN_CACHE_VALUE
-    global _JCOAG_WORKBUF_MODE, _SCATTER_MODE
+    global _JCOAG_WORKBUF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE
 
     backend = get_backend() if backend is None else backend
     bind_sparse_solver(backend=backend)
@@ -1738,11 +1752,13 @@ def bind_backend_kernels(backend=None):
     scatter_mode = os.getenv("DUSTPY_SCATTER_MODE", "addat").strip().lower()
     if scatter_mode not in ("addat", "scatter"):
         scatter_mode = "addat"
+    cupy_dust_solver_mode = _get_cupy_dust_solver_mode() if backend == "cupy" else "sparse"
     if (
         backend == _BOUND_BACKEND
         and _K_A is not None
         and mode == _JCOAG_WORKBUF_MODE
         and scatter_mode == _SCATTER_MODE
+        and cupy_dust_solver_mode == _CUPY_DUST_SOLVER_MODE
     ):
         return
 
@@ -1763,12 +1779,17 @@ def bind_backend_kernels(backend=None):
     _K_VREL_TURB = select_backend({"cupy": _vrel_turbulent_motion_cupy}, backend=backend, default=_vrel_turbulent_motion_fortran)
     _K_VREL_VERT = select_backend({"cupy": _vrel_vertical_settling_cupy}, backend=backend, default=_vrel_vertical_settling_fortran)
     _K_COAG_PARAMS = select_backend({"cupy": _coagulation_parameters_python}, backend=backend, default=_coagulation_parameters_fortran)
-    _K_IMPL_1_DIRECT = select_backend({"cupy": _f_impl_1_direct_cupy}, backend=backend, default=_f_impl_1_direct_numpy)
-    _K_JACOBIAN = select_backend({"cupy": _jacobian_cupy}, backend=backend, default=_jacobian_numpy)
+    if backend == "cupy" and cupy_dust_solver_mode == "dense_gpu":
+        _K_IMPL_1_DIRECT = _f_impl_1_direct_cupy_dense
+        _K_JACOBIAN = _jacobian_cupy_dense
+    else:
+        _K_IMPL_1_DIRECT = select_backend({"cupy": _f_impl_1_direct_cupy}, backend=backend, default=_f_impl_1_direct_numpy)
+        _K_JACOBIAN = select_backend({"cupy": _jacobian_cupy}, backend=backend, default=_jacobian_numpy)
     _K_INTERP_TO_INTERFACES = select_backend({"cupy": _interp_to_interfaces_cupy}, backend=backend, default=_interp_to_interfaces_numpy)
 
     _JCOAG_WORKBUF_MODE = mode
     _SCATTER_MODE = scatter_mode
+    _CUPY_DUST_SOLVER_MODE = cupy_dust_solver_mode
 
     _KERNEL_LOWER_MASK = None
     _COAG_CACHE_KEY = None
@@ -2416,6 +2437,148 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     return J_coag + J_hb
 
 
+def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
+    """CuPy Jacobian assembly into a dense matrix (no sparse conversion path)."""
+    A = sim.dust.coagulation.A
+    cstick = sim.dust.coagulation.stick
+    eps = sim.dust.coagulation.eps
+    ilf = sim.dust.coagulation.lf_ind
+    irm = sim.dust.coagulation.rm_ind
+    istick = sim.dust.coagulation.stick_ind
+    m = sim.grid.m
+    phi = sim.dust.coagulation.phi
+    Rf = sim.dust.kernel * sim.dust.p.frag
+    Rs = sim.dust.kernel * sim.dust.p.stick
+    SigD = sim.dust.Sigma
+    SigDfloor = sim.dust.SigmaFloor
+
+    if dx is None:
+        dt = x.stepsize
+    else:
+        dt = dx
+    try:
+        dt = float(dt)
+    except Exception:
+        dt = float(to_numpy(dt))
+
+    r = _field_data(sim.grid.r)
+    ri = _field_data(sim.grid.ri)
+    SigmaArr = _field_data(sim.dust.Sigma)
+    area = sim.grid.A
+    Nr = int(sim.grid.Nr)
+    Nm = int(sim.grid.Nm)
+    Ntot = int(Nr * Nm)
+    zero_flux = is_zero_flux_enabled(sim)
+
+    q = _get_mass_grid_q(cp.asarray(_field_data(m)), Nm)
+    _, _, row, col, _, _, _, _ = _get_jcoag_pattern_cupy(Nr, Nm, q)
+    dat_coag, _, _ = _jacobian_coagulation_generator_cupy(
+        A, cstick, eps, ilf, irm, istick, m, phi, Rf, Rs, SigD, SigDfloor
+    )
+    dtype = dat_coag.dtype
+    J = cp.zeros((Ntot, Ntot), dtype=dtype)
+    J_flat = J.ravel()
+    _scatter_add_1d(J_flat, row * Ntot + col, dat_coag)
+
+    A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(
+        area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
+    )
+    if zero_flux:
+        A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(
+            A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
+        )
+
+    idx = cp.arange(Ntot, dtype=cp.int64)
+    Bflat = B_h.ravel()
+    Aflat = A_h.ravel()
+    Cflat = C_h.ravel()
+    _scatter_add_1d(J_flat, idx * Ntot + idx, Bflat)
+    _scatter_add_1d(J_flat, idx[Nm:] * Ntot + (idx[Nm:] - Nm), Aflat[Nm:])
+    _scatter_add_1d(J_flat, idx[:-Nm] * Ntot + (idx[:-Nm] + Nm), Cflat[:-Nm])
+
+    # Right-hand side defaults to the current state for all rows.
+    sim.dust._rhs[:] = sim.dust.Sigma.ravel()
+    c_in0 = 0.0
+    c_in1 = 0.0
+    c_in2 = 0.0
+
+    if (not zero_flux) and sim.dust.boundary.inner is not None:
+        if sim.dust.boundary.inner.condition == "val":
+            sim.dust._rhs[:Nm] = sim.dust.boundary.inner.value
+        elif sim.dust.boundary.inner.condition == "const_val":
+            c_in1 = 1. / dt
+            sim.dust._rhs[:Nm] = 0.
+        elif sim.dust.boundary.inner.condition == "grad":
+            K1 = - (r[1] / r[0])
+            c_in1 = -K1 / dt
+            fac = - (ri[1] / r[0] * (r[1] - r[0]))
+            sim.dust._rhs[:Nm] = fac * sim.dust.boundary.inner.value
+        elif sim.dust.boundary.inner.condition == "const_grad":
+            Di = (ri[1] / ri[2] * (r[1] - r[0]) / (r[2] - r[0]))
+            K1 = - (r[1] / r[0]) * (1. + Di)
+            K2 = (r[2] / r[0]) * Di
+            c_in0 = 0.0
+            c_in1 = -K1 / dt
+            c_in2 = -K2 / dt
+            sim.dust._rhs[:Nm] = 0.
+        elif sim.dust.boundary.inner.condition == "pow":
+            p = sim.dust.boundary.inner.value
+            ratio = (r[0] / r[1])
+            sim.dust._rhs[:Nm] = SigmaArr[1] * ratio**p
+        elif sim.dust.boundary.inner.condition == "const_pow":
+            logr = cp.log(r[2] / r[1])
+            p = cp.log(SigmaArr[2] / SigmaArr[1]) / logr
+            K1 = - (r[0] / r[1])**p
+            c_in1 = -K1 / dt
+            sim.dust._rhs[:Nm] = 0.
+
+    c_out0 = 0.0
+    c_out1 = 0.0
+    c_out2 = 0.0
+
+    if (not zero_flux) and sim.dust.boundary.outer is not None:
+        if sim.dust.boundary.outer.condition == "val":
+            sim.dust._rhs[-Nm:] = sim.dust.boundary.outer.value
+        elif sim.dust.boundary.outer.condition == "const_val":
+            c_out1 = 1. / dt
+            sim.dust._rhs[-Nm:] = 0.
+        elif sim.dust.boundary.outer.condition == "grad":
+            KNrm2 = - (r[-2] / r[-1])
+            c_out1 = -KNrm2 / dt
+            fac = (ri[-2] / r[-1] * (r[-1] - r[-2]))
+            sim.dust._rhs[-Nm:] = fac * sim.dust.boundary.outer.value
+        elif sim.dust.boundary.outer.condition == "const_grad":
+            Do = (ri[-2] / ri[-3] * (r[-1] - r[-2]) / (r[-2] - r[-3]))
+            KNrm2 = - (r[-2] / r[-1]) * (1. + Do)
+            KNrm3 = (r[-3] / r[-1]) * Do
+            c_out1 = -KNrm2 / dt
+            c_out0 = -KNrm3 / dt
+            sim.dust._rhs[-Nm:] = 0.
+        elif sim.dust.boundary.outer.condition == "pow":
+            p = sim.dust.boundary.outer.value
+            ratio = (r[-1] / r[-2])
+            sim.dust._rhs[-Nm:] = SigmaArr[-2] * ratio**p
+        elif sim.dust.boundary.outer.condition == "const_pow":
+            logr = cp.log(r[-2] / r[-3])
+            p = cp.log(SigmaArr[-2] / SigmaArr[-3]) / logr
+            KNrm2 = - (r[-1] / r[-2])**p
+            c_out1 = -KNrm2 / dt
+            sim.dust._rhs[-Nm:] = 0.
+
+    rows = cp.arange(Nm, dtype=cp.int64)
+    row_out = rows + int((Nr - 1) * Nm)
+    _scatter_add_1d(J_flat, rows * Ntot + rows, cp.full((Nm,), c_in0, dtype=dtype))
+    _scatter_add_1d(J_flat, row_out * Ntot + row_out, cp.full((Nm,), c_out0, dtype=dtype))
+    if Nr >= 2:
+        _scatter_add_1d(J_flat, rows * Ntot + (rows + Nm), cp.full((Nm,), c_in1, dtype=dtype))
+        _scatter_add_1d(J_flat, row_out * Ntot + (row_out - Nm), cp.full((Nm,), c_out1, dtype=dtype))
+    if Nr >= 3:
+        _scatter_add_1d(J_flat, rows * Ntot + (rows + 2 * Nm), cp.full((Nm,), c_in2, dtype=dtype))
+        _scatter_add_1d(J_flat, row_out * Ntot + (row_out - 2 * Nm), cp.full((Nm,), c_out2, dtype=dtype))
+
+    return J
+
+
 def jacobian(sim, x, dx=None, *args, **kwargs):
     return _K_JACOBIAN(sim, x, dx=dx, *args, **kwargs)
 
@@ -2887,6 +3050,29 @@ def _f_impl_1_direct_cupy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
     A = cp_sparse.identity(jac_gpu.shape[0], format="csr", dtype=jac_gpu.dtype) - dx * jac_gpu
 
     Y1_ravel = solve_sparse_linear_system(A, rhs)
+    Y1 = Y1_ravel.reshape(Y0.shape)
+    return Y1 - Y0
+
+
+def _f_impl_1_direct_cupy_dense(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
+    """CuPy implicit 1st-order scheme using dense GPU matrix solve."""
+    zero_flux = is_zero_flux_enabled(Y0._owner)
+    if jac is None:
+        jac = Y0.jacobian(x0, dx)
+    if rhs is None:
+        rhs = cp.asarray(_field_data(Y0.ravel()))
+    else:
+        rhs = cp.asarray(_field_data(rhs))
+
+    Nm = Y0._owner.dust.Sigma.shape[1]
+    if zero_flux:
+        rhs[:] += dx * _field_data(Y0._owner.dust.S.ext).ravel()
+    else:
+        rhs[Nm:-Nm] += dx * _field_data(Y0._owner.dust.S.ext[1:-1, ...]).ravel()
+
+    jac_dense = jac if isinstance(jac, cp.ndarray) else cp.asarray(jac)
+    A = cp.eye(int(jac_dense.shape[0]), dtype=jac_dense.dtype) - dx * jac_dense
+    Y1_ravel = cp.linalg.solve(A, rhs)
     Y1 = Y1_ravel.reshape(Y0.shape)
     return Y1 - Y0
 
