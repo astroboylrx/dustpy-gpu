@@ -15,6 +15,7 @@ from simframe.io.writers import hdf5writer
 from dustpy.utils.boundary import Boundary
 from dustpy.utils.backend import call_numpy
 from dustpy.utils.simplenamespace import SimpleNamespace
+from simframe.backends.api import set_backend
 from simframe.backends.api import xp
 
 import numpy as np
@@ -34,10 +35,21 @@ class Simulation(Frame):
 
     __name__ = "DustPy"
 
-    def __init__(self, **kwargs):
-        """Main simulation class."""
+    def __init__(self, backend=None, **kwargs):
+        """Main simulation class.
+
+        Parameters
+        ----------
+        backend : {"numpy", "cupy", "torch", "auto"}, optional
+            Convenience wrapper around ``simframe.backends.api.set_backend``.
+            Backend selection remains process-global for the Python process.
+        """
+
+        if backend is not None:
+            set_backend(backend)
 
         super().__init__(**kwargs)
+        self._requested_backend = backend
 
         # Namespace with parameters to set the initial conditions
         self._ini = SimpleNamespace(**{"dust": SimpleNamespace(**{"aIniMax": 0.0001,
