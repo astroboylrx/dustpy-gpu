@@ -1,3 +1,7 @@
+import os
+import threading
+from contextlib import nullcontext
+
 from simframe import Frame
 from simframe import Instruction
 from simframe import Integrator
@@ -36,6 +40,7 @@ class Simulation(Frame):
 
     __name__ = "DustPy"
     _bound_backend_name = None
+    _backend_runtime_lock = threading.RLock()
 
     def __init__(self, backend=None, **kwargs):
         """Main simulation class.
@@ -52,6 +57,10 @@ class Simulation(Frame):
         self._backend_context = BackendContext(backend)
         self._requested_backend = self._backend_context.requested_backend
         self._backend_name = self._backend_context.backend
+        self._strict_backend_lock = (
+            os.getenv("DUSTPY_STRICT_BACKEND_LOCK", "0").strip().lower()
+            in {"1", "true", "yes", "on"}
+        )
 
         # Namespace with parameters to set the initial conditions
         self._ini = SimpleNamespace(**{"dust": SimpleNamespace(**{"aIniMax": 0.0001,
@@ -237,31 +246,38 @@ class Simulation(Frame):
             std.gas.bind_backend_kernels()
             self.__class__._bound_backend_name = self._backend_name
 
+    def _backend_lock_scope(self):
+        if self._strict_backend_lock:
+            return self.__class__._backend_runtime_lock
+        return nullcontext()
+
     def update(self, *args, **kwargs):
-        self._activate_backend_context()
-        return super().update(*args, **kwargs)
+        with self._backend_lock_scope():
+            self._activate_backend_context()
+            return super().update(*args, **kwargs)
 
     def run(self):
         """This functions runs the simulation."""
-        self._activate_backend_context()
-        # Print welcome message
-        if self.verbosity > 0:
-            msg = ""
-            msg += "\nDustPy v{}".format(self.__version__)
-            msg += "\n"
-            msg += "\nDocumentation: {}".format(
-                "https://stammler.github.io/dustpy/")
-            msg += "\nPyPI:          {}".format(
-                "https://pypi.org/project/dustpy/")
-            msg += "\nGitHub:        {}".format(
-                "https://github.com/stammler/dustpy/")
-            msg += "\n"
-            msg += colorize("\nPlease cite Stammler & Birnstiel (2022).", "blue")
-            print(msg)
-        # Check for mass conserbation
-        self.checkmassconservation()
-        # Actually run the simulation
-        super().run()
+        with self._backend_lock_scope():
+            self._activate_backend_context()
+            # Print welcome message
+            if self.verbosity > 0:
+                msg = ""
+                msg += "\nDustPy v{}".format(self.__version__)
+                msg += "\n"
+                msg += "\nDocumentation: {}".format(
+                    "https://stammler.github.io/dustpy/")
+                msg += "\nPyPI:          {}".format(
+                    "https://pypi.org/project/dustpy/")
+                msg += "\nGitHub:        {}".format(
+                    "https://github.com/stammler/dustpy/")
+                msg += "\n"
+                msg += colorize("\nPlease cite Stammler & Birnstiel (2022).", "blue")
+                print(msg)
+            # Check for mass conserbation
+            self.checkmassconservation()
+            # Actually run the simulation
+            super().run()
 
     @property
     def ini(self):
@@ -442,62 +458,63 @@ class Simulation(Frame):
 
         Function sets all fields that are None with a standard value.
         If the grids are not set, it will call ``Simulation.makegrids()`` first.'''
-        self._activate_backend_context(require_rebind=True)
-        if not isinstance(self.grid.Nm, Field) or not isinstance(self.grid.Nr, Field):
-            self.makegrids()
+        with self._backend_lock_scope():
+            self._activate_backend_context(require_rebind=True)
+            if not isinstance(self.grid.Nm, Field) or not isinstance(self.grid.Nr, Field):
+                self.makegrids()
 
-        # INTEGRATION VARIABLE
-        if self.t is None:
-            self.t = IntVar(self, 0., description="Time [s]")
-            self.t.cfl = 0.1
-            self.t.updater = std.sim.dt
-            self.t.snapshots = np.hstack(
-                [self.t, np.geomspace(1.e3, 1.e5, num=21)*c.year]
-            )
+            # INTEGRATION VARIABLE
+            if self.t is None:
+                self.t = IntVar(self, 0., description="Time [s]")
+                self.t.cfl = 0.1
+                self.t.updater = std.sim.dt
+                self.t.snapshots = np.hstack(
+                    [self.t, np.geomspace(1.e3, 1.e5, num=21)*c.year]
+                )
 
-        # STELLAR QUANTITIES
-        self._initializestar()
+            # STELLAR QUANTITIES
+            self._initializestar()
 
-        # GRID QUANTITIES
-        self._initializegrid()
+            # GRID QUANTITIES
+            self._initializegrid()
 
-        # GAS QUANTITIES
-        self._initializegas()
+            # GAS QUANTITIES
+            self._initializegas()
 
-        # DUST QUANTITIES
-        self._initializedust()
+            # DUST QUANTITIES
+            self._initializedust()
 
-        # INTEGRATOR
-        if self.integrator is None:
-            instructions = [
-                Instruction(std.dust.impl_1_direct,
-                            self.dust.Sigma,
-                            controller={"rhs": self.dust._rhs
-                                        },
-                            description="Dust: implicit 1st-order direct solver"
-                            ),
-                Instruction(std.gas.impl_1_direct,
-                            self.gas.Sigma,
-                            controller={
-                                "boundary": self.gas.boundary,
-                                "Sext": self.gas.S.ext,
-                            },
-                            description="Gas: implicit 1st-order direct solver"
-                            ),
-            ]
-            self.integrator = Integrator(
-                self.t, description="Default integrator")
-            self.integrator.instructions = instructions
-            self.integrator.preparator = std.sim.prepare_implicit_dust
-            self.integrator.finalizer = std.sim.finalize_implicit_dust
+            # INTEGRATOR
+            if self.integrator is None:
+                instructions = [
+                    Instruction(std.dust.impl_1_direct,
+                                self.dust.Sigma,
+                                controller={"rhs": self.dust._rhs
+                                            },
+                                description="Dust: implicit 1st-order direct solver"
+                                ),
+                    Instruction(std.gas.impl_1_direct,
+                                self.gas.Sigma,
+                                controller={
+                                    "boundary": self.gas.boundary,
+                                    "Sext": self.gas.S.ext,
+                                },
+                                description="Gas: implicit 1st-order direct solver"
+                                ),
+                ]
+                self.integrator = Integrator(
+                    self.t, description="Default integrator")
+                self.integrator.instructions = instructions
+                self.integrator.preparator = std.sim.prepare_implicit_dust
+                self.integrator.finalizer = std.sim.finalize_implicit_dust
 
-        # WRITER
-        if self.writer is None:
-            self.writer = hdf5writer()
+            # WRITER
+            if self.writer is None:
+                self.writer = hdf5writer()
 
-        # Updating the entire Simulation object including integrator finalization
-        self.integrator._finalize()
-        self.update()
+            # Updating the entire Simulation object including integrator finalization
+            self.integrator._finalize()
+            self.update()
 
     def _initializedust(self):
         '''Function to initialize dust quantities'''
