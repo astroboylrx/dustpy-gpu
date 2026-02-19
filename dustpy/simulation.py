@@ -15,7 +15,8 @@ from simframe.io.writers import hdf5writer
 from dustpy.utils.boundary import Boundary
 from dustpy.utils.backend import call_numpy
 from dustpy.utils.simplenamespace import SimpleNamespace
-from simframe.backends.api import set_backend
+from simframe.backends.api import BackendContext
+from simframe.backends.api import get_backend
 from simframe.backends.api import xp
 
 import numpy as np
@@ -34,6 +35,7 @@ class Simulation(Frame):
     Please have a look at the documentation of ``simframe`` for further details."""
 
     __name__ = "DustPy"
+    _bound_backend_name = None
 
     def __init__(self, backend=None, **kwargs):
         """Main simulation class.
@@ -41,15 +43,15 @@ class Simulation(Frame):
         Parameters
         ----------
         backend : {"numpy", "cupy", "torch", "auto"}, optional
-            Convenience wrapper around ``simframe.backends.api.set_backend``.
-            Backend selection remains process-global for the Python process.
+            Backend preference stored on this simulation and activated
+            automatically for initialize/run/update calls.
+            Backend execution remains process-global for the Python process.
         """
 
-        if backend is not None:
-            set_backend(backend)
-
         super().__init__(**kwargs)
-        self._requested_backend = backend
+        self._backend_context = BackendContext(backend)
+        self._requested_backend = self._backend_context.requested_backend
+        self._backend_name = self._backend_context.backend
 
         # Namespace with parameters to set the initial conditions
         self._ini = SimpleNamespace(**{"dust": SimpleNamespace(**{"aIniMax": 0.0001,
@@ -218,8 +220,30 @@ class Simulation(Frame):
         self.RL_ncycle_out = 100
         self.RL_recent_dts = np.zeros(100)
 
+    @property
+    def backend(self):
+        """Resolved backend for this simulation object."""
+        return self._backend_name
+
+    def _activate_backend_context(self, *, require_rebind=False):
+        """Activate this simulation backend and rebind kernels when needed."""
+        active = get_backend()
+        if active != self._backend_name:
+            self._backend_context.activate()
+            require_rebind = True
+
+        if require_rebind or self.__class__._bound_backend_name != self._backend_name:
+            std.dust.bind_backend_kernels()
+            std.gas.bind_backend_kernels()
+            self.__class__._bound_backend_name = self._backend_name
+
+    def update(self, *args, **kwargs):
+        self._activate_backend_context()
+        return super().update(*args, **kwargs)
+
     def run(self):
         """This functions runs the simulation."""
+        self._activate_backend_context()
         # Print welcome message
         if self.verbosity > 0:
             msg = ""
@@ -418,6 +442,7 @@ class Simulation(Frame):
 
         Function sets all fields that are None with a standard value.
         If the grids are not set, it will call ``Simulation.makegrids()`` first.'''
+        self._activate_backend_context(require_rebind=True)
         if not isinstance(self.grid.Nm, Field) or not isinstance(self.grid.Nr, Field):
             self.makegrids()
 
@@ -435,10 +460,6 @@ class Simulation(Frame):
 
         # GRID QUANTITIES
         self._initializegrid()
-
-        # Bind backend-specific hot kernels once for this run.
-        std.dust.bind_backend_kernels()
-        std.gas.bind_backend_kernels()
 
         # GAS QUANTITIES
         self._initializegas()
