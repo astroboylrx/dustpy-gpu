@@ -282,6 +282,89 @@ _CSR_HOST_META_KEY = None
 _CSR_HOST_META_VALUE = None
 _GAS_JAC_PATTERN_KEY = None
 _GAS_JAC_PATTERN_VALUE = None
+_RUNTIME_STATES = {}
+_ACTIVE_RUNTIME_TOKEN = None
+
+_RUNTIME_STATE_VARS = (
+    "_BOUND_BACKEND",
+    "_K_ENFORCE_FLOOR",
+    "_K_CS",
+    "_K_ETA",
+    "_K_FI",
+    "_K_HP",
+    "_K_N",
+    "_K_P",
+    "_K_RHO",
+    "_K_S_HYD",
+    "_K_TIMESTEP",
+    "_K_VRAD",
+    "_K_VVISC",
+    "_K_IMPLICIT_BOUNDARIES",
+    "_K_MFP",
+    "_K_NU",
+    "_K_S_TOT",
+    "_K_T_PASS",
+    "_K_IMPL_1_DIRECT",
+    "_K_INTERP_TO_INTERFACES_1D",
+    "_K_JACOBIAN",
+    "_CSR_HOST_META_KEY",
+    "_CSR_HOST_META_VALUE",
+    "_GAS_JAC_PATTERN_KEY",
+    "_GAS_JAC_PATTERN_VALUE",
+)
+
+
+def _fresh_runtime_state():
+    return {
+        "_BOUND_BACKEND": None,
+        "_K_ENFORCE_FLOOR": None,
+        "_K_CS": None,
+        "_K_ETA": None,
+        "_K_FI": None,
+        "_K_HP": None,
+        "_K_N": None,
+        "_K_P": None,
+        "_K_RHO": None,
+        "_K_S_HYD": None,
+        "_K_TIMESTEP": None,
+        "_K_VRAD": None,
+        "_K_VVISC": None,
+        "_K_IMPLICIT_BOUNDARIES": None,
+        "_K_MFP": None,
+        "_K_NU": None,
+        "_K_S_TOT": None,
+        "_K_T_PASS": None,
+        "_K_IMPL_1_DIRECT": None,
+        "_K_INTERP_TO_INTERFACES_1D": None,
+        "_K_JACOBIAN": None,
+        "_CSR_HOST_META_KEY": None,
+        "_CSR_HOST_META_VALUE": None,
+        "_GAS_JAC_PATTERN_KEY": None,
+        "_GAS_JAC_PATTERN_VALUE": None,
+    }
+
+
+def _capture_runtime_state():
+    return {name: globals()[name] for name in _RUNTIME_STATE_VARS}
+
+
+def _restore_runtime_state(state):
+    for name, value in state.items():
+        globals()[name] = value
+
+
+def _switch_runtime_state(runtime_token):
+    global _ACTIVE_RUNTIME_TOKEN
+    if runtime_token is None or runtime_token == _ACTIVE_RUNTIME_TOKEN:
+        return
+    if _ACTIVE_RUNTIME_TOKEN is not None:
+        _RUNTIME_STATES[_ACTIVE_RUNTIME_TOKEN] = _capture_runtime_state()
+    state = _RUNTIME_STATES.get(runtime_token)
+    if state is None:
+        state = _fresh_runtime_state()
+        _RUNTIME_STATES[runtime_token] = state
+    _restore_runtime_state(state)
+    _ACTIVE_RUNTIME_TOKEN = runtime_token
 
 
 def _get_csr_host_meta(mat):
@@ -509,13 +592,14 @@ def _t_passive_cupy(sim):
     return (6.25e-3 * sim.star.L / (c.pi * sim.grid.r**2 * c.sigma_sb)) ** 0.25
 
 
-def bind_backend_kernels(backend=None, force=False):
+def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     global _BOUND_BACKEND, _K_ENFORCE_FLOOR, _K_CS, _K_ETA, _K_FI, _K_HP
     global _K_N, _K_P, _K_RHO, _K_S_HYD, _K_TIMESTEP, _K_VRAD, _K_VVISC
     global _K_IMPLICIT_BOUNDARIES, _K_MFP, _K_NU, _K_S_TOT, _K_T_PASS, _K_IMPL_1_DIRECT, _K_INTERP_TO_INTERFACES_1D
     global _K_JACOBIAN, _CSR_HOST_META_KEY, _CSR_HOST_META_VALUE
     global _GAS_JAC_PATTERN_KEY, _GAS_JAC_PATTERN_VALUE
 
+    _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
     if (not force) and backend == _BOUND_BACKEND and _K_FI is not None:
         return
@@ -548,6 +632,8 @@ def bind_backend_kernels(backend=None, force=False):
     _GAS_JAC_PATTERN_KEY = None
     _GAS_JAC_PATTERN_VALUE = None
     _BOUND_BACKEND = backend
+    if runtime_token is not None:
+        _RUNTIME_STATES[runtime_token] = _capture_runtime_state()
 
 
 

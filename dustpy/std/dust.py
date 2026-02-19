@@ -115,6 +115,149 @@ _DUST_JHB_PATTERN_CACHE_VALUE = None
 _JCOAG_WORKBUF_MODE = "fresh"
 _SCATTER_MODE = "addat"
 _CUPY_DUST_SOLVER_MODE = "sparse"
+_RUNTIME_STATES = {}
+_ACTIVE_RUNTIME_TOKEN = None
+
+_RUNTIME_STATE_VARS = (
+    "_BOUND_BACKEND",
+    "_K_A",
+    "_K_D",
+    "_K_H",
+    "_K_F_ADV",
+    "_K_F_DIFF",
+    "_K_S_COAG",
+    "_K_S_HYD",
+    "_K_KERNEL",
+    "_K_P_FRAG",
+    "_K_ST",
+    "_K_VRAD",
+    "_K_VREL_BROWN",
+    "_K_VREL_AZI",
+    "_K_VREL_RAD",
+    "_K_VREL_TURB",
+    "_K_VREL_VERT",
+    "_K_COAG_PARAMS",
+    "_K_IMPL_1_DIRECT",
+    "_K_JACOBIAN",
+    "_K_INTERP_TO_INTERFACES",
+    "_KERNEL_LOWER_MASK",
+    "_COAG_CACHE_KEY",
+    "_COAG_CACHE_VALUE",
+    "_COAG_PAIR_CACHE_KEY",
+    "_COAG_PAIR_CACHE_VALUE",
+    "_SCOAG_PAIRMAP_CACHE_KEY",
+    "_SCOAG_PAIRMAP_CACHE_VALUE",
+    "_SCOAG_PRECOMP_CACHE_KEY",
+    "_SCOAG_PRECOMP_CACHE_VALUE",
+    "_FRAG_P_CACHE_KEY",
+    "_FRAG_P_CACHE_VALUE",
+    "_MGRID_Q_CACHE_KEY",
+    "_MGRID_Q_CACHE_VALUE",
+    "_JCOAG_CONST_CACHE_KEY",
+    "_JCOAG_CONST_CACHE_VALUE",
+    "_JCOAG_PATTERN_CACHE_KEY",
+    "_JCOAG_PATTERN_CACHE_VALUE",
+    "_JCOAG_PATTERN_GPU_CACHE_KEY",
+    "_JCOAG_PATTERN_GPU_CACHE_VALUE",
+    "_JCOAG_PRECOMP_CACHE_KEY",
+    "_JCOAG_PRECOMP_CACHE_VALUE",
+    "_BOUNDARY_BASIS_CACHE_KEY",
+    "_BOUNDARY_BASIS_CACHE_VALUE",
+    "_JSTICK_MAP_CACHE_KEY",
+    "_JSTICK_MAP_CACHE_VALUE",
+    "_JFRAG_MAP_CACHE_KEY",
+    "_JFRAG_MAP_CACHE_VALUE",
+    "_JCOAG_WORK_CACHE_KEY",
+    "_JCOAG_WORK_CACHE_VALUE",
+    "_DUST_JHB_PATTERN_CACHE_KEY",
+    "_DUST_JHB_PATTERN_CACHE_VALUE",
+    "_JCOAG_WORKBUF_MODE",
+    "_SCATTER_MODE",
+    "_CUPY_DUST_SOLVER_MODE",
+)
+
+
+def _fresh_runtime_state():
+    return {
+        "_BOUND_BACKEND": None,
+        "_K_A": None,
+        "_K_D": None,
+        "_K_H": None,
+        "_K_F_ADV": None,
+        "_K_F_DIFF": None,
+        "_K_S_COAG": None,
+        "_K_S_HYD": None,
+        "_K_KERNEL": None,
+        "_K_P_FRAG": None,
+        "_K_ST": None,
+        "_K_VRAD": None,
+        "_K_VREL_BROWN": None,
+        "_K_VREL_AZI": None,
+        "_K_VREL_RAD": None,
+        "_K_VREL_TURB": None,
+        "_K_VREL_VERT": None,
+        "_K_COAG_PARAMS": None,
+        "_K_IMPL_1_DIRECT": None,
+        "_K_JACOBIAN": None,
+        "_K_INTERP_TO_INTERFACES": None,
+        "_KERNEL_LOWER_MASK": None,
+        "_COAG_CACHE_KEY": None,
+        "_COAG_CACHE_VALUE": None,
+        "_COAG_PAIR_CACHE_KEY": None,
+        "_COAG_PAIR_CACHE_VALUE": None,
+        "_SCOAG_PAIRMAP_CACHE_KEY": None,
+        "_SCOAG_PAIRMAP_CACHE_VALUE": None,
+        "_SCOAG_PRECOMP_CACHE_KEY": None,
+        "_SCOAG_PRECOMP_CACHE_VALUE": None,
+        "_FRAG_P_CACHE_KEY": None,
+        "_FRAG_P_CACHE_VALUE": None,
+        "_MGRID_Q_CACHE_KEY": None,
+        "_MGRID_Q_CACHE_VALUE": None,
+        "_JCOAG_CONST_CACHE_KEY": None,
+        "_JCOAG_CONST_CACHE_VALUE": None,
+        "_JCOAG_PATTERN_CACHE_KEY": None,
+        "_JCOAG_PATTERN_CACHE_VALUE": None,
+        "_JCOAG_PATTERN_GPU_CACHE_KEY": None,
+        "_JCOAG_PATTERN_GPU_CACHE_VALUE": None,
+        "_JCOAG_PRECOMP_CACHE_KEY": None,
+        "_JCOAG_PRECOMP_CACHE_VALUE": None,
+        "_BOUNDARY_BASIS_CACHE_KEY": None,
+        "_BOUNDARY_BASIS_CACHE_VALUE": None,
+        "_JSTICK_MAP_CACHE_KEY": None,
+        "_JSTICK_MAP_CACHE_VALUE": None,
+        "_JFRAG_MAP_CACHE_KEY": None,
+        "_JFRAG_MAP_CACHE_VALUE": None,
+        "_JCOAG_WORK_CACHE_KEY": None,
+        "_JCOAG_WORK_CACHE_VALUE": None,
+        "_DUST_JHB_PATTERN_CACHE_KEY": None,
+        "_DUST_JHB_PATTERN_CACHE_VALUE": None,
+        "_JCOAG_WORKBUF_MODE": "fresh",
+        "_SCATTER_MODE": "addat",
+        "_CUPY_DUST_SOLVER_MODE": "sparse",
+    }
+
+
+def _capture_runtime_state():
+    return {name: globals()[name] for name in _RUNTIME_STATE_VARS}
+
+
+def _restore_runtime_state(state):
+    for name, value in state.items():
+        globals()[name] = value
+
+
+def _switch_runtime_state(runtime_token):
+    global _ACTIVE_RUNTIME_TOKEN
+    if runtime_token is None or runtime_token == _ACTIVE_RUNTIME_TOKEN:
+        return
+    if _ACTIVE_RUNTIME_TOKEN is not None:
+        _RUNTIME_STATES[_ACTIVE_RUNTIME_TOKEN] = _capture_runtime_state()
+    state = _RUNTIME_STATES.get(runtime_token)
+    if state is None:
+        state = _fresh_runtime_state()
+        _RUNTIME_STATES[runtime_token] = state
+    _restore_runtime_state(state)
+    _ACTIVE_RUNTIME_TOKEN = runtime_token
 
 
 def _get_jcoag_chunk_size(Nr_int, Nm):
@@ -1727,7 +1870,7 @@ def _coagulation_parameters_python(sim):
     return cstick, cstick_ind, AFrag, epsFrag, klf, krm, phiFrag
 
 
-def bind_backend_kernels(backend=None, force=False):
+def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     """Bind hot dust kernels to backend-specific implementations once."""
     global _BOUND_BACKEND, _K_A, _K_D, _K_H, _K_F_ADV, _K_F_DIFF, _K_S_COAG, _K_S_HYD
     global _K_KERNEL, _K_P_FRAG, _K_ST, _K_VRAD, _K_VREL_BROWN, _K_VREL_AZI, _K_VREL_RAD, _K_VREL_TURB, _K_VREL_VERT
@@ -1744,6 +1887,7 @@ def bind_backend_kernels(backend=None, force=False):
     global _DUST_JHB_PATTERN_CACHE_KEY, _DUST_JHB_PATTERN_CACHE_VALUE
     global _JCOAG_WORKBUF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE
 
+    _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
     bind_sparse_solver(backend=backend, force=force)
     mode = os.getenv("DUSTPY_JCOAG_WORKBUF_MODE", "fresh").strip().lower()
@@ -1823,6 +1967,8 @@ def bind_backend_kernels(backend=None, force=False):
     _DUST_JHB_PATTERN_CACHE_VALUE = None
 
     _BOUND_BACKEND = backend
+    if runtime_token is not None:
+        _RUNTIME_STATES[runtime_token] = _capture_runtime_state()
 
 
 # Initialize default bindings at import time.

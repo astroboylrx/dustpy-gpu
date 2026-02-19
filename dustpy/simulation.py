@@ -243,12 +243,10 @@ class Simulation(Frame):
             self._backend_context.activate()
             require_rebind = True
 
-        if self.__class__._bound_runtime_token != self._runtime_token:
-            require_rebind = True
-
-        if require_rebind or self.__class__._bound_backend_name != self._backend_name:
-            std.dust.bind_backend_kernels(force=require_rebind)
-            std.gas.bind_backend_kernels(force=require_rebind)
+        runtime_switched = self.__class__._bound_runtime_token != self._runtime_token
+        if require_rebind or runtime_switched or self.__class__._bound_backend_name != self._backend_name:
+            std.dust.bind_backend_kernels(force=require_rebind, runtime_token=self._runtime_token)
+            std.gas.bind_backend_kernels(force=require_rebind, runtime_token=self._runtime_token)
             self.__class__._bound_backend_name = self._backend_name
             self.__class__._bound_runtime_token = self._runtime_token
 
