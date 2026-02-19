@@ -40,6 +40,7 @@ class Simulation(Frame):
 
     __name__ = "DustPy"
     _bound_backend_name = None
+    _bound_runtime_token = None
     _backend_runtime_lock = threading.RLock()
 
     def __init__(self, backend=None, **kwargs):
@@ -57,6 +58,7 @@ class Simulation(Frame):
         self._backend_context = BackendContext(backend)
         self._requested_backend = self._backend_context.requested_backend
         self._backend_name = self._backend_context.backend
+        self._runtime_token = id(self)
         self._strict_backend_lock = (
             os.getenv("DUSTPY_STRICT_BACKEND_LOCK", "0").strip().lower()
             in {"1", "true", "yes", "on"}
@@ -241,10 +243,14 @@ class Simulation(Frame):
             self._backend_context.activate()
             require_rebind = True
 
+        if self.__class__._bound_runtime_token != self._runtime_token:
+            require_rebind = True
+
         if require_rebind or self.__class__._bound_backend_name != self._backend_name:
-            std.dust.bind_backend_kernels()
-            std.gas.bind_backend_kernels()
+            std.dust.bind_backend_kernels(force=require_rebind)
+            std.gas.bind_backend_kernels(force=require_rebind)
             self.__class__._bound_backend_name = self._backend_name
+            self.__class__._bound_runtime_token = self._runtime_token
 
     def _backend_lock_scope(self):
         if self._strict_backend_lock:

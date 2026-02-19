@@ -422,11 +422,11 @@ def _solve_sparse_linear_system_cupy_cpu_direct(matrix, rhs):
     return cp.asarray(sol_cpu)
 
 
-def bind_sparse_solver(backend=None):
+def bind_sparse_solver(backend=None, force=False):
     """Bind sparse linear solver implementation for the selected backend."""
     global _BOUND_SOLVER_BACKEND, _SOLVE_SPARSE_IMPL
     backend = get_backend() if backend is None else backend
-    if backend == _BOUND_SOLVER_BACKEND and _SOLVE_SPARSE_IMPL is not None:
+    if (not force) and backend == _BOUND_SOLVER_BACKEND and _SOLVE_SPARSE_IMPL is not None:
         return
 
     if backend == "cupy":
@@ -445,13 +445,14 @@ def solve_sparse_linear_system(matrix, rhs):
     return _SOLVE_SPARSE_IMPL(matrix, rhs)
 
 
-def bind_gas_sparse_solver(backend=None):
+def bind_gas_sparse_solver(backend=None, force=False):
     """Bind gas sparse solver implementation for selected backend."""
     global _BOUND_GAS_SOLVER_BACKEND, _BOUND_GAS_SOLVER_MODE, _SOLVE_GAS_SPARSE_IMPL
     backend = get_backend() if backend is None else backend
     mode = _CUPY_GAS_SOLVER_CONFIG["mode"] if backend == "cupy" else "default"
     if (
-        backend == _BOUND_GAS_SOLVER_BACKEND
+        (not force)
+        and backend == _BOUND_GAS_SOLVER_BACKEND
         and mode == _BOUND_GAS_SOLVER_MODE
         and _SOLVE_GAS_SPARSE_IMPL is not None
     ):

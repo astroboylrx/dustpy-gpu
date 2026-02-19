@@ -1727,7 +1727,7 @@ def _coagulation_parameters_python(sim):
     return cstick, cstick_ind, AFrag, epsFrag, klf, krm, phiFrag
 
 
-def bind_backend_kernels(backend=None):
+def bind_backend_kernels(backend=None, force=False):
     """Bind hot dust kernels to backend-specific implementations once."""
     global _BOUND_BACKEND, _K_A, _K_D, _K_H, _K_F_ADV, _K_F_DIFF, _K_S_COAG, _K_S_HYD
     global _K_KERNEL, _K_P_FRAG, _K_ST, _K_VRAD, _K_VREL_BROWN, _K_VREL_AZI, _K_VREL_RAD, _K_VREL_TURB, _K_VREL_VERT
@@ -1745,7 +1745,7 @@ def bind_backend_kernels(backend=None):
     global _JCOAG_WORKBUF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE
 
     backend = get_backend() if backend is None else backend
-    bind_sparse_solver(backend=backend)
+    bind_sparse_solver(backend=backend, force=force)
     mode = os.getenv("DUSTPY_JCOAG_WORKBUF_MODE", "fresh").strip().lower()
     if mode not in ("fresh", "reuse"):
         mode = "reuse"
@@ -1754,7 +1754,8 @@ def bind_backend_kernels(backend=None):
         scatter_mode = "addat"
     cupy_dust_solver_mode = _get_cupy_dust_solver_mode() if backend == "cupy" else "sparse"
     if (
-        backend == _BOUND_BACKEND
+        (not force)
+        and backend == _BOUND_BACKEND
         and _K_A is not None
         and mode == _JCOAG_WORKBUF_MODE
         and scatter_mode == _SCATTER_MODE

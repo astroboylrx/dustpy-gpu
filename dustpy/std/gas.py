@@ -509,7 +509,7 @@ def _t_passive_cupy(sim):
     return (6.25e-3 * sim.star.L / (c.pi * sim.grid.r**2 * c.sigma_sb)) ** 0.25
 
 
-def bind_backend_kernels(backend=None):
+def bind_backend_kernels(backend=None, force=False):
     global _BOUND_BACKEND, _K_ENFORCE_FLOOR, _K_CS, _K_ETA, _K_FI, _K_HP
     global _K_N, _K_P, _K_RHO, _K_S_HYD, _K_TIMESTEP, _K_VRAD, _K_VVISC
     global _K_IMPLICIT_BOUNDARIES, _K_MFP, _K_NU, _K_S_TOT, _K_T_PASS, _K_IMPL_1_DIRECT, _K_INTERP_TO_INTERFACES_1D
@@ -517,10 +517,10 @@ def bind_backend_kernels(backend=None):
     global _GAS_JAC_PATTERN_KEY, _GAS_JAC_PATTERN_VALUE
 
     backend = get_backend() if backend is None else backend
-    if backend == _BOUND_BACKEND and _K_FI is not None:
+    if (not force) and backend == _BOUND_BACKEND and _K_FI is not None:
         return
 
-    bind_gas_sparse_solver(backend=backend)
+    bind_gas_sparse_solver(backend=backend, force=force)
 
     _K_ENFORCE_FLOOR = select_backend({"cupy": _enforce_floor_cupy}, backend=backend, default=_enforce_floor_fortran)
     _K_CS = select_backend({"cupy": _cs_isothermal_cupy}, backend=backend, default=_cs_isothermal_fortran)
