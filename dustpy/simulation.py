@@ -1,3 +1,5 @@
+import os
+
 from simframe import Frame
 from simframe import Instruction
 from simframe import Integrator
@@ -19,6 +21,10 @@ from simframe.backends.api import set_backend
 from simframe.backends.api import xp
 
 import numpy as np
+
+
+def _env_flag_enabled(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
 
 class Simulation(Frame):
@@ -50,6 +56,7 @@ class Simulation(Frame):
 
         super().__init__(**kwargs)
         self._requested_backend = backend
+        self._skip_mass_check = _env_flag_enabled("DUSTPY_SKIP_MASS_CHECK", "0")
 
         # Namespace with parameters to set the initial conditions
         self._ini = SimpleNamespace(**{"dust": SimpleNamespace(**{"aIniMax": 0.0001,
@@ -234,8 +241,9 @@ class Simulation(Frame):
             msg += "\n"
             msg += colorize("\nPlease cite Stammler & Birnstiel (2022).", "blue")
             print(msg)
-        # Check for mass conserbation
-        self.checkmassconservation()
+        # Check for mass conservation unless explicitly disabled for perf runs.
+        if not self._skip_mass_check:
+            self.checkmassconservation()
         # Actually run the simulation
         super().run()
 
@@ -476,7 +484,7 @@ class Simulation(Frame):
 
         # Updating the entire Simulation object including integrator finalization
         self.integrator._finalize()
-        self.update()
+        super().update()
 
     def _initializedust(self):
         '''Function to initialize dust quantities'''
