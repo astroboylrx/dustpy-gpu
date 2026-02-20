@@ -25,6 +25,10 @@ from simframe.backends.api import xp
 import numpy as np
 
 
+def _env_flag_enabled(name: str, default: str = "0") -> bool:
+    return os.getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
 class Simulation(Frame):
     """The main simulation class for running dust coagulation simulations.
 
@@ -58,10 +62,8 @@ class Simulation(Frame):
         self._requested_backend = self._backend_context.requested_backend
         self._backend_name = self._backend_context.backend
         self._runtime_token = id(self)
-        self._strict_backend_lock = (
-            os.getenv("DUSTPY_STRICT_BACKEND_LOCK", "0").strip().lower()
-            in {"1", "true", "yes", "on"}
-        )
+        self._strict_backend_lock = _env_flag_enabled("DUSTPY_STRICT_BACKEND_LOCK", "0")
+        self._skip_mass_check = _env_flag_enabled("DUSTPY_SKIP_MASS_CHECK", "0")
         self._run_context_active = False
 
         # Namespace with parameters to set the initial conditions
@@ -277,8 +279,9 @@ class Simulation(Frame):
             msg += "\n"
             msg += colorize("\nPlease cite Stammler & Birnstiel (2022).", "blue")
             print(msg)
-        # Check for mass conserbation
-        self.checkmassconservation()
+        # Check for mass conservation unless explicitly disabled for perf runs.
+        if not self._skip_mass_check:
+            self.checkmassconservation()
         # Actually run the simulation
         super().run()
 
@@ -541,7 +544,7 @@ class Simulation(Frame):
 
         # Updating the entire Simulation object including integrator finalization
         self.integrator._finalize()
-        self.update()
+        super().update()
 
     def _initializedust(self):
         '''Function to initialize dust quantities'''
