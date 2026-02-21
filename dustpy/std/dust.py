@@ -54,6 +54,22 @@ def _scatter_add_1d(out, idx, vals):
     """1D scatter-add helper."""
     if int(idx.size) == 0:
         return
+    if _SCATTER_MODE == "rawkernel":
+        kernel = _get_raw_scatter_kernel(out.dtype)
+        if (
+            kernel is not None
+            and getattr(out, "ndim", 0) == 1
+            and getattr(idx, "ndim", 0) == 1
+            and getattr(vals, "ndim", 0) == 1
+        ):
+            n = int(idx.size)
+            threads = 256
+            blocks = (n + threads - 1) // threads
+            if blocks > 0:
+                idx64 = idx if idx.dtype == cp.int64 else idx.astype(cp.int64, copy=False)
+                vals_cast = vals if vals.dtype == out.dtype else vals.astype(out.dtype, copy=False)
+                kernel((blocks,), (threads,), (out, idx64, vals_cast, np.int64(n)))
+                return
     if _SCATTER_MODE == "scatter" and cp_scatter_add is not None:
         cp_scatter_add(out, idx, vals)
     else:
@@ -115,8 +131,13 @@ _DUST_JHB_PATTERN_CACHE_VALUE = None
 _JCOAG_WORKBUF_MODE = "fresh"
 _SCATTER_MODE = "addat"
 _CUPY_DUST_SOLVER_MODE = "sparse"
+_VREL_TURB_MODE = "baseline"
 _RUNTIME_STATES = {}
 _ACTIVE_RUNTIME_TOKEN = None
+_RAW_SCATTER_KERNEL_F32 = None
+_RAW_SCATTER_KERNEL_F64 = None
+_VREL_TURB_EW_KERNEL_F32 = None
+_VREL_TURB_EW_KERNEL_F64 = None
 
 _RUNTIME_STATE_VARS = (
     "_BOUND_BACKEND",
@@ -174,6 +195,7 @@ _RUNTIME_STATE_VARS = (
     "_JCOAG_WORKBUF_MODE",
     "_SCATTER_MODE",
     "_CUPY_DUST_SOLVER_MODE",
+    "_VREL_TURB_MODE",
 )
 
 
@@ -234,6 +256,7 @@ def _fresh_runtime_state():
         "_JCOAG_WORKBUF_MODE": "fresh",
         "_SCATTER_MODE": "addat",
         "_CUPY_DUST_SOLVER_MODE": "sparse",
+        "_VREL_TURB_MODE": "baseline",
     }
 
 
@@ -258,6 +281,232 @@ def _switch_runtime_state(runtime_token):
         _RUNTIME_STATES[runtime_token] = state
     _restore_runtime_state(state)
     _ACTIVE_RUNTIME_TOKEN = runtime_token
+
+
+def _get_raw_scatter_kernel(dtype):
+    """Return cached raw scatter-add kernel for float32/float64 outputs."""
+    global _RAW_SCATTER_KERNEL_F32, _RAW_SCATTER_KERNEL_F64
+
+    if cp is None:
+        return None
+
+    if dtype == cp.float32:
+        if _RAW_SCATTER_KERNEL_F32 is None:
+            _RAW_SCATTER_KERNEL_F32 = cp.RawKernel(
+                r"""
+                extern "C" __global__
+                void dustpy_scatter_add_f32(float* out, const long long* idx, const float* vals, long long n) {
+                    long long tid = (long long)(blockDim.x * blockIdx.x + threadIdx.x);
+                    if (tid < n) {
+                        atomicAdd(out + idx[tid], vals[tid]);
+                    }
+                }
+                """,
+                "dustpy_scatter_add_f32",
+            )
+        return _RAW_SCATTER_KERNEL_F32
+
+    if dtype == cp.float64:
+        if _RAW_SCATTER_KERNEL_F64 is None:
+            _RAW_SCATTER_KERNEL_F64 = cp.RawKernel(
+                r"""
+                extern "C" __global__
+                void dustpy_scatter_add_f64(double* out, const long long* idx, const double* vals, long long n) {
+                    long long tid = (long long)(blockDim.x * blockIdx.x + threadIdx.x);
+                    if (tid < n) {
+                        atomicAdd(out + idx[tid], vals[tid]);
+                    }
+                }
+                """,
+                "dustpy_scatter_add_f64",
+            )
+        return _RAW_SCATTER_KERNEL_F64
+
+    return None
+
+
+def _get_vrel_turbulent_elementwise_kernel(dtype):
+    """Return cached elementwise kernel for turbulent relative velocity."""
+    global _VREL_TURB_EW_KERNEL_F32, _VREL_TURB_EW_KERNEL_F64
+
+    if cp is None:
+        return None
+
+    if dtype == cp.float32:
+        if _VREL_TURB_EW_KERNEL_F32 is None:
+            _VREL_TURB_EW_KERNEL_F32 = cp.ElementwiseKernel(
+                "raw float32 alpha, raw float32 cs, raw float32 mump, raw float32 omegak, raw float32 sigmag, raw float32 st, int64 nm, float32 sigma_h2",
+                "float32 out",
+                r"""
+                const long long plane = nm * nm;
+                const long long ir = i / plane;
+                const long long rem = i - ir * plane;
+                const long long jm = rem / nm;
+                const long long im = rem - jm * nm;
+                const long long base = ir * nm;
+
+                const float eps0 = 1.0e-30f;
+                float Stj = st[base + jm];
+                float Sti = st[base + im];
+                float StL = Stj >= Sti ? Stj : Sti;
+                float StS = Stj >= Sti ? Sti : Stj;
+
+                float OmKinv = 1.0f / (omegak[ir] + eps0);
+                float Re = 0.5f * alpha[ir] * sigmag[ir] * sigma_h2 / (mump[ir] + eps0);
+                float ReInvSqrt = sqrtf(1.0f / (Re + eps0));
+                float vn = sqrtf(alpha[ir]) * cs[ir];
+                float vs = powf(Re + eps0, -0.25f) * vn;
+                float ts = OmKinv * ReInvSqrt;
+                float vg2 = 1.5f * vn * vn;
+
+                const float c0 = 1.6015125f;
+                const float c1 = -0.63119577f;
+                const float c2 = 0.32938936f;
+                const float c3 = -0.29847604f;
+                const float ya = 1.6f;
+                const float yap1inv = 1.0f / (1.0f + ya);
+
+                float eps = StS / (StL + eps0);
+                float tauL = StL * OmKinv;
+                float tauS = StS * OmKinv;
+                float StL2 = StL * StL;
+                float StL3 = StL2 * StL;
+                float StS2 = StS * StS;
+                float eps3 = eps * eps * eps;
+
+                float ys = c0 + c1 * StL + c2 * StL2 + c3 * StL3;
+                float h1 = (StL - StS) / (StL + StS + eps0) * (StL * yap1inv - StS2 / (StS + ya * StL + eps0));
+                float h2 = 2.0f * (ya * StL - ReInvSqrt)
+                    + StL * yap1inv
+                    - StL2 / (StL + ReInvSqrt + eps0)
+                    + StS2 / (ya * StL + StS + eps0)
+                    - StS2 / (StS + ReInvSqrt + eps0);
+
+                float t = vs / (ts + eps0) * (tauL - tauS);
+                float val1 = 1.5f * t * t;
+                float val2 = vg2 * (StL - StS) / (StL + StS + eps0)
+                    * (StL2 / (StL + ReInvSqrt + eps0) - StS2 / (StS + ReInvSqrt + eps0));
+                float val3 = vg2 * (h1 + h2);
+                float val4 = vg2 * StL * (2.0f * ya - 1.0f - eps
+                    + 2.0f / (1.0f + eps + eps0) * (yap1inv + eps3 / (ya + eps + eps0)));
+                float val5 = vg2 * StL * (2.0f * ys - 1.0f - eps
+                    + 2.0f / (1.0f + eps + eps0) * (1.0f / (1.0f + ys + eps0) + eps3 / (ys + eps + eps0)));
+                float val6 = vg2 * (2.0f + StL + StS) / (1.0f + StL + StS + StL * StS + eps0);
+
+                bool cond1 = tauL < 0.2f * ts;
+                bool cond2 = tauL * ya < ts;
+                bool cond3 = tauL < 5.0f * ts;
+                bool cond4 = tauL < 0.2f * OmKinv;
+                bool cond5 = tauL < OmKinv;
+
+                float v2;
+                if (cond1) {
+                    v2 = val1;
+                } else if (cond2) {
+                    v2 = val2;
+                } else if (cond3) {
+                    v2 = val3;
+                } else if (cond4) {
+                    v2 = val4;
+                } else if (cond5) {
+                    v2 = val5;
+                } else {
+                    v2 = val6;
+                }
+                out = sqrtf(v2 > 0.0f ? v2 : 0.0f);
+                """,
+                "dustpy_vrel_turbulent_elementwise_f32",
+            )
+        return _VREL_TURB_EW_KERNEL_F32
+
+    if dtype == cp.float64:
+        if _VREL_TURB_EW_KERNEL_F64 is None:
+            _VREL_TURB_EW_KERNEL_F64 = cp.ElementwiseKernel(
+                "raw float64 alpha, raw float64 cs, raw float64 mump, raw float64 omegak, raw float64 sigmag, raw float64 st, int64 nm, float64 sigma_h2",
+                "float64 out",
+                r"""
+                const long long plane = nm * nm;
+                const long long ir = i / plane;
+                const long long rem = i - ir * plane;
+                const long long jm = rem / nm;
+                const long long im = rem - jm * nm;
+                const long long base = ir * nm;
+
+                const double eps0 = 1.0e-300;
+                double Stj = st[base + jm];
+                double Sti = st[base + im];
+                double StL = Stj >= Sti ? Stj : Sti;
+                double StS = Stj >= Sti ? Sti : Stj;
+
+                double OmKinv = 1.0 / (omegak[ir] + eps0);
+                double Re = 0.5 * alpha[ir] * sigmag[ir] * sigma_h2 / (mump[ir] + eps0);
+                double ReInvSqrt = sqrt(1.0 / (Re + eps0));
+                double vn = sqrt(alpha[ir]) * cs[ir];
+                double vs = pow(Re + eps0, -0.25) * vn;
+                double ts = OmKinv * ReInvSqrt;
+                double vg2 = 1.5 * vn * vn;
+
+                const double c0 = 1.6015125;
+                const double c1 = -0.63119577;
+                const double c2 = 0.32938936;
+                const double c3 = -0.29847604;
+                const double ya = 1.6;
+                const double yap1inv = 1.0 / (1.0 + ya);
+
+                double eps = StS / (StL + eps0);
+                double tauL = StL * OmKinv;
+                double tauS = StS * OmKinv;
+                double StL2 = StL * StL;
+                double StL3 = StL2 * StL;
+                double StS2 = StS * StS;
+                double eps3 = eps * eps * eps;
+
+                double ys = c0 + c1 * StL + c2 * StL2 + c3 * StL3;
+                double h1 = (StL - StS) / (StL + StS + eps0) * (StL * yap1inv - StS2 / (StS + ya * StL + eps0));
+                double h2 = 2.0 * (ya * StL - ReInvSqrt)
+                    + StL * yap1inv
+                    - StL2 / (StL + ReInvSqrt + eps0)
+                    + StS2 / (ya * StL + StS + eps0)
+                    - StS2 / (StS + ReInvSqrt + eps0);
+
+                double t = vs / (ts + eps0) * (tauL - tauS);
+                double val1 = 1.5 * t * t;
+                double val2 = vg2 * (StL - StS) / (StL + StS + eps0)
+                    * (StL2 / (StL + ReInvSqrt + eps0) - StS2 / (StS + ReInvSqrt + eps0));
+                double val3 = vg2 * (h1 + h2);
+                double val4 = vg2 * StL * (2.0 * ya - 1.0 - eps
+                    + 2.0 / (1.0 + eps + eps0) * (yap1inv + eps3 / (ya + eps + eps0)));
+                double val5 = vg2 * StL * (2.0 * ys - 1.0 - eps
+                    + 2.0 / (1.0 + eps + eps0) * (1.0 / (1.0 + ys + eps0) + eps3 / (ys + eps + eps0)));
+                double val6 = vg2 * (2.0 + StL + StS) / (1.0 + StL + StS + StL * StS + eps0);
+
+                bool cond1 = tauL < 0.2 * ts;
+                bool cond2 = tauL * ya < ts;
+                bool cond3 = tauL < 5.0 * ts;
+                bool cond4 = tauL < 0.2 * OmKinv;
+                bool cond5 = tauL < OmKinv;
+
+                double v2;
+                if (cond1) {
+                    v2 = val1;
+                } else if (cond2) {
+                    v2 = val2;
+                } else if (cond3) {
+                    v2 = val3;
+                } else if (cond4) {
+                    v2 = val4;
+                } else if (cond5) {
+                    v2 = val5;
+                } else {
+                    v2 = val6;
+                }
+                out = sqrt(v2 > 0.0 ? v2 : 0.0);
+                """,
+                "dustpy_vrel_turbulent_elementwise_f64",
+            )
+        return _VREL_TURB_EW_KERNEL_F64
+
+    return None
 
 
 def _get_jcoag_chunk_size(Nr_int, Nm):
@@ -1625,6 +1874,43 @@ def _vrel_turbulent_motion_fortran(sim):
     )
 
 
+def _vrel_turbulent_motion_cupy_elementwise(alpha, cs, mump, OmegaK, SigmaGas, St):
+    """Elementwise-kernel variant to reduce temporary 3D allocations."""
+    dtype = cp.result_type(alpha.dtype, cs.dtype, mump.dtype, OmegaK.dtype, SigmaGas.dtype, St.dtype)
+    if dtype not in (cp.float32, cp.float64):
+        return None
+
+    kernel = _get_vrel_turbulent_elementwise_kernel(dtype)
+    if kernel is None:
+        return None
+
+    Nr = int(St.shape[0])
+    Nm = int(St.shape[1])
+    size = int(Nr * Nm * Nm)
+    if size <= 0:
+        return cp.zeros((Nr, Nm, Nm), dtype=dtype)
+
+    alpha_arr = cp.asarray(alpha, dtype=dtype)
+    cs_arr = cp.asarray(cs, dtype=dtype)
+    mump_arr = cp.asarray(mump, dtype=dtype)
+    omk_arr = cp.asarray(OmegaK, dtype=dtype)
+    sig_arr = cp.asarray(SigmaGas, dtype=dtype)
+    st_arr = cp.asarray(St, dtype=dtype).reshape(-1)
+
+    out = kernel(
+        alpha_arr,
+        cs_arr,
+        mump_arr,
+        omk_arr,
+        sig_arr,
+        st_arr,
+        np.int64(Nm),
+        dtype.type(c.sigma_H2),
+        size=size,
+    )
+    return out.reshape(Nr, Nm, Nm)
+
+
 def _vrel_turbulent_motion_cupy(sim):
     alpha = _field_data(sim.dust.delta.turb)
     cs = _field_data(sim.gas.cs)
@@ -1632,6 +1918,11 @@ def _vrel_turbulent_motion_cupy(sim):
     OmegaK = _field_data(sim.grid.OmegaK)
     SigmaGas = _field_data(sim.gas.Sigma)
     St = _field_data(sim.dust.St)
+
+    if _VREL_TURB_MODE == "elementwise":
+        vrel = _vrel_turbulent_motion_cupy_elementwise(alpha, cs, mump, OmegaK, SigmaGas, St)
+        if vrel is not None:
+            return vrel
 
     c0 = 1.6015125
     c1 = -0.63119577
@@ -1885,7 +2176,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     global _JSTICK_MAP_CACHE_KEY, _JSTICK_MAP_CACHE_VALUE
     global _JFRAG_MAP_CACHE_KEY, _JFRAG_MAP_CACHE_VALUE, _JCOAG_WORK_CACHE_KEY, _JCOAG_WORK_CACHE_VALUE
     global _DUST_JHB_PATTERN_CACHE_KEY, _DUST_JHB_PATTERN_CACHE_VALUE
-    global _JCOAG_WORKBUF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE
+    global _JCOAG_WORKBUF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE, _VREL_TURB_MODE
 
     _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
@@ -1894,8 +2185,11 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     if mode not in ("fresh", "reuse"):
         mode = "reuse"
     scatter_mode = os.getenv("DUSTPY_SCATTER_MODE", "addat").strip().lower()
-    if scatter_mode not in ("addat", "scatter"):
+    if scatter_mode not in ("addat", "scatter", "rawkernel"):
         scatter_mode = "addat"
+    vrel_turb_mode = os.getenv("DUSTPY_VREL_TURB_MODE", "baseline").strip().lower()
+    if vrel_turb_mode not in ("baseline", "elementwise"):
+        vrel_turb_mode = "baseline"
     cupy_dust_solver_mode = _get_cupy_dust_solver_mode() if backend == "cupy" else "sparse"
     if (
         (not force)
@@ -1904,6 +2198,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
         and mode == _JCOAG_WORKBUF_MODE
         and scatter_mode == _SCATTER_MODE
         and cupy_dust_solver_mode == _CUPY_DUST_SOLVER_MODE
+        and vrel_turb_mode == _VREL_TURB_MODE
     ):
         return
 
@@ -1935,6 +2230,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     _JCOAG_WORKBUF_MODE = mode
     _SCATTER_MODE = scatter_mode
     _CUPY_DUST_SOLVER_MODE = cupy_dust_solver_mode
+    _VREL_TURB_MODE = vrel_turb_mode
 
     _KERNEL_LOWER_MASK = None
     _COAG_CACHE_KEY = None
