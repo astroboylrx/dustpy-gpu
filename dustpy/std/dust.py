@@ -129,6 +129,9 @@ _JCOAG_WORK_CACHE_VALUE = None
 _DUST_JHB_PATTERN_CACHE_KEY = None
 _DUST_JHB_PATTERN_CACHE_VALUE = None
 _JCOAG_WORKBUF_MODE = "fresh"
+_JCOAG_GEN_MODE = "baseline"
+_S_COAG_MODE = "baseline"
+_F_DIFF_MODE = "baseline"
 _SCATTER_MODE = "addat"
 _CUPY_DUST_SOLVER_MODE = "sparse"
 _VREL_TURB_MODE = "baseline"
@@ -136,6 +139,8 @@ _RUNTIME_STATES = {}
 _ACTIVE_RUNTIME_TOKEN = None
 _RAW_SCATTER_KERNEL_F32 = None
 _RAW_SCATTER_KERNEL_F64 = None
+_F_DIFF_EW_KERNEL_F32 = None
+_F_DIFF_EW_KERNEL_F64 = None
 _VREL_TURB_EW_KERNEL_F32 = None
 _VREL_TURB_EW_KERNEL_F64 = None
 
@@ -193,6 +198,9 @@ _RUNTIME_STATE_VARS = (
     "_DUST_JHB_PATTERN_CACHE_KEY",
     "_DUST_JHB_PATTERN_CACHE_VALUE",
     "_JCOAG_WORKBUF_MODE",
+    "_JCOAG_GEN_MODE",
+    "_S_COAG_MODE",
+    "_F_DIFF_MODE",
     "_SCATTER_MODE",
     "_CUPY_DUST_SOLVER_MODE",
     "_VREL_TURB_MODE",
@@ -254,6 +262,9 @@ def _fresh_runtime_state():
         "_DUST_JHB_PATTERN_CACHE_KEY": None,
         "_DUST_JHB_PATTERN_CACHE_VALUE": None,
         "_JCOAG_WORKBUF_MODE": "fresh",
+        "_JCOAG_GEN_MODE": "baseline",
+        "_S_COAG_MODE": "baseline",
+        "_F_DIFF_MODE": "baseline",
         "_SCATTER_MODE": "addat",
         "_CUPY_DUST_SOLVER_MODE": "sparse",
         "_VREL_TURB_MODE": "baseline",
@@ -321,6 +332,100 @@ def _get_raw_scatter_kernel(dtype):
                 "dustpy_scatter_add_f64",
             )
         return _RAW_SCATTER_KERNEL_F64
+
+    return None
+
+
+def _get_fdiff_elementwise_kernel(dtype):
+    """Return cached elementwise kernel for diffusive flux interiors."""
+    global _F_DIFF_EW_KERNEL_F32, _F_DIFF_EW_KERNEL_F64
+
+    if cp is None:
+        return None
+
+    if dtype == cp.float32:
+        if _F_DIFF_EW_KERNEL_F32 is None:
+            _F_DIFF_EW_KERNEL_F32 = cp.ElementwiseKernel(
+                "raw float32 D, raw float32 SigmaD, raw float32 SigmaG, raw float32 St, raw float32 u, raw float32 r, raw float32 ri, int64 nm",
+                "float32 out",
+                r"""
+                const long long iface = i / nm + 1;
+                const long long jm = i - (iface - 1) * nm;
+                const long long l = iface - 1;
+                const long long rr = iface;
+                const long long idxL = l * nm + jm;
+                const long long idxR = rr * nm + jm;
+
+                const float eps0 = 1.0e-30f;
+                const float dr = r[rr] - r[l];
+                const float t = (ri[iface] - r[l]) / (dr + eps0);
+
+                const float siggi = SigmaG[l] + t * (SigmaG[rr] - SigmaG[l]);
+                const float ui = u[l] + t * (u[rr] - u[l]);
+                const float di = D[idxL] + t * (D[idxR] - D[idxL]);
+                const float sigdi = SigmaD[idxL] + t * (SigmaD[idxR] - SigmaD[idxL]);
+                const float sti = St[idxL] + t * (St[idxR] - St[idxL]);
+
+                const float epsL = SigmaD[idxL] / (SigmaG[l] + eps0);
+                const float epsR = SigmaD[idxR] / (SigmaG[rr] + eps0);
+                const float gradepsi = (epsR - epsL) / (dr + eps0);
+
+                const float w = ui * sigdi / (1.0f + sti * sti);
+                const float fi0 = -di * siggi * gradepsi;
+
+                if (fabsf(w) > 0.0f) {
+                    const float P = fabsf(fi0 / w);
+                    const float lam = (1.0f + P) / (1.0f + P + P * P);
+                    out = lam * fi0;
+                } else {
+                    out = w;
+                }
+                """,
+                "dustpy_fdiff_elementwise_f32",
+            )
+        return _F_DIFF_EW_KERNEL_F32
+
+    if dtype == cp.float64:
+        if _F_DIFF_EW_KERNEL_F64 is None:
+            _F_DIFF_EW_KERNEL_F64 = cp.ElementwiseKernel(
+                "raw float64 D, raw float64 SigmaD, raw float64 SigmaG, raw float64 St, raw float64 u, raw float64 r, raw float64 ri, int64 nm",
+                "float64 out",
+                r"""
+                const long long iface = i / nm + 1;
+                const long long jm = i - (iface - 1) * nm;
+                const long long l = iface - 1;
+                const long long rr = iface;
+                const long long idxL = l * nm + jm;
+                const long long idxR = rr * nm + jm;
+
+                const double eps0 = 1.0e-300;
+                const double dr = r[rr] - r[l];
+                const double t = (ri[iface] - r[l]) / (dr + eps0);
+
+                const double siggi = SigmaG[l] + t * (SigmaG[rr] - SigmaG[l]);
+                const double ui = u[l] + t * (u[rr] - u[l]);
+                const double di = D[idxL] + t * (D[idxR] - D[idxL]);
+                const double sigdi = SigmaD[idxL] + t * (SigmaD[idxR] - SigmaD[idxL]);
+                const double sti = St[idxL] + t * (St[idxR] - St[idxL]);
+
+                const double epsL = SigmaD[idxL] / (SigmaG[l] + eps0);
+                const double epsR = SigmaD[idxR] / (SigmaG[rr] + eps0);
+                const double gradepsi = (epsR - epsL) / (dr + eps0);
+
+                const double w = ui * sigdi / (1.0 + sti * sti);
+                const double fi0 = -di * siggi * gradepsi;
+
+                if (fabs(w) > 0.0) {
+                    const double P = fabs(fi0 / w);
+                    const double lam = (1.0 + P) / (1.0 + P + P * P);
+                    out = lam * fi0;
+                } else {
+                    out = w;
+                }
+                """,
+                "dustpy_fdiff_elementwise_f64",
+            )
+        return _F_DIFF_EW_KERNEL_F64
 
     return None
 
@@ -528,6 +633,11 @@ def _get_jcoag_chunk_size(Nr_int, Nm):
     return max(1, min(int(base), int(Nr_int)))
 
 
+def _env_bool(name, default=False):
+    raw = os.getenv(name, "1" if default else "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
 def _get_cupy_dust_solver_mode():
     """Return CuPy dust implicit solver mode."""
     raw = os.getenv("DUSTPY_CUPY_DUST_SOLVER", "sparse").strip().lower()
@@ -674,6 +784,37 @@ def _F_diff_fortran(sim, Sigma=None):
     return Fi
 
 
+def _F_diff_cupy_elementwise(D, SigmaD, SigmaG, St, u, r, ri):
+    """Elementwise-kernel variant to reduce temporary interface arrays."""
+    dtype = cp.result_type(D.dtype, SigmaD.dtype, SigmaG.dtype, St.dtype, u.dtype, r.dtype, ri.dtype)
+    if dtype not in (cp.float32, cp.float64):
+        return None
+
+    Nr = int(SigmaD.shape[0])
+    Nm = int(SigmaD.shape[1])
+    if Nr < 2 or Nm < 1:
+        return cp.zeros((Nr + 1, Nm), dtype=dtype)
+
+    kernel = _get_fdiff_elementwise_kernel(dtype)
+    if kernel is None:
+        return None
+
+    Dv = cp.asarray(D, dtype=dtype).reshape(-1)
+    SDv = cp.asarray(SigmaD, dtype=dtype).reshape(-1)
+    SGv = cp.asarray(SigmaG, dtype=dtype).reshape(-1)
+    Stv = cp.asarray(St, dtype=dtype).reshape(-1)
+    uv = cp.asarray(u, dtype=dtype).reshape(-1)
+    rv = cp.asarray(r, dtype=dtype).reshape(-1)
+    riv = cp.asarray(ri, dtype=dtype).reshape(-1)
+
+    size = int((Nr - 1) * Nm)
+    Fi = cp.zeros((Nr + 1, Nm), dtype=dtype)
+    Fi[1:-1, :] = kernel(Dv, SDv, SGv, Stv, uv, rv, riv, np.int64(Nm), size=size).reshape(Nr - 1, Nm)
+    Fi[0, :] = 0.0
+    Fi[-1, :] = 0.0
+    return Fi
+
+
 def _F_diff_cupy(sim, Sigma=None):
     if Sigma is None:
         Sigma = sim.dust.Sigma
@@ -685,6 +826,11 @@ def _F_diff_cupy(sim, Sigma=None):
     u = _field_data(xp.sqrt(sim.dust.delta.rad * sim.gas.cs**2))
     r = _field_data(sim.grid.r)
     ri = _field_data(sim.grid.ri)
+
+    if _F_DIFF_MODE == "elementwise":
+        Fi = _F_diff_cupy_elementwise(D, SigmaD, SigmaG, St, u, r, ri)
+        if Fi is not None:
+            return Fi
 
     SigGi = _interp_to_interfaces(SigmaG, r, ri)
     ui = _interp_to_interfaces(u, r, ri)
@@ -847,6 +993,7 @@ def _get_scoag_precomp(cstick, cstick_ind, A, eps, klf, krm, phi, m, Nm):
     disable_cache = os.getenv("DUSTPY_DISABLE_SCOAG_PRECOMP", "0").strip() == "1"
     key = (
         int(Nm),
+        _S_COAG_MODE,
         id(cstick),
         id(cstick_ind),
         id(A),
@@ -898,6 +1045,84 @@ def _get_scoag_precomp(cstick, cstick_ind, A, eps, klf, krm, phi, m, Nm):
     c2 = cp.where(ero_case2)[0]
     ff = cp.where(fullfrag_p)[0]
 
+    stick_sel_mat_gpu = None
+    frag_a_sel_mat_gpu = None
+    frag_sink_sel_mat_gpu = None
+    if _S_COAG_MODE == "fused_spmm":
+        i_idx_np = cp.asnumpy(i_idx).astype(np.int64, copy=False)
+        j_idx_np = cp.asnumpy(j_idx).astype(np.int64, copy=False)
+        n_pairs = int(i_idx_np.size)
+        pair_idx = np.arange(n_pairs, dtype=np.int64)
+
+        cstick_ind_np = cp.asnumpy(cstick_ind)
+        cstick_np = cp.asnumpy(cstick)
+        A_p_np = cp.asnumpy(A_p)
+        klf_p_np = cp.asnumpy(klf_p)
+        krm_p_np = cp.asnumpy(krm_p)
+        eps_p_np = cp.asnumpy(eps_p)
+        p_val_i = int(p_val)
+
+        stick_rows = []
+        stick_cols = []
+        stick_vals = []
+        for nz in range(4):
+            k_np = cstick_ind_np[nz, j_idx_np, i_idx_np].astype(np.int64, copy=False)
+            valid = k_np >= 0
+            if np.any(valid):
+                stick_rows.append(k_np[valid])
+                stick_cols.append(pair_idx[valid])
+                stick_vals.append(cstick_np[nz, j_idx_np[valid], i_idx_np[valid]])
+        if len(stick_rows) > 0:
+            stick_rows_np = np.concatenate(stick_rows)
+            stick_cols_np = np.concatenate(stick_cols)
+            stick_vals_np = np.concatenate(stick_vals)
+            stick_mat_cpu = sp.coo_matrix(
+                (stick_vals_np, (stick_rows_np, stick_cols_np)),
+                shape=(int(Nm), n_pairs),
+            ).tocsr()
+            stick_sel_mat_gpu = cp_sparse.csr_matrix(stick_mat_cpu)
+
+        frag_valid_np = np.where(klf_p_np >= 0)[0].astype(np.int64, copy=False)
+        if int(frag_valid_np.size) > 0:
+            klf_v_np = klf_p_np[frag_valid_np].astype(np.int64, copy=False)
+            A_v_np = A_p_np[frag_valid_np]
+            frag_a_mat_cpu = sp.coo_matrix(
+                (A_v_np, (klf_v_np, np.arange(int(frag_valid_np.size), dtype=np.int64))),
+                shape=(int(Nm), int(frag_valid_np.size)),
+            ).tocsr()
+            frag_a_sel_mat_gpu = cp_sparse.csr_matrix(frag_a_mat_cpu)
+
+        sink_rows = []
+        sink_cols = []
+        sink_vals = []
+        for pidx in range(n_pairs):
+            i_p = int(i_idx_np[pidx])
+            j_p = int(j_idx_np[pidx])
+            k_p = int(krm_p_np[pidx])
+            e_p = float(eps_p_np[pidx])
+            if j_p <= i_p - p_val_i - 1:
+                if k_p == i_p - 1:
+                    sink_rows.extend((k_p, k_p + 1, j_p))
+                    sink_cols.extend((pidx, pidx, pidx))
+                    sink_vals.extend((e_p, -e_p, -1.0))
+                else:
+                    sink_rows.extend((k_p, k_p + 1, i_p, j_p))
+                    sink_cols.extend((pidx, pidx, pidx, pidx))
+                    sink_vals.extend((e_p, 1.0 - e_p, -1.0, -1.0))
+            else:
+                sink_rows.extend((i_p, j_p))
+                sink_cols.extend((pidx, pidx))
+                sink_vals.extend((-1.0, -1.0))
+        if len(sink_rows) > 0:
+            sink_mat_cpu = sp.coo_matrix(
+                (
+                    np.asarray(sink_vals, dtype=np.float64),
+                    (np.asarray(sink_rows, dtype=np.int64), np.asarray(sink_cols, dtype=np.int64)),
+                ),
+                shape=(int(Nm), n_pairs),
+            ).tocsr()
+            frag_sink_sel_mat_gpu = cp_sparse.csr_matrix(sink_mat_cpu)
+
     pre = {
         "i_idx": i_idx,
         "j_idx": j_idx,
@@ -911,6 +1136,9 @@ def _get_scoag_precomp(cstick, cstick_ind, A, eps, klf, krm, phi, m, Nm):
         "c2": c2,
         "ff": ff,
         "phi_lower": cp.tril(phi),
+        "stick_sel_mat_gpu": stick_sel_mat_gpu,
+        "frag_a_sel_mat_gpu": frag_a_sel_mat_gpu,
+        "frag_sink_sel_mat_gpu": frag_sink_sel_mat_gpu,
     }
     if not disable_cache:
         _SCOAG_PRECOMP_CACHE_KEY = key
@@ -994,6 +1222,35 @@ def _S_coag_cupy(sim, Sigma=None):
     Rf_all = Kf[1:-1, j_idx, i_idx] * n_all[:, j_idx] * n_all[:, i_idx]
     Rs_all = Rs_all * p_active
     Rf_all = Rf_all * p_active
+
+    if _S_COAG_MODE == "fused_spmm":
+        S_mid = cp.zeros((Nr_int, Nm), dtype=SigmaArr.dtype)
+        stick_mat = pre.get("stick_sel_mat_gpu")
+        frag_a_mat = pre.get("frag_a_sel_mat_gpu")
+        sink_mat = pre.get("frag_sink_sel_mat_gpu")
+        frag_valid = pre["frag_valid"]
+        phi_lower = pre["phi_lower"]
+        chunk_size = _get_jcoag_chunk_size(Nr_int, Nm)
+        for start in range(0, Nr_int, chunk_size):
+            stop = min(start + chunk_size, Nr_int)
+            S_chunk = S_mid[start:stop]
+            Rs_chunk = Rs_all[start:stop]
+            Rf_chunk = Rf_all[start:stop]
+
+            if stick_mat is not None:
+                S_chunk += stick_mat.dot(Rs_chunk.T).T
+
+            if frag_a_mat is not None and int(frag_valid.size) > 0:
+                ratef_v = Rf_chunk[:, frag_valid]
+                As_chunk = frag_a_mat.dot(ratef_v.T).T
+                S_chunk += (As_chunk @ phi_lower) / m[None, :]
+
+            if sink_mat is not None:
+                S_chunk += sink_mat.dot(Rf_chunk.T).T
+
+        S = cp.zeros_like(SigmaArr)
+        S[1:-1] = S_mid * m[None, :]
+        return S
 
     # Sticking contribution.
     for k_v, c_v, valid in pre["stick_maps"]:
@@ -1209,7 +1466,12 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
         stick_idx_count = int(stick_rows.size)
     else:
         stick_sel_mat_gpu = None
+        stick_mat_cpu = None
         stick_idx_count = 0
+
+    frag_rows_parts = []
+    frag_cols_parts = []
+    frag_vals_parts = []
 
     # Precompute fragmentation redistribution once in packed (flat) form.
     klf_vals = iLF_cpu[j_all, i_all]
@@ -1227,11 +1489,16 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
         frag_rows = (k_range[:, None] * Nm + i_frag[None, :]).ravel()
         frag_cols = np.broadcast_to(np.arange(n_frag, dtype=np.int64)[None, :], (Nm, n_frag)).ravel()
         frag_vals = frag_dist_cpu.T.ravel()
+        frag_pair_idx = np.where(frag_valid)[0].astype(np.int64, copy=False)
+        frag_cols_full = np.broadcast_to(frag_pair_idx[None, :], (Nm, n_frag)).ravel()
         frag_mat_cpu = sp.coo_matrix(
             (frag_vals, (frag_rows, frag_cols)),
             shape=(int(Nm * Nm), n_frag),
         ).tocsr()
         frag_sel_mat_gpu = cp_sparse.csr_matrix(frag_mat_cpu[flat_sel, :])
+        frag_rows_parts.append(frag_rows.astype(np.int64, copy=False))
+        frag_cols_parts.append(frag_cols_full.astype(np.int64, copy=False))
+        frag_vals_parts.append(frag_vals)
         frag_idx_count = int(frag_rows.size)
     else:
         frag_sel_mat_gpu = None
@@ -1277,6 +1544,10 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
         ).tocsr()
         c1_sel_mat_gpu = cp_sparse.csr_matrix(c1_mat_cpu[flat_sel, :])
         c1_pair_idx_gpu = cp.asarray(c1_pair_idx.astype(np.int64, copy=False))
+        c1_cols_full = np.concatenate((c1_pair_idx, c1_pair_idx, c1_pair_idx)).astype(np.int64, copy=False)
+        frag_rows_parts.append(c1_rows.astype(np.int64, copy=False))
+        frag_cols_parts.append(c1_cols_full)
+        frag_vals_parts.append(c1_vals)
         c1_idx_count = int(c1_rows.size)
     else:
         c1_sel_mat_gpu = None
@@ -1314,6 +1585,10 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
         ).tocsr()
         c2_sel_mat_gpu = cp_sparse.csr_matrix(c2_mat_cpu[flat_sel, :])
         c2_pair_idx_gpu = cp.asarray(c2_pair_idx.astype(np.int64, copy=False))
+        c2_cols_full = np.concatenate((c2_pair_idx, c2_pair_idx, c2_pair_idx, c2_pair_idx)).astype(np.int64, copy=False)
+        frag_rows_parts.append(c2_rows.astype(np.int64, copy=False))
+        frag_cols_parts.append(c2_cols_full)
+        frag_vals_parts.append(c2_vals)
         c2_idx_count = int(c2_rows.size)
     else:
         c2_sel_mat_gpu = None
@@ -1345,11 +1620,32 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
         ).tocsr()
         ff_sel_mat_gpu = cp_sparse.csr_matrix(ff_mat_cpu[flat_sel, :])
         ff_pair_idx_gpu = cp.asarray(ff_idx.astype(np.int64, copy=False))
+        ff_cols_full = np.concatenate((ff_idx, ff_idx)).astype(np.int64, copy=False)
+        frag_rows_parts.append(ff_rows.astype(np.int64, copy=False))
+        frag_cols_parts.append(ff_cols_full)
+        frag_vals_parts.append(ff_vals)
         ff_idx_count = int(ff_rows.size)
     else:
         ff_sel_mat_gpu = None
         ff_pair_idx_gpu = None
         ff_idx_count = 0
+
+    if len(frag_rows_parts) > 0:
+        frag_all_rows = np.concatenate(frag_rows_parts)
+        frag_all_cols = np.concatenate(frag_cols_parts)
+        frag_all_vals = np.concatenate(frag_vals_parts)
+        frag_all_mat_cpu = sp.coo_matrix(
+            (frag_all_vals, (frag_all_rows, frag_all_cols)),
+            shape=(int(Nm * Nm), n_pairs),
+        ).tocsr()
+        frag_all_sel_mat_gpu = cp_sparse.csr_matrix(frag_all_mat_cpu[flat_sel, :])
+    else:
+        frag_all_sel_mat_gpu = None
+
+    if stick_sel_mat_gpu is not None and frag_all_sel_mat_gpu is not None:
+        jcoag_fused_sel_mat_gpu = cp_sparse.hstack([stick_sel_mat_gpu, frag_all_sel_mat_gpu], format="csr")
+    else:
+        jcoag_fused_sel_mat_gpu = None
 
     pre = {
         "q": q,
@@ -1371,6 +1667,8 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
         "ff_sel_mat_gpu": ff_sel_mat_gpu,
         "ff_pair_idx_gpu": ff_pair_idx_gpu,
         "ff_idx_count": ff_idx_count,
+        "frag_all_sel_mat_gpu": frag_all_sel_mat_gpu,
+        "jcoag_fused_sel_mat_gpu": jcoag_fused_sel_mat_gpu,
     }
     _JCOAG_PRECOMP_CACHE_KEY = key
     _JCOAG_PRECOMP_CACHE_VALUE = pre
@@ -1574,27 +1872,32 @@ def _jacobian_coagulation_generator_cupy(
         rates_s = n_mid[start:stop, j_gpu] * Rs_mid[start:stop, j_gpu, i_gpu]
         ratef = n_mid[start:stop, j_gpu] * Rf_mid[start:stop, j_gpu, i_gpu]
 
-        if pre["stick_sel_mat_gpu"] is not None:
-            # Sticking contribution from all pair-rates in one sparse matmul.
-            dat_chunk += pre["stick_sel_mat_gpu"].dot(rates_s.T).T
+        if _JCOAG_GEN_MODE == "fused_spmm" and pre["jcoag_fused_sel_mat_gpu"] is not None:
+            # Fused path: one SpMM over concatenated sticking and fragmentation rates.
+            rates_fused = cp.concatenate((rates_s, ratef), axis=1)
+            dat_chunk += pre["jcoag_fused_sel_mat_gpu"].dot(rates_fused.T).T
+        else:
+            if pre["stick_sel_mat_gpu"] is not None:
+                # Sticking contribution from all pair-rates in one sparse matmul.
+                dat_chunk += pre["stick_sel_mat_gpu"].dot(rates_s.T).T
 
-        if pre["n_frag"] > 0:
-            # Apply fragmentation via sparse operator to avoid building massive
-            # per-step flat index tensors for (k, pair) redistribution.
-            ratef_v = ratef[:, pre["frag_valid_gpu"]]
-            dat_chunk += pre["frag_sel_mat_gpu"].dot(ratef_v.T).T
+            if pre["n_frag"] > 0:
+                # Apply fragmentation via sparse operator to avoid building massive
+                # per-step flat index tensors for (k, pair) redistribution.
+                ratef_v = ratef[:, pre["frag_valid_gpu"]]
+                dat_chunk += pre["frag_sel_mat_gpu"].dot(ratef_v.T).T
 
-        if pre["c1_sel_mat_gpu"] is not None:
-            ratef_c1 = ratef[:, pre["c1_pair_idx_gpu"]]
-            dat_chunk += pre["c1_sel_mat_gpu"].dot(ratef_c1.T).T
+            if pre["c1_sel_mat_gpu"] is not None:
+                ratef_c1 = ratef[:, pre["c1_pair_idx_gpu"]]
+                dat_chunk += pre["c1_sel_mat_gpu"].dot(ratef_c1.T).T
 
-        if pre["c2_sel_mat_gpu"] is not None:
-            ratef_c2 = ratef[:, pre["c2_pair_idx_gpu"]]
-            dat_chunk += pre["c2_sel_mat_gpu"].dot(ratef_c2.T).T
+            if pre["c2_sel_mat_gpu"] is not None:
+                ratef_c2 = ratef[:, pre["c2_pair_idx_gpu"]]
+                dat_chunk += pre["c2_sel_mat_gpu"].dot(ratef_c2.T).T
 
-        if pre["ff_sel_mat_gpu"] is not None:
-            ratef_ff = ratef[:, pre["ff_pair_idx_gpu"]]
-            dat_chunk += pre["ff_sel_mat_gpu"].dot(ratef_ff.T).T
+            if pre["ff_sel_mat_gpu"] is not None:
+                ratef_ff = ratef[:, pre["ff_pair_idx_gpu"]]
+                dat_chunk += pre["ff_sel_mat_gpu"].dot(ratef_ff.T).T
 
     # Apply active-mass masking directly on packed sparse data values.
     active = Sigma[1:-1] > SigmaFloor[1:-1]
@@ -2176,7 +2479,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     global _JSTICK_MAP_CACHE_KEY, _JSTICK_MAP_CACHE_VALUE
     global _JFRAG_MAP_CACHE_KEY, _JFRAG_MAP_CACHE_VALUE, _JCOAG_WORK_CACHE_KEY, _JCOAG_WORK_CACHE_VALUE
     global _DUST_JHB_PATTERN_CACHE_KEY, _DUST_JHB_PATTERN_CACHE_VALUE
-    global _JCOAG_WORKBUF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE, _VREL_TURB_MODE
+    global _JCOAG_WORKBUF_MODE, _JCOAG_GEN_MODE, _S_COAG_MODE, _F_DIFF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE, _VREL_TURB_MODE
 
     _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
@@ -2184,18 +2487,36 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     mode = os.getenv("DUSTPY_JCOAG_WORKBUF_MODE", "fresh").strip().lower()
     if mode not in ("fresh", "reuse"):
         mode = "reuse"
+    cupy_kernel_optimized = _env_bool("DUSTPY_CUPY_KERNEL_OPTIMIZED", default=True) if backend == "cupy" else False
+    default_jcoag_gen_mode = "fused_spmm" if cupy_kernel_optimized else "baseline"
+    default_scoag_mode = "fused_spmm" if cupy_kernel_optimized else "baseline"
+    default_fdiff_mode = "elementwise" if cupy_kernel_optimized else "baseline"
+    default_vrel_turb_mode = "elementwise" if cupy_kernel_optimized else "baseline"
+
+    jcoag_gen_mode = os.getenv("DUSTPY_JCOAG_GEN_MODE", default_jcoag_gen_mode).strip().lower()
+    if jcoag_gen_mode not in ("baseline", "fused_spmm"):
+        jcoag_gen_mode = default_jcoag_gen_mode
+    scoag_mode = os.getenv("DUSTPY_S_COAG_MODE", default_scoag_mode).strip().lower()
+    if scoag_mode not in ("baseline", "fused_spmm"):
+        scoag_mode = default_scoag_mode
+    fdiff_mode = os.getenv("DUSTPY_F_DIFF_MODE", default_fdiff_mode).strip().lower()
+    if fdiff_mode not in ("baseline", "elementwise"):
+        fdiff_mode = default_fdiff_mode
     scatter_mode = os.getenv("DUSTPY_SCATTER_MODE", "addat").strip().lower()
     if scatter_mode not in ("addat", "scatter", "rawkernel"):
         scatter_mode = "addat"
-    vrel_turb_mode = os.getenv("DUSTPY_VREL_TURB_MODE", "baseline").strip().lower()
+    vrel_turb_mode = os.getenv("DUSTPY_VREL_TURB_MODE", default_vrel_turb_mode).strip().lower()
     if vrel_turb_mode not in ("baseline", "elementwise"):
-        vrel_turb_mode = "baseline"
+        vrel_turb_mode = default_vrel_turb_mode
     cupy_dust_solver_mode = _get_cupy_dust_solver_mode() if backend == "cupy" else "sparse"
     if (
         (not force)
         and backend == _BOUND_BACKEND
         and _K_A is not None
         and mode == _JCOAG_WORKBUF_MODE
+        and jcoag_gen_mode == _JCOAG_GEN_MODE
+        and scoag_mode == _S_COAG_MODE
+        and fdiff_mode == _F_DIFF_MODE
         and scatter_mode == _SCATTER_MODE
         and cupy_dust_solver_mode == _CUPY_DUST_SOLVER_MODE
         and vrel_turb_mode == _VREL_TURB_MODE
@@ -2228,6 +2549,9 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     _K_INTERP_TO_INTERFACES = select_backend({"cupy": _interp_to_interfaces_cupy}, backend=backend, default=_interp_to_interfaces_numpy)
 
     _JCOAG_WORKBUF_MODE = mode
+    _JCOAG_GEN_MODE = jcoag_gen_mode
+    _S_COAG_MODE = scoag_mode
+    _F_DIFF_MODE = fdiff_mode
     _SCATTER_MODE = scatter_mode
     _CUPY_DUST_SOLVER_MODE = cupy_dust_solver_mode
     _VREL_TURB_MODE = vrel_turb_mode
