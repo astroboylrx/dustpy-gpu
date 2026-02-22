@@ -95,6 +95,8 @@ def _load_cupy_gas_solver_config():
         "gpu": "gpu_gmres",
         "gpu_gmres": "gpu_gmres",
         "gmres": "gpu_gmres",
+        "dense": "dense_gpu",
+        "dense_gpu": "dense_gpu",
     }
     return {"mode": aliases.get(mode, "cpu_direct")}
 
@@ -422,6 +424,22 @@ def _solve_sparse_linear_system_cupy_cpu_direct(matrix, rhs):
     return cp.asarray(sol_cpu)
 
 
+def _solve_sparse_linear_system_cupy_dense(matrix, rhs):
+    """Dense CuPy direct solve path (mainly for small gas systems / experiments)."""
+    if cp is None or cp_sparse is None:
+        raise RuntimeError("CuPy backend requested but cupy/cupyx is unavailable.")
+
+    if isinstance(matrix, cp_sparse.spmatrix):
+        matrix_gpu = matrix.toarray()
+    elif sp.issparse(matrix):
+        matrix_gpu = cp_sparse.csr_matrix(matrix).toarray()
+    else:
+        matrix_gpu = cp.asarray(matrix)
+    rhs_raw = rhs._data if hasattr(rhs, "_data") else rhs
+    rhs_gpu = cp.asarray(rhs_raw)
+    return cp.linalg.solve(matrix_gpu, rhs_gpu)
+
+
 def bind_sparse_solver(backend=None, force=False):
     """Bind sparse linear solver implementation for the selected backend."""
     global _BOUND_SOLVER_BACKEND, _SOLVE_SPARSE_IMPL
@@ -460,6 +478,8 @@ def bind_gas_sparse_solver(backend=None, force=False):
 
     if backend == "cupy" and mode == "cpu_direct":
         _SOLVE_GAS_SPARSE_IMPL = _solve_sparse_linear_system_cupy_cpu_direct
+    elif backend == "cupy" and mode == "dense_gpu":
+        _SOLVE_GAS_SPARSE_IMPL = _solve_sparse_linear_system_cupy_dense
     elif backend == "cupy":
         _SOLVE_GAS_SPARSE_IMPL = _solve_sparse_linear_system_cupy
     elif backend == "torch":
