@@ -135,6 +135,9 @@ _F_DIFF_MODE = "baseline"
 _SCATTER_MODE = "addat"
 _CUPY_DUST_SOLVER_MODE = "sparse"
 _VREL_TURB_MODE = "baseline"
+_VREL_TOT_MODE = "baseline"
+_P_FRAG_MODE = "baseline"
+_COLLISION_KERNEL_MODE = "baseline"
 _RUNTIME_STATES = {}
 _ACTIVE_RUNTIME_TOKEN = None
 _RAW_SCATTER_KERNEL_F32 = None
@@ -143,6 +146,12 @@ _F_DIFF_EW_KERNEL_F32 = None
 _F_DIFF_EW_KERNEL_F64 = None
 _VREL_TURB_EW_KERNEL_F32 = None
 _VREL_TURB_EW_KERNEL_F64 = None
+_VREL_TOT_EW_KERNEL_F32 = None
+_VREL_TOT_EW_KERNEL_F64 = None
+_P_FRAG_EW_KERNEL_F32 = None
+_P_FRAG_EW_KERNEL_F64 = None
+_COLLISION_KERNEL_EW_F32 = None
+_COLLISION_KERNEL_EW_F64 = None
 
 _RUNTIME_STATE_VARS = (
     "_BOUND_BACKEND",
@@ -204,6 +213,9 @@ _RUNTIME_STATE_VARS = (
     "_SCATTER_MODE",
     "_CUPY_DUST_SOLVER_MODE",
     "_VREL_TURB_MODE",
+    "_VREL_TOT_MODE",
+    "_P_FRAG_MODE",
+    "_COLLISION_KERNEL_MODE",
 )
 
 
@@ -268,6 +280,9 @@ def _fresh_runtime_state():
         "_SCATTER_MODE": "addat",
         "_CUPY_DUST_SOLVER_MODE": "sparse",
         "_VREL_TURB_MODE": "baseline",
+        "_VREL_TOT_MODE": "baseline",
+        "_P_FRAG_MODE": "baseline",
+        "_COLLISION_KERNEL_MODE": "baseline",
     }
 
 
@@ -610,6 +625,170 @@ def _get_vrel_turbulent_elementwise_kernel(dtype):
                 "dustpy_vrel_turbulent_elementwise_f64",
             )
         return _VREL_TURB_EW_KERNEL_F64
+
+    return None
+
+
+def _get_vrel_tot_elementwise_kernel(dtype):
+    """Return cached elementwise kernel for total relative velocity."""
+    global _VREL_TOT_EW_KERNEL_F32, _VREL_TOT_EW_KERNEL_F64
+
+    if cp is None:
+        return None
+
+    if dtype == cp.float32:
+        if _VREL_TOT_EW_KERNEL_F32 is None:
+            _VREL_TOT_EW_KERNEL_F32 = cp.ElementwiseKernel(
+                "float32 az, float32 br, float32 rd, float32 tu, float32 vt",
+                "float32 out",
+                "out = sqrtf(az * az + br * br + rd * rd + tu * tu + vt * vt)",
+                "dustpy_vrel_tot_elementwise_f32",
+            )
+        return _VREL_TOT_EW_KERNEL_F32
+
+    if dtype == cp.float64:
+        if _VREL_TOT_EW_KERNEL_F64 is None:
+            _VREL_TOT_EW_KERNEL_F64 = cp.ElementwiseKernel(
+                "float64 az, float64 br, float64 rd, float64 tu, float64 vt",
+                "float64 out",
+                "out = sqrt(az * az + br * br + rd * rd + tu * tu + vt * vt)",
+                "dustpy_vrel_tot_elementwise_f64",
+            )
+        return _VREL_TOT_EW_KERNEL_F64
+
+    return None
+
+
+def _get_pfrag_elementwise_kernel(dtype):
+    """Return cached elementwise kernel for fragmentation probability."""
+    global _P_FRAG_EW_KERNEL_F32, _P_FRAG_EW_KERNEL_F64
+
+    if cp is None:
+        return None
+
+    if dtype == cp.float32:
+        if _P_FRAG_EW_KERNEL_F32 is None:
+            _P_FRAG_EW_KERNEL_F32 = cp.ElementwiseKernel(
+                "raw float32 vrel, raw float32 vfrag, int64 nm",
+                "float32 out",
+                r"""
+                const long long nm2 = nm * nm;
+                const long long ir_int = i / nm2;
+                const float v = vrel[i];
+                const float vf = vfrag[ir_int];
+                if (v != 0.0f) {
+                    const float dum = (vf / v) * (vf / v);
+                    out = (1.5f * dum + 1.0f) * expf(-1.5f * dum);
+                } else {
+                    out = 0.0f;
+                }
+                """,
+                "dustpy_pfrag_elementwise_f32",
+            )
+        return _P_FRAG_EW_KERNEL_F32
+
+    if dtype == cp.float64:
+        if _P_FRAG_EW_KERNEL_F64 is None:
+            _P_FRAG_EW_KERNEL_F64 = cp.ElementwiseKernel(
+                "raw float64 vrel, raw float64 vfrag, int64 nm",
+                "float64 out",
+                r"""
+                const long long nm2 = nm * nm;
+                const long long ir_int = i / nm2;
+                const double v = vrel[i];
+                const double vf = vfrag[ir_int];
+                if (v != 0.0) {
+                    const double dum = (vf / v) * (vf / v);
+                    out = (1.5 * dum + 1.0) * exp(-1.5 * dum);
+                } else {
+                    out = 0.0;
+                }
+                """,
+                "dustpy_pfrag_elementwise_f64",
+            )
+        return _P_FRAG_EW_KERNEL_F64
+
+    return None
+
+
+def _get_collision_kernel_elementwise_kernel(dtype):
+    """Return cached elementwise kernel for collision-kernel assembly."""
+    global _COLLISION_KERNEL_EW_F32, _COLLISION_KERNEL_EW_F64
+
+    if cp is None:
+        return None
+
+    if dtype == cp.float32:
+        if _COLLISION_KERNEL_EW_F32 is None:
+            _COLLISION_KERNEL_EW_F32 = cp.ElementwiseKernel(
+                "raw float32 a, raw float32 h, raw float32 sigma, raw float32 floor, raw float32 vrel, int64 nm",
+                "float32 out",
+                r"""
+                const long long nm2 = nm * nm;
+                const long long ir_int = i / nm2;
+                const long long rem = i - ir_int * nm2;
+                const long long jm = rem / nm;
+                const long long im = rem - jm * nm;
+
+                if (jm > im) {
+                    out = 0.0f;
+                    return;
+                }
+
+                const long long base = ir_int * nm;
+                if (sigma[base + jm] <= floor[base + jm] || sigma[base + im] <= floor[base + im]) {
+                    out = 0.0f;
+                    return;
+                }
+
+                const float pi = 3.14159265358979323846f;
+                const float sum_a = a[base + jm] + a[base + im];
+                const float cross = pi * sum_a * sum_a;
+                const float hj = h[base + jm];
+                const float hi = h[base + im];
+                const float sh = sqrtf(2.0f * pi * (hj * hj + hi * hi));
+                const float diag_fac = (jm == im) ? 0.5f : 1.0f;
+                out = diag_fac * cross * vrel[i] / sh;
+                """,
+                "dustpy_collision_kernel_elementwise_f32",
+            )
+        return _COLLISION_KERNEL_EW_F32
+
+    if dtype == cp.float64:
+        if _COLLISION_KERNEL_EW_F64 is None:
+            _COLLISION_KERNEL_EW_F64 = cp.ElementwiseKernel(
+                "raw float64 a, raw float64 h, raw float64 sigma, raw float64 floor, raw float64 vrel, int64 nm",
+                "float64 out",
+                r"""
+                const long long nm2 = nm * nm;
+                const long long ir_int = i / nm2;
+                const long long rem = i - ir_int * nm2;
+                const long long jm = rem / nm;
+                const long long im = rem - jm * nm;
+
+                if (jm > im) {
+                    out = 0.0;
+                    return;
+                }
+
+                const long long base = ir_int * nm;
+                if (sigma[base + jm] <= floor[base + jm] || sigma[base + im] <= floor[base + im]) {
+                    out = 0.0;
+                    return;
+                }
+
+                const double pi = 3.14159265358979323846;
+                const double sum_a = a[base + jm] + a[base + im];
+                const double cross = pi * sum_a * sum_a;
+                const double hj = h[base + jm];
+                const double hi = h[base + im];
+                const double sh = sqrt(2.0 * pi * (hj * hj + hi * hi));
+                const double diag_fac = (jm == im) ? 0.5 : 1.0;
+                out = diag_fac * cross * vrel[i] / sh;
+                """,
+                "dustpy_collision_kernel_elementwise_f64",
+            )
+        return _COLLISION_KERNEL_EW_F64
 
     return None
 
@@ -2066,6 +2245,44 @@ def _kernel_fortran(sim):
     )
 
 
+def _kernel_cupy_elementwise(a, H, Sigma, SigmaFloor, vrel):
+    """Elementwise-kernel variant for collision-kernel assembly."""
+    dtype = cp.result_type(a.dtype, H.dtype, Sigma.dtype, SigmaFloor.dtype, vrel.dtype)
+    if dtype not in (cp.float32, cp.float64):
+        return None
+
+    kernel = _get_collision_kernel_elementwise_kernel(dtype)
+    if kernel is None:
+        return None
+
+    Nr = int(a.shape[0])
+    Nm = int(a.shape[1])
+    Nr_int = Nr - 2
+    size = int(Nr_int * Nm * Nm)
+    if size <= 0:
+        return cp.zeros((Nr, Nm, Nm), dtype=dtype)
+
+    a_int = cp.asarray(a[1:-1], dtype=dtype).reshape(-1)
+    h_int = cp.asarray(H[1:-1], dtype=dtype).reshape(-1)
+    sigma_int = cp.asarray(Sigma[1:-1], dtype=dtype).reshape(-1)
+    floor_int = cp.asarray(SigmaFloor[1:-1], dtype=dtype).reshape(-1)
+    vrel_int = cp.asarray(vrel[1:-1], dtype=dtype).reshape(-1)
+
+    out_int = kernel(
+        a_int,
+        h_int,
+        sigma_int,
+        floor_int,
+        vrel_int,
+        np.int64(Nm),
+        size=size,
+    )
+
+    K = cp.zeros((Nr, Nm, Nm), dtype=dtype)
+    K[1:-1, :, :] = out_int.reshape(Nr_int, Nm, Nm)
+    return K
+
+
 def _kernel_cupy(sim):
     global _KERNEL_LOWER_MASK
     a = _field_data(sim.dust.a)
@@ -2074,6 +2291,11 @@ def _kernel_cupy(sim):
     SigmaFloor = _field_data(sim.dust.SigmaFloor)
     vrel = _field_data(sim.dust.v.rel.tot)
     Nm = int(sim.grid.Nm)
+
+    if _COLLISION_KERNEL_MODE == "elementwise" and cp is not None:
+        K = _kernel_cupy_elementwise(a, H, Sigma, SigmaFloor, vrel)
+        if K is not None:
+            return K
 
     if _KERNEL_LOWER_MASK is None or int(_KERNEL_LOWER_MASK.shape[0]) != Nm:
         # Fortran kernels are stored/accessed as K(ir, j, i) with j <= i active.
@@ -2311,12 +2533,45 @@ def _p_frag_fortran(sim):
     return _dust_f_call(dust_f.pfrag, sim.dust.v.rel.tot, sim.dust.v.frag)
 
 
+def _p_frag_cupy_elementwise(vrel, vfrag):
+    """Elementwise-kernel variant of fragmentation probability."""
+    dtype = cp.result_type(vrel.dtype, vfrag.dtype)
+    if dtype not in (cp.float32, cp.float64):
+        return None
+
+    kernel = _get_pfrag_elementwise_kernel(dtype)
+    if kernel is None:
+        return None
+
+    Nr = int(vrel.shape[0])
+    Nm = int(vrel.shape[1])
+    Nr_int = Nr - 2
+    size = int(Nr_int * Nm * Nm)
+    if size <= 0:
+        return cp.zeros_like(vrel, dtype=dtype)
+
+    vrel_int = cp.asarray(vrel[1:-1], dtype=dtype).reshape(-1)
+    vfrag_int = cp.asarray(vfrag[1:-1], dtype=dtype)
+    out_int = kernel(vrel_int, vfrag_int, np.int64(Nm), size=size)
+
+    pf = cp.zeros_like(vrel, dtype=dtype)
+    pf[1:-1, :, :] = out_int.reshape(Nr_int, Nm, Nm)
+    return pf
+
+
 def _p_frag_cupy(sim):
     vrel = _field_data(sim.dust.v.rel.tot)
-    vfrag = _field_data(sim.dust.v.frag)[:, None, None]
+    vfrag = _field_data(sim.dust.v.frag)
+
+    if _P_FRAG_MODE == "elementwise" and cp is not None:
+        pf = _p_frag_cupy_elementwise(vrel, vfrag)
+        if pf is not None:
+            return pf
+
+    vfrag3 = vfrag[:, None, None]
     mask = vrel != 0.0
     denom = xp.where(mask, vrel, 1.0)
-    dum = (vfrag / denom) ** 2
+    dum = (vfrag3 / denom) ** 2
     pf = xp.where(mask, (1.5 * dum + 1.0) * xp.exp(-1.5 * dum), 0.0)
     pf[0, :, :] = 0.0
     pf[-1, :, :] = 0.0
@@ -2479,7 +2734,8 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     global _JSTICK_MAP_CACHE_KEY, _JSTICK_MAP_CACHE_VALUE
     global _JFRAG_MAP_CACHE_KEY, _JFRAG_MAP_CACHE_VALUE, _JCOAG_WORK_CACHE_KEY, _JCOAG_WORK_CACHE_VALUE
     global _DUST_JHB_PATTERN_CACHE_KEY, _DUST_JHB_PATTERN_CACHE_VALUE
-    global _JCOAG_WORKBUF_MODE, _JCOAG_GEN_MODE, _S_COAG_MODE, _F_DIFF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE, _VREL_TURB_MODE
+    global _JCOAG_WORKBUF_MODE, _JCOAG_GEN_MODE, _S_COAG_MODE, _F_DIFF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE
+    global _VREL_TURB_MODE, _VREL_TOT_MODE, _P_FRAG_MODE, _COLLISION_KERNEL_MODE
 
     _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
@@ -2492,6 +2748,9 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     default_scoag_mode = "fused_spmm" if cupy_kernel_optimized else "baseline"
     default_fdiff_mode = "elementwise" if cupy_kernel_optimized else "baseline"
     default_vrel_turb_mode = "elementwise" if cupy_kernel_optimized else "baseline"
+    default_vrel_tot_mode = "baseline"
+    default_p_frag_mode = "baseline"
+    default_collision_kernel_mode = "baseline"
 
     jcoag_gen_mode = os.getenv("DUSTPY_JCOAG_GEN_MODE", default_jcoag_gen_mode).strip().lower()
     if jcoag_gen_mode not in ("baseline", "fused_spmm"):
@@ -2508,6 +2767,15 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     vrel_turb_mode = os.getenv("DUSTPY_VREL_TURB_MODE", default_vrel_turb_mode).strip().lower()
     if vrel_turb_mode not in ("baseline", "elementwise"):
         vrel_turb_mode = default_vrel_turb_mode
+    vrel_tot_mode = os.getenv("DUSTPY_VREL_TOT_MODE", default_vrel_tot_mode).strip().lower()
+    if vrel_tot_mode not in ("baseline", "elementwise"):
+        vrel_tot_mode = default_vrel_tot_mode
+    p_frag_mode = os.getenv("DUSTPY_P_FRAG_MODE", default_p_frag_mode).strip().lower()
+    if p_frag_mode not in ("baseline", "elementwise"):
+        p_frag_mode = default_p_frag_mode
+    collision_kernel_mode = os.getenv("DUSTPY_COLLISION_KERNEL_MODE", default_collision_kernel_mode).strip().lower()
+    if collision_kernel_mode not in ("baseline", "elementwise"):
+        collision_kernel_mode = default_collision_kernel_mode
     cupy_dust_solver_mode = _get_cupy_dust_solver_mode() if backend == "cupy" else "sparse"
     if (
         (not force)
@@ -2520,6 +2788,9 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
         and scatter_mode == _SCATTER_MODE
         and cupy_dust_solver_mode == _CUPY_DUST_SOLVER_MODE
         and vrel_turb_mode == _VREL_TURB_MODE
+        and vrel_tot_mode == _VREL_TOT_MODE
+        and p_frag_mode == _P_FRAG_MODE
+        and collision_kernel_mode == _COLLISION_KERNEL_MODE
     ):
         return
 
@@ -2555,6 +2826,9 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     _SCATTER_MODE = scatter_mode
     _CUPY_DUST_SOLVER_MODE = cupy_dust_solver_mode
     _VREL_TURB_MODE = vrel_turb_mode
+    _VREL_TOT_MODE = vrel_tot_mode
+    _P_FRAG_MODE = p_frag_mode
+    _COLLISION_KERNEL_MODE = collision_kernel_mode
 
     _KERNEL_LOWER_MASK = None
     _COAG_CACHE_KEY = None
@@ -3692,6 +3966,25 @@ def vrel_radial_drift(sim):
     return _K_VREL_RAD(sim)
 
 
+def _vrel_tot_cupy_elementwise(azi, brown, rad, turb, vert):
+    """Elementwise-kernel variant for total relative velocity."""
+    dtype = cp.result_type(azi.dtype, brown.dtype, rad.dtype, turb.dtype, vert.dtype)
+    if dtype not in (cp.float32, cp.float64):
+        return None
+
+    kernel = _get_vrel_tot_elementwise_kernel(dtype)
+    if kernel is None:
+        return None
+
+    return kernel(
+        cp.asarray(azi, dtype=dtype),
+        cp.asarray(brown, dtype=dtype),
+        cp.asarray(rad, dtype=dtype),
+        cp.asarray(turb, dtype=dtype),
+        cp.asarray(vert, dtype=dtype),
+    )
+
+
 def vrel_tot(sim):
     """Function calculates the total relative vparticle velocities by taking the root mean square
     of all individual sources.
@@ -3705,6 +3998,17 @@ def vrel_tot(sim):
     -------
     vrel : Field
         Relative velocities"""
+    if _VREL_TOT_MODE == "elementwise" and cp is not None and getattr(xp, "name", "") == "cupy":
+        vrel = _vrel_tot_cupy_elementwise(
+            _field_data(sim.dust.v.rel.azi),
+            _field_data(sim.dust.v.rel.brown),
+            _field_data(sim.dust.v.rel.rad),
+            _field_data(sim.dust.v.rel.turb),
+            _field_data(sim.dust.v.rel.vert),
+        )
+        if vrel is not None:
+            return vrel
+
     return xp.sqrt(
         sim.dust.v.rel.azi**2
         + sim.dust.v.rel.brown**2
