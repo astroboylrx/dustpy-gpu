@@ -2748,9 +2748,9 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     default_scoag_mode = "fused_spmm" if cupy_kernel_optimized else "baseline"
     default_fdiff_mode = "elementwise" if cupy_kernel_optimized else "baseline"
     default_vrel_turb_mode = "elementwise" if cupy_kernel_optimized else "baseline"
-    default_vrel_tot_mode = "baseline"
-    default_p_frag_mode = "baseline"
-    default_collision_kernel_mode = "baseline"
+    default_vrel_tot_mode = "elementwise" if cupy_kernel_optimized else "baseline"
+    default_p_frag_mode = "elementwise" if cupy_kernel_optimized else "baseline"
+    default_collision_kernel_mode = "elementwise" if cupy_kernel_optimized else "baseline"
 
     jcoag_gen_mode = os.getenv("DUSTPY_JCOAG_GEN_MODE", default_jcoag_gen_mode).strip().lower()
     if jcoag_gen_mode not in ("baseline", "fused_spmm"):
