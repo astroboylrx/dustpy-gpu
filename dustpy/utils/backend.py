@@ -33,6 +33,8 @@ _AUDIT_TOTAL = 0
 _AUDIT_LOCK = threading.Lock()
 _AUDIT_LOCAL = threading.local()
 _GMRES_STATS = Counter()
+_GMRES_PREV_SOL = None
+_GMRES_PRECOND_CACHE = {}
 
 
 _CUPY_GMRES_KWARGS = {"maxiter": 500}
@@ -61,6 +63,13 @@ def _env_bool(name, default=False):
 
 
 def _load_cupy_gmres_config():
+    solver_optimized = _env_bool("DUSTPY_CUPY_SOLVER_OPTIMIZED", default=True)
+    default_x0_mode = "rhs"
+    default_reuse_precond = not solver_optimized
+
+    x0_mode = os.getenv("DUSTPY_CUPY_GMRES_X0", default_x0_mode).strip().lower()
+    if x0_mode not in ("rhs", "zero", "prev"):
+        x0_mode = default_x0_mode
     return {
         "tier1": {
             "rtol": float(os.getenv("DUSTPY_CUPY_GMRES_RTOL", "1e-14")),
@@ -74,7 +83,8 @@ def _load_cupy_gmres_config():
             "maxiter": int(os.getenv("DUSTPY_CUPY_GMRES_FALLBACK_MAXITER", "2000")),
             "restart": int(os.getenv("DUSTPY_CUPY_GMRES_FALLBACK_RESTART", "150")),
         },
-        "cpu_fallback": _env_bool("DUSTPY_CUPY_GMRES_CPU_FALLBACK", default=False),
+        "x0_mode": x0_mode,
+        "reuse_precond": _env_bool("DUSTPY_CUPY_GMRES_REUSE_PRECOND", default=default_reuse_precond),
     }
 
 
@@ -176,8 +186,11 @@ def get_transfer_audit_report(limit=20):
 
 
 def reset_gmres_stats():
+    global _GMRES_PREV_SOL
     with _AUDIT_LOCK:
         _GMRES_STATS.clear()
+    _GMRES_PREV_SOL = None
+    _GMRES_PRECOND_CACHE.clear()
 
 
 def get_gmres_stats():
@@ -259,6 +272,7 @@ def call_numpy(func, *args, to_backend_result=True, audit_tag=None, **kwargs):
 
 
 def _solve_sparse_linear_system_cupy(matrix, rhs):
+    global _GMRES_PREV_SOL
     if cp is None or cp_sparse is None or cp_splinalg is None:
         raise RuntimeError("CuPy backend requested but cupy/cupyx is unavailable.")
 
@@ -275,15 +289,40 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
     rhs_gpu = cp.asarray(rhs_raw)
 
     if is_scipy_sparse or is_cupy_sparse:
+        cfg = _CUPY_GMRES_CONFIG
+        precond = None
         diag = matrix_gpu.diagonal()
         diag = cp.where(cp.abs(diag) > 1e-15, diag, cp.ones_like(diag))
-        inv_diag = 1.0 / diag
+        if cfg["reuse_precond"]:
+            pkey = (int(diag.size), str(diag.dtype))
+            cached = _GMRES_PRECOND_CACHE.get(pkey)
+            if cached is None:
+                inv_diag = 1.0 / diag
 
-        def matvec(x):
-            return inv_diag * x
+                def matvec(x, inv=inv_diag):
+                    return inv * x
 
-        precond = cp_splinalg.LinearOperator(matrix_gpu.shape, matvec=matvec)
-        cfg = _CUPY_GMRES_CONFIG
+                precond = cp_splinalg.LinearOperator(matrix_gpu.shape, matvec=matvec)
+                _GMRES_PRECOND_CACHE[pkey] = (inv_diag, precond)
+            else:
+                inv_diag, precond = cached
+                inv_diag[...] = 1.0 / diag
+        else:
+            inv_diag = 1.0 / diag
+
+            def matvec(x):
+                return inv_diag * x
+
+            precond = cp_splinalg.LinearOperator(matrix_gpu.shape, matvec=matvec)
+
+        x0_mode = cfg["x0_mode"]
+        if x0_mode == "zero":
+            x0_tier1 = cp.zeros_like(rhs_gpu)
+        elif x0_mode == "prev" and _GMRES_PREV_SOL is not None and _GMRES_PREV_SOL.shape == rhs_gpu.shape:
+            x0_tier1 = _GMRES_PREV_SOL
+        else:
+            x0_tier1 = rhs_gpu
+
         tier1 = cfg["tier1"]
         # Tier-1: strict tolerances (fast/default path).
         tier1_kwargs = _cupy_gmres_kwargs(
@@ -292,10 +331,11 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
             maxiter=tier1["maxiter"],
             restart=tier1["restart"],
             precond=precond,
-            x0=rhs_gpu,
+            x0=x0_tier1,
         )
         sol, info = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier1_kwargs)
         if info == 0:
+            _GMRES_PREV_SOL = sol
             with _AUDIT_LOCK:
                 _GMRES_STATS["tier1_success"] += 1
             return sol
@@ -312,14 +352,15 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
         )
         sol2, info2 = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier2_kwargs)
         if info2 == 0:
+            _GMRES_PREV_SOL = sol2
             with _AUDIT_LOCK:
                 _GMRES_STATS["tier2_success"] += 1
             return sol2
 
-        # Optional last-resort CPU direct fallback (explicitly opt-in).
-        if cfg["cpu_fallback"]:
-            with _AUDIT_LOCK:
-                _GMRES_STATS["cpu_fallback"] += 1
+        with _AUDIT_LOCK:
+            _GMRES_STATS["tier2_failed"] += 1
+            _GMRES_STATS["cpu_fallback"] += 1
+        try:
             matrix_cpu = sp.csr_matrix(cp.asnumpy(matrix_gpu))
             rhs_cpu = cp.asnumpy(rhs_gpu)
             matrix_lu = sp.linalg.splu(
@@ -328,14 +369,17 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
                 diag_pivot_thresh=0.0,
                 options=dict(SymmetricMode=True),
             )
-            return cp.asarray(matrix_lu.solve(rhs_cpu))
-
-        with _AUDIT_LOCK:
-            _GMRES_STATS["tier2_failed"] += 1
-        raise RuntimeError(
-            "CuPy GMRES failed to converge "
-            f"(tier1_info={info}, tier2_info={info2})."
-        )
+            sol_cpu = matrix_lu.solve(rhs_cpu)
+            sol_fallback = cp.asarray(sol_cpu)
+            _GMRES_PREV_SOL = sol_fallback
+            return sol_fallback
+        except Exception as exc:
+            with _AUDIT_LOCK:
+                _GMRES_STATS["cpu_fallback_failed"] += 1
+            raise RuntimeError(
+                "CuPy GMRES failed to converge and CPU fallback failed "
+                f"(tier1_info={info}, tier2_info={info2})."
+            ) from exc
 
     return cp.linalg.solve(matrix_gpu, rhs_gpu)
 

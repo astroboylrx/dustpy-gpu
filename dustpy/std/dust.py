@@ -128,7 +128,6 @@ _JCOAG_WORK_CACHE_KEY = None
 _JCOAG_WORK_CACHE_VALUE = None
 _DUST_JHB_PATTERN_CACHE_KEY = None
 _DUST_JHB_PATTERN_CACHE_VALUE = None
-_JCOAG_WORKBUF_MODE = "fresh"
 _JCOAG_GEN_MODE = "baseline"
 _S_COAG_MODE = "baseline"
 _F_DIFF_MODE = "baseline"
@@ -138,6 +137,10 @@ _VREL_TURB_MODE = "baseline"
 _VREL_TOT_MODE = "baseline"
 _P_FRAG_MODE = "baseline"
 _COLLISION_KERNEL_MODE = "baseline"
+_CUPY_A_BUILD_MODE = "identity_sub"
+_CUPY_DIAG_POS_CACHE_KEY = None
+_CUPY_DIAG_POS_CACHE_VALUE = None
+_JCOAG_CHUNK_SIZE_OVERRIDE = None
 _RUNTIME_STATES = {}
 _ACTIVE_RUNTIME_TOKEN = None
 _RAW_SCATTER_KERNEL_F32 = None
@@ -206,7 +209,6 @@ _RUNTIME_STATE_VARS = (
     "_JCOAG_WORK_CACHE_VALUE",
     "_DUST_JHB_PATTERN_CACHE_KEY",
     "_DUST_JHB_PATTERN_CACHE_VALUE",
-    "_JCOAG_WORKBUF_MODE",
     "_JCOAG_GEN_MODE",
     "_S_COAG_MODE",
     "_F_DIFF_MODE",
@@ -216,6 +218,10 @@ _RUNTIME_STATE_VARS = (
     "_VREL_TOT_MODE",
     "_P_FRAG_MODE",
     "_COLLISION_KERNEL_MODE",
+    "_CUPY_A_BUILD_MODE",
+    "_CUPY_DIAG_POS_CACHE_KEY",
+    "_CUPY_DIAG_POS_CACHE_VALUE",
+    "_JCOAG_CHUNK_SIZE_OVERRIDE",
 )
 
 
@@ -273,7 +279,6 @@ def _fresh_runtime_state():
         "_JCOAG_WORK_CACHE_VALUE": None,
         "_DUST_JHB_PATTERN_CACHE_KEY": None,
         "_DUST_JHB_PATTERN_CACHE_VALUE": None,
-        "_JCOAG_WORKBUF_MODE": "fresh",
         "_JCOAG_GEN_MODE": "baseline",
         "_S_COAG_MODE": "baseline",
         "_F_DIFF_MODE": "baseline",
@@ -283,6 +288,10 @@ def _fresh_runtime_state():
         "_VREL_TOT_MODE": "baseline",
         "_P_FRAG_MODE": "baseline",
         "_COLLISION_KERNEL_MODE": "baseline",
+        "_CUPY_A_BUILD_MODE": "identity_sub",
+        "_CUPY_DIAG_POS_CACHE_KEY": None,
+        "_CUPY_DIAG_POS_CACHE_VALUE": None,
+        "_JCOAG_CHUNK_SIZE_OVERRIDE": None,
     }
 
 
@@ -795,12 +804,8 @@ def _get_collision_kernel_elementwise_kernel(dtype):
 
 def _get_jcoag_chunk_size(Nr_int, Nm):
     """Return chunk size for CuPy Jacobian radius batching."""
-    val = os.getenv("DUSTPY_JCOAG_CHUNK_SIZE", "auto").strip().lower()
-    if val and val != "auto":
-        try:
-            return max(1, min(int(val), int(Nr_int)))
-        except Exception:
-            pass
+    if _JCOAG_CHUNK_SIZE_OVERRIDE is not None:
+        return max(1, min(int(_JCOAG_CHUNK_SIZE_OVERRIDE), int(Nr_int)))
 
     # Auto heuristic tuned for production-like grids:
     # use one wide batch when grids are moderate, otherwise cap temporary size.
@@ -828,6 +833,47 @@ def _get_cupy_dust_solver_mode():
         "dense_gpu": "dense_gpu",
     }
     return aliases.get(raw, "sparse")
+
+
+def _get_cupy_diag_positions_csr(matrix):
+    """Return cached CSR data positions for diagonal entries, or None if absent."""
+    global _CUPY_DIAG_POS_CACHE_KEY, _CUPY_DIAG_POS_CACHE_VALUE
+    if cp is None or cp_sparse is None:
+        return None
+    if not isinstance(matrix, cp_sparse.spmatrix):
+        return None
+    if getattr(matrix, "format", None) != "csr":
+        return None
+
+    key = (int(matrix.shape[0]), int(matrix.shape[1]), int(matrix.nnz), str(matrix.dtype))
+    if _CUPY_DIAG_POS_CACHE_KEY == key and _CUPY_DIAG_POS_CACHE_VALUE is not None:
+        return _CUPY_DIAG_POS_CACHE_VALUE
+
+    n = int(matrix.shape[0])
+    indptr = np.asarray(cp.asnumpy(matrix.indptr), dtype=np.int64)
+    indices = np.asarray(cp.asnumpy(matrix.indices), dtype=np.int64)
+    pos = np.full((n,), -1, dtype=np.int64)
+
+    ok = True
+    for i in range(n):
+        s = int(indptr[i])
+        e = int(indptr[i + 1])
+        row_cols = indices[s:e]
+        j = int(np.searchsorted(row_cols, i))
+        if j >= (e - s) or int(row_cols[j]) != i:
+            ok = False
+            break
+        pos[i] = s + j
+
+    if not ok:
+        _CUPY_DIAG_POS_CACHE_KEY = key
+        _CUPY_DIAG_POS_CACHE_VALUE = None
+        return None
+
+    out = cp.asarray(pos)
+    _CUPY_DIAG_POS_CACHE_KEY = key
+    _CUPY_DIAG_POS_CACHE_VALUE = out
+    return out
 
 
 def _a_fortran(sim):
@@ -1169,7 +1215,6 @@ def _get_mass_grid_q(m, Nm):
 def _get_scoag_precomp(cstick, cstick_ind, A, eps, klf, krm, phi, m, Nm):
     """Cache static pair/mask maps for _S_coag_cupy."""
     global _SCOAG_PRECOMP_CACHE_KEY, _SCOAG_PRECOMP_CACHE_VALUE
-    disable_cache = os.getenv("DUSTPY_DISABLE_SCOAG_PRECOMP", "0").strip() == "1"
     key = (
         int(Nm),
         _S_COAG_MODE,
@@ -1182,7 +1227,7 @@ def _get_scoag_precomp(cstick, cstick_ind, A, eps, klf, krm, phi, m, Nm):
         id(phi),
         id(m),
     )
-    if (not disable_cache) and _SCOAG_PRECOMP_CACHE_KEY == key and _SCOAG_PRECOMP_CACHE_VALUE is not None:
+    if _SCOAG_PRECOMP_CACHE_KEY == key and _SCOAG_PRECOMP_CACHE_VALUE is not None:
         return _SCOAG_PRECOMP_CACHE_VALUE
 
     i_idx, j_idx = _get_coag_pair_indices(Nm)
@@ -1319,9 +1364,8 @@ def _get_scoag_precomp(cstick, cstick_ind, A, eps, klf, krm, phi, m, Nm):
         "frag_a_sel_mat_gpu": frag_a_sel_mat_gpu,
         "frag_sink_sel_mat_gpu": frag_sink_sel_mat_gpu,
     }
-    if not disable_cache:
-        _SCOAG_PRECOMP_CACHE_KEY = key
-        _SCOAG_PRECOMP_CACHE_VALUE = pre
+    _SCOAG_PRECOMP_CACHE_KEY = key
+    _SCOAG_PRECOMP_CACHE_VALUE = pre
     return pre
 
 
@@ -2734,16 +2778,16 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     global _JSTICK_MAP_CACHE_KEY, _JSTICK_MAP_CACHE_VALUE
     global _JFRAG_MAP_CACHE_KEY, _JFRAG_MAP_CACHE_VALUE, _JCOAG_WORK_CACHE_KEY, _JCOAG_WORK_CACHE_VALUE
     global _DUST_JHB_PATTERN_CACHE_KEY, _DUST_JHB_PATTERN_CACHE_VALUE
-    global _JCOAG_WORKBUF_MODE, _JCOAG_GEN_MODE, _S_COAG_MODE, _F_DIFF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE
+    global _JCOAG_GEN_MODE, _S_COAG_MODE, _F_DIFF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE
     global _VREL_TURB_MODE, _VREL_TOT_MODE, _P_FRAG_MODE, _COLLISION_KERNEL_MODE
+    global _CUPY_A_BUILD_MODE, _CUPY_DIAG_POS_CACHE_KEY, _CUPY_DIAG_POS_CACHE_VALUE
+    global _JCOAG_CHUNK_SIZE_OVERRIDE
 
     _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
     bind_sparse_solver(backend=backend, force=force)
-    mode = os.getenv("DUSTPY_JCOAG_WORKBUF_MODE", "fresh").strip().lower()
-    if mode not in ("fresh", "reuse"):
-        mode = "reuse"
     cupy_kernel_optimized = _env_bool("DUSTPY_CUPY_KERNEL_OPTIMIZED", default=True) if backend == "cupy" else False
+    cupy_solver_optimized = _env_bool("DUSTPY_CUPY_SOLVER_OPTIMIZED", default=True) if backend == "cupy" else False
     default_jcoag_gen_mode = "fused_spmm" if cupy_kernel_optimized else "baseline"
     default_scoag_mode = "fused_spmm" if cupy_kernel_optimized else "baseline"
     default_fdiff_mode = "elementwise" if cupy_kernel_optimized else "baseline"
@@ -2751,6 +2795,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     default_vrel_tot_mode = "elementwise" if cupy_kernel_optimized else "baseline"
     default_p_frag_mode = "elementwise" if cupy_kernel_optimized else "baseline"
     default_collision_kernel_mode = "elementwise" if cupy_kernel_optimized else "baseline"
+    default_cupy_a_build_mode = "diag_inplace" if cupy_solver_optimized else "identity_sub"
 
     jcoag_gen_mode = os.getenv("DUSTPY_JCOAG_GEN_MODE", default_jcoag_gen_mode).strip().lower()
     if jcoag_gen_mode not in ("baseline", "fused_spmm"):
@@ -2776,12 +2821,21 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     collision_kernel_mode = os.getenv("DUSTPY_COLLISION_KERNEL_MODE", default_collision_kernel_mode).strip().lower()
     if collision_kernel_mode not in ("baseline", "elementwise"):
         collision_kernel_mode = default_collision_kernel_mode
+    cupy_a_build_mode = os.getenv("DUSTPY_CUPY_A_BUILD_MODE", default_cupy_a_build_mode).strip().lower()
+    if cupy_a_build_mode not in ("identity_sub", "diag_inplace"):
+        cupy_a_build_mode = default_cupy_a_build_mode
+    jcoag_chunk_size_raw = os.getenv("DUSTPY_JCOAG_CHUNK_SIZE", "auto").strip().lower()
+    jcoag_chunk_size_override = None
+    if jcoag_chunk_size_raw and jcoag_chunk_size_raw != "auto":
+        try:
+            jcoag_chunk_size_override = max(1, int(jcoag_chunk_size_raw))
+        except Exception:
+            jcoag_chunk_size_override = None
     cupy_dust_solver_mode = _get_cupy_dust_solver_mode() if backend == "cupy" else "sparse"
     if (
         (not force)
         and backend == _BOUND_BACKEND
         and _K_A is not None
-        and mode == _JCOAG_WORKBUF_MODE
         and jcoag_gen_mode == _JCOAG_GEN_MODE
         and scoag_mode == _S_COAG_MODE
         and fdiff_mode == _F_DIFF_MODE
@@ -2791,6 +2845,8 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
         and vrel_tot_mode == _VREL_TOT_MODE
         and p_frag_mode == _P_FRAG_MODE
         and collision_kernel_mode == _COLLISION_KERNEL_MODE
+        and cupy_a_build_mode == _CUPY_A_BUILD_MODE
+        and jcoag_chunk_size_override == _JCOAG_CHUNK_SIZE_OVERRIDE
     ):
         return
 
@@ -2819,7 +2875,6 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
         _K_JACOBIAN = select_backend({"cupy": _jacobian_cupy}, backend=backend, default=_jacobian_numpy)
     _K_INTERP_TO_INTERFACES = select_backend({"cupy": _interp_to_interfaces_cupy}, backend=backend, default=_interp_to_interfaces_numpy)
 
-    _JCOAG_WORKBUF_MODE = mode
     _JCOAG_GEN_MODE = jcoag_gen_mode
     _S_COAG_MODE = scoag_mode
     _F_DIFF_MODE = fdiff_mode
@@ -2829,6 +2884,8 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     _VREL_TOT_MODE = vrel_tot_mode
     _P_FRAG_MODE = p_frag_mode
     _COLLISION_KERNEL_MODE = collision_kernel_mode
+    _CUPY_A_BUILD_MODE = cupy_a_build_mode
+    _JCOAG_CHUNK_SIZE_OVERRIDE = jcoag_chunk_size_override
 
     _KERNEL_LOWER_MASK = None
     _COAG_CACHE_KEY = None
@@ -2859,6 +2916,8 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     _JCOAG_WORK_CACHE_VALUE = None
     _DUST_JHB_PATTERN_CACHE_KEY = None
     _DUST_JHB_PATTERN_CACHE_VALUE = None
+    _CUPY_DIAG_POS_CACHE_KEY = None
+    _CUPY_DIAG_POS_CACHE_VALUE = None
 
     _BOUND_BACKEND = backend
     if runtime_token is not None:
@@ -4118,7 +4177,16 @@ def _f_impl_1_direct_cupy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
         rhs[Nm:-Nm] += dx * _field_data(Y0._owner.dust.S.ext[1:-1, ...]).ravel()
 
     jac_gpu = jac.tocsr() if isinstance(jac, cp_sparse.spmatrix) else cp_sparse.csr_matrix(jac)
-    A = cp_sparse.identity(jac_gpu.shape[0], format="csr", dtype=jac_gpu.dtype) - dx * jac_gpu
+    if _CUPY_A_BUILD_MODE == "diag_inplace":
+        A = jac_gpu.copy()
+        A.data *= -dx
+        diag_pos = _get_cupy_diag_positions_csr(A)
+        if diag_pos is not None:
+            A.data[diag_pos] += 1.0
+        else:
+            A = cp_sparse.identity(jac_gpu.shape[0], format="csr", dtype=jac_gpu.dtype) - dx * jac_gpu
+    else:
+        A = cp_sparse.identity(jac_gpu.shape[0], format="csr", dtype=jac_gpu.dtype) - dx * jac_gpu
 
     Y1_ravel = solve_sparse_linear_system(A, rhs)
     Y1 = Y1_ravel.reshape(Y0.shape)
