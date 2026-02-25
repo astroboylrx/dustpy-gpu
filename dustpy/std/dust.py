@@ -2785,7 +2785,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
 
     _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
-    bind_sparse_solver(backend=backend, force=force)
+    bind_sparse_solver(backend=backend, force=force, runtime_token=runtime_token)
     cupy_kernel_optimized = _env_bool("DUSTPY_CUPY_KERNEL_OPTIMIZED", default=True) if backend == "cupy" else False
     cupy_solver_optimized = _env_bool("DUSTPY_CUPY_SOLVER_OPTIMIZED", default=True) if backend == "cupy" else False
     default_jcoag_gen_mode = "fused_spmm" if cupy_kernel_optimized else "baseline"

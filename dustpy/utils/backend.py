@@ -33,6 +33,7 @@ _AUDIT_TOTAL = 0
 _AUDIT_LOCK = threading.Lock()
 _AUDIT_LOCAL = threading.local()
 _GMRES_STATS = Counter()
+_GMRES_STATS_ENABLED = os.getenv("DUSTPY_GMRES_STATS", "0").strip().lower() in ("1", "true", "yes", "on")
 _GMRES_PREV_SOL = None
 _GMRES_PRECOND_CACHE = {}
 
@@ -64,25 +65,13 @@ def _env_bool(name, default=False):
 
 def _load_cupy_gmres_config():
     solver_optimized = _env_bool("DUSTPY_CUPY_SOLVER_OPTIMIZED", default=True)
-    default_x0_mode = "rhs"
+    default_x0_mode = "prev"
     default_reuse_precond = not solver_optimized
 
     x0_mode = os.getenv("DUSTPY_CUPY_GMRES_X0", default_x0_mode).strip().lower()
     if x0_mode not in ("rhs", "zero", "prev"):
         x0_mode = default_x0_mode
     return {
-        "tier1": {
-            "rtol": float(os.getenv("DUSTPY_CUPY_GMRES_RTOL", "1e-14")),
-            "atol": float(os.getenv("DUSTPY_CUPY_GMRES_ATOL", "1e-14")),
-            "maxiter": int(os.getenv("DUSTPY_CUPY_GMRES_MAXITER", "1000")),
-            "restart": int(os.getenv("DUSTPY_CUPY_GMRES_RESTART", "64")),
-        },
-        "tier2": {
-            "rtol": float(os.getenv("DUSTPY_CUPY_GMRES_FALLBACK_RTOL", "1e-10")),
-            "atol": float(os.getenv("DUSTPY_CUPY_GMRES_FALLBACK_ATOL", "1e-10")),
-            "maxiter": int(os.getenv("DUSTPY_CUPY_GMRES_FALLBACK_MAXITER", "2000")),
-            "restart": int(os.getenv("DUSTPY_CUPY_GMRES_FALLBACK_RESTART", "150")),
-        },
         "x0_mode": x0_mode,
         "reuse_precond": _env_bool("DUSTPY_CUPY_GMRES_REUSE_PRECOND", default=default_reuse_precond),
     }
@@ -112,13 +101,69 @@ def _load_cupy_gas_solver_config():
 
 
 _CUPY_GAS_SOLVER_CONFIG = _load_cupy_gas_solver_config()
+_RUNTIME_STATES = {}
+_ACTIVE_RUNTIME_TOKEN = None
+
+_RUNTIME_STATE_VARS = (
+    "_GMRES_STATS",
+    "_GMRES_STATS_ENABLED",
+    "_GMRES_PREV_SOL",
+    "_GMRES_PRECOND_CACHE",
+    "_CUPY_GMRES_CONFIG",
+    "_CUPY_GAS_SOLVER_CONFIG",
+    "_BOUND_SOLVER_BACKEND",
+    "_SOLVE_SPARSE_IMPL",
+    "_BOUND_GAS_SOLVER_BACKEND",
+    "_BOUND_GAS_SOLVER_MODE",
+    "_SOLVE_GAS_SPARSE_IMPL",
+)
+
+
+def _fresh_runtime_state():
+    return {
+        "_GMRES_STATS": Counter(),
+        "_GMRES_STATS_ENABLED": _env_bool("DUSTPY_GMRES_STATS", default=False),
+        "_GMRES_PREV_SOL": None,
+        "_GMRES_PRECOND_CACHE": {},
+        "_CUPY_GMRES_CONFIG": _load_cupy_gmres_config(),
+        "_CUPY_GAS_SOLVER_CONFIG": _load_cupy_gas_solver_config(),
+        "_BOUND_SOLVER_BACKEND": None,
+        "_SOLVE_SPARSE_IMPL": None,
+        "_BOUND_GAS_SOLVER_BACKEND": None,
+        "_BOUND_GAS_SOLVER_MODE": None,
+        "_SOLVE_GAS_SPARSE_IMPL": None,
+    }
+
+
+def _capture_runtime_state():
+    return {name: globals()[name] for name in _RUNTIME_STATE_VARS}
+
+
+def _restore_runtime_state(state):
+    for name, value in state.items():
+        globals()[name] = value
+
+
+def _switch_runtime_state(runtime_token):
+    global _ACTIVE_RUNTIME_TOKEN
+    if runtime_token is None or runtime_token == _ACTIVE_RUNTIME_TOKEN:
+        return
+    if _ACTIVE_RUNTIME_TOKEN is not None:
+        _RUNTIME_STATES[_ACTIVE_RUNTIME_TOKEN] = _capture_runtime_state()
+    state = _RUNTIME_STATES.get(runtime_token)
+    if state is None:
+        state = _fresh_runtime_state()
+        _RUNTIME_STATES[runtime_token] = state
+    _restore_runtime_state(state)
+    _ACTIVE_RUNTIME_TOKEN = runtime_token
 
 
 def reload_cupy_gmres_config():
     """Reload CuPy GMRES settings from environment variables."""
-    global _CUPY_GMRES_CONFIG, _CUPY_GAS_SOLVER_CONFIG
+    global _CUPY_GMRES_CONFIG, _CUPY_GAS_SOLVER_CONFIG, _GMRES_STATS_ENABLED
     _CUPY_GMRES_CONFIG = _load_cupy_gmres_config()
     _CUPY_GAS_SOLVER_CONFIG = _load_cupy_gas_solver_config()
+    _GMRES_STATS_ENABLED = _env_bool("DUSTPY_GMRES_STATS", default=False)
 
 
 def _cupy_gmres_kwargs(*, rtol, atol, maxiter, restart, precond, x0):
@@ -196,6 +241,13 @@ def reset_gmres_stats():
 def get_gmres_stats():
     with _AUDIT_LOCK:
         return dict(_GMRES_STATS)
+
+
+def _record_gmres_stat(key, always=False):
+    if (not always) and (not _GMRES_STATS_ENABLED):
+        return
+    with _AUDIT_LOCK:
+        _GMRES_STATS[key] += 1
 
 
 def _contains_backend_array(value):
@@ -323,43 +375,38 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
         else:
             x0_tier1 = rhs_gpu
 
-        tier1 = cfg["tier1"]
         # Tier-1: strict tolerances (fast/default path).
         tier1_kwargs = _cupy_gmres_kwargs(
-            rtol=tier1["rtol"],
-            atol=tier1["atol"],
-            maxiter=tier1["maxiter"],
-            restart=tier1["restart"],
+            rtol=1e-14,
+            atol=1e-14,
+            maxiter=1000,
+            restart=64,
             precond=precond,
             x0=x0_tier1,
         )
         sol, info = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier1_kwargs)
         if info == 0:
             _GMRES_PREV_SOL = sol
-            with _AUDIT_LOCK:
-                _GMRES_STATS["tier1_success"] += 1
+            _record_gmres_stat("tier1_success")
             return sol
 
         # Tier-2: relaxed tolerances + more iterations for hard timesteps.
-        tier2 = cfg["tier2"]
         tier2_kwargs = _cupy_gmres_kwargs(
-            rtol=tier2["rtol"],
-            atol=tier2["atol"],
-            maxiter=tier2["maxiter"],
-            restart=tier2["restart"],
+            rtol=1e-10,
+            atol=1e-10,
+            maxiter=2000,
+            restart=150,
             precond=precond,
             x0=sol,
         )
         sol2, info2 = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier2_kwargs)
         if info2 == 0:
             _GMRES_PREV_SOL = sol2
-            with _AUDIT_LOCK:
-                _GMRES_STATS["tier2_success"] += 1
+            _record_gmres_stat("tier2_success")
             return sol2
 
-        with _AUDIT_LOCK:
-            _GMRES_STATS["tier2_failed"] += 1
-            _GMRES_STATS["cpu_fallback"] += 1
+        _record_gmres_stat("tier2_failed", always=True)
+        _record_gmres_stat("cpu_fallback", always=True)
         try:
             matrix_cpu = sp.csr_matrix(cp.asnumpy(matrix_gpu))
             rhs_cpu = cp.asnumpy(rhs_gpu)
@@ -374,8 +421,7 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
             _GMRES_PREV_SOL = sol_fallback
             return sol_fallback
         except Exception as exc:
-            with _AUDIT_LOCK:
-                _GMRES_STATS["cpu_fallback_failed"] += 1
+            _record_gmres_stat("cpu_fallback_failed", always=True)
             raise RuntimeError(
                 "CuPy GMRES failed to converge and CPU fallback failed "
                 f"(tier1_info={info}, tier2_info={info2})."
@@ -484,9 +530,10 @@ def _solve_sparse_linear_system_cupy_dense(matrix, rhs):
     return cp.linalg.solve(matrix_gpu, rhs_gpu)
 
 
-def bind_sparse_solver(backend=None, force=False):
+def bind_sparse_solver(backend=None, force=False, runtime_token=None):
     """Bind sparse linear solver implementation for the selected backend."""
     global _BOUND_SOLVER_BACKEND, _SOLVE_SPARSE_IMPL
+    _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
     if (not force) and backend == _BOUND_SOLVER_BACKEND and _SOLVE_SPARSE_IMPL is not None:
         return
@@ -507,9 +554,10 @@ def solve_sparse_linear_system(matrix, rhs):
     return _SOLVE_SPARSE_IMPL(matrix, rhs)
 
 
-def bind_gas_sparse_solver(backend=None, force=False):
+def bind_gas_sparse_solver(backend=None, force=False, runtime_token=None):
     """Bind gas sparse solver implementation for selected backend."""
     global _BOUND_GAS_SOLVER_BACKEND, _BOUND_GAS_SOLVER_MODE, _SOLVE_GAS_SPARSE_IMPL
+    _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
     mode = _CUPY_GAS_SOLVER_CONFIG["mode"] if backend == "cupy" else "default"
     if (

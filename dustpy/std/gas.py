@@ -604,7 +604,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     if (not force) and backend == _BOUND_BACKEND and _K_FI is not None:
         return
 
-    bind_gas_sparse_solver(backend=backend, force=force)
+    bind_gas_sparse_solver(backend=backend, force=force, runtime_token=runtime_token)
 
     _K_ENFORCE_FLOOR = select_backend({"cupy": _enforce_floor_cupy}, backend=backend, default=_enforce_floor_fortran)
     _K_CS = select_backend({"cupy": _cs_isothermal_cupy}, backend=backend, default=_cs_isothermal_fortran)
