@@ -141,6 +141,13 @@ _CUPY_A_BUILD_MODE = "identity_sub"
 _CUPY_DIAG_POS_CACHE_KEY = None
 _CUPY_DIAG_POS_CACHE_VALUE = None
 _JCOAG_CHUNK_SIZE_OVERRIDE = None
+_SANITIZER_CONFIG = {
+    "enabled": False,
+    "mode": "implicit",
+    "tiny_max_ratio": 100.0,
+    "born_ratio": 1.0,
+    "stop_thresh_mearth": 1.0e-2,
+}
 _RUNTIME_STATES = {}
 _ACTIVE_RUNTIME_TOKEN = None
 _RAW_SCATTER_KERNEL_F32 = None
@@ -222,6 +229,7 @@ _RUNTIME_STATE_VARS = (
     "_CUPY_DIAG_POS_CACHE_KEY",
     "_CUPY_DIAG_POS_CACHE_VALUE",
     "_JCOAG_CHUNK_SIZE_OVERRIDE",
+    "_SANITIZER_CONFIG",
 )
 
 
@@ -292,6 +300,13 @@ def _fresh_runtime_state():
         "_CUPY_DIAG_POS_CACHE_KEY": None,
         "_CUPY_DIAG_POS_CACHE_VALUE": None,
         "_JCOAG_CHUNK_SIZE_OVERRIDE": None,
+        "_SANITIZER_CONFIG": {
+            "enabled": False,
+            "mode": "implicit",
+            "tiny_max_ratio": 100.0,
+            "born_ratio": 1.0,
+            "stop_thresh_mearth": 1.0e-2,
+        },
     }
 
 
@@ -820,6 +835,29 @@ def _get_jcoag_chunk_size(Nr_int, Nm):
 def _env_bool(name, default=False):
     raw = os.getenv(name, "1" if default else "0").strip().lower()
     return raw in ("1", "true", "yes", "on")
+
+
+def _env_float(name, default):
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _load_sanitizer_config():
+    mode = os.getenv("DUSTPY_SANITIZER_MODE", "implicit").strip().lower()
+    if mode not in ("implicit", "both"):
+        mode = "implicit"
+    return {
+        "enabled": _env_bool("DUSTPY_SANITIZER_ENABLE", default=False),
+        "mode": mode,
+        "tiny_max_ratio": _env_float("DUSTPY_SANITIZER_TINY_MAX_RATIO", 100.0),
+        "born_ratio": _env_float("DUSTPY_SANITIZER_BORN_RATIO", 1.0),
+        "stop_thresh_mearth": _env_float("DUSTPY_SANITIZER_STOP_THRESH_MEARTH", 1.0e-2),
+    }
 
 
 def _get_cupy_dust_solver_mode():
@@ -2781,7 +2819,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     global _JCOAG_GEN_MODE, _S_COAG_MODE, _F_DIFF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE
     global _VREL_TURB_MODE, _VREL_TOT_MODE, _P_FRAG_MODE, _COLLISION_KERNEL_MODE
     global _CUPY_A_BUILD_MODE, _CUPY_DIAG_POS_CACHE_KEY, _CUPY_DIAG_POS_CACHE_VALUE
-    global _JCOAG_CHUNK_SIZE_OVERRIDE
+    global _JCOAG_CHUNK_SIZE_OVERRIDE, _SANITIZER_CONFIG
 
     _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
@@ -2832,6 +2870,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
         except Exception:
             jcoag_chunk_size_override = None
     cupy_dust_solver_mode = _get_cupy_dust_solver_mode() if backend == "cupy" else "sparse"
+    sanitizer_cfg = _load_sanitizer_config()
     if (
         (not force)
         and backend == _BOUND_BACKEND
@@ -2847,6 +2886,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
         and collision_kernel_mode == _COLLISION_KERNEL_MODE
         and cupy_a_build_mode == _CUPY_A_BUILD_MODE
         and jcoag_chunk_size_override == _JCOAG_CHUNK_SIZE_OVERRIDE
+        and sanitizer_cfg == _SANITIZER_CONFIG
     ):
         return
 
@@ -2886,6 +2926,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     _COLLISION_KERNEL_MODE = collision_kernel_mode
     _CUPY_A_BUILD_MODE = cupy_a_build_mode
     _JCOAG_CHUNK_SIZE_OVERRIDE = jcoag_chunk_size_override
+    _SANITIZER_CONFIG = sanitizer_cfg
 
     _KERNEL_LOWER_MASK = None
     _COAG_CACHE_KEY = None
@@ -2952,6 +2993,190 @@ def enforce_floor_value(sim):
         0.1*sim.dust.SigmaFloor)
 
 
+def _sanitize_floorborn_islands(sim):
+    """Optionally clip floor-born tiny islands after implicit/explicit floor enforcement."""
+    cfg = _SANITIZER_CONFIG
+    dust = sim.dust
+    dust._san_last_n_clipped = 0
+
+    if not cfg.get("enabled", False):
+        return
+
+    backend = get_backend()
+    if backend == "cupy" and cp is not None:
+        amod = cp
+    else:
+        amod = np
+
+    sigma = _field_data(dust.Sigma)
+    sigma_floor = _field_data(dust.SigmaFloor)
+
+    if sigma.shape != sigma_floor.shape:
+        return
+
+    ratio_now = amod.where(sigma_floor > 0.0, sigma / sigma_floor, 0.0)
+
+    prev_ratio = getattr(dust, "_san_prev_ratio", None)
+    if prev_ratio is None or prev_ratio.shape != ratio_now.shape:
+        dust._san_prev_ratio = ratio_now.copy()
+        return
+
+    t_years = float(sim.t) / c.year
+
+    if getattr(dust, "_san_Mdust0_mearth", None) is None:
+        area = _field_data(sim.grid.A)
+        mdust0 = amod.sum(sigma * area[:, None]) / c.M_earth
+        mdust0 = float(to_numpy(mdust0))
+        dust._san_Mdust0_mearth = max(mdust0, 1e-300)
+        dust._san_dM_total_mearth = 0.0
+        dust._san_active_cycles = 0
+        dust._san_clip_cycles = 0
+        dust._san_sum_clipped_cells = 0
+        dust._san_max_cells_per_cycle = 0
+        dust._san_first_clip_cycle = None
+        dust._san_first_clip_t_years = None
+        dust._san_first_clip_cells = None
+
+    if not hasattr(dust, "dM_sanitizer"):
+        dust.addfield(
+            "dM_sanitizer",
+            xp.zeros_like(dust.Sigma),
+            description="Cumulative sanitizer-removed dust mass [M_earth] per cell",
+        )
+    dM_sanitizer = _field_data(dust.dM_sanitizer)
+
+    _, nm = sigma.shape
+    tiny_max = float(cfg["tiny_max_ratio"])
+    born_ratio = float(cfg["born_ratio"])
+    prev_floor_max = 0.11
+    nrad = 1
+
+    prev_floor = prev_ratio <= prev_floor_max
+    prev_floor_i8 = prev_floor.astype(np.int8 if amod is np else cp.int8, copy=False)
+    suffix_ok = amod.flip(
+        amod.cumprod(amod.flip(prev_floor_i8, axis=1), axis=1),
+        axis=1,
+    ).astype(bool)
+
+    half_idx = getattr(dust, "_san_half_idx", None)
+    if half_idx is None or int(getattr(half_idx, "size", -1)) != int(nm):
+        # Map each mass bin m_j to the closest bin to m_j / 2 on the actual grid.
+        m_np = to_numpy(_field_data(sim.grid.m)).astype(np.float64, copy=False)
+        m_half = 0.5 * m_np
+        idx_hi = np.searchsorted(m_np, m_half, side="left")
+        idx_hi = np.clip(idx_hi, 0, nm - 1)
+        idx_lo = np.clip(idx_hi - 1, 0, nm - 1)
+        use_lo = np.abs(m_np[idx_lo] - m_half) <= np.abs(m_np[idx_hi] - m_half)
+        half_idx_np = np.where(use_lo, idx_lo, idx_hi).astype(np.int64, copy=False)
+        if amod is np:
+            half_idx = half_idx_np
+        else:
+            half_idx = cp.asarray(half_idx_np, dtype=cp.int64)
+        dust._san_half_idx = half_idx
+    row_ok = suffix_ok[:, half_idx]
+
+    radial_ok = amod.ones_like(row_ok, dtype=bool)
+    for dr in range(-nrad, nrad + 1):
+        shifted = amod.zeros_like(row_ok, dtype=bool)
+        if dr == 0:
+            shifted[...] = row_ok
+        elif dr > 0:
+            shifted[:-dr, :] = row_ok[dr:, :]
+        else:
+            k = -dr
+            shifted[k:, :] = row_ok[:-k, :]
+        radial_ok &= shifted
+
+    candidate = (
+        (ratio_now > born_ratio)
+        & (ratio_now <= tiny_max)
+        & radial_ok
+    )
+    candidate[0, :] = False
+    candidate[-1, :] = False
+    target = 0.1 * sigma_floor
+    delta = amod.where(candidate, sigma - target, 0.0)
+    to_clip = delta > 0.0
+    n_clipped = int(to_numpy(to_clip.sum()))
+
+    dust._san_active_cycles += 1
+    dust._san_last_n_clipped = n_clipped
+    if n_clipped == 0:
+        dust._san_prev_ratio = ratio_now.copy()
+        return
+
+    sigma[to_clip] = target[to_clip]
+    area = _field_data(sim.grid.A)
+    dM_inc = delta * to_clip * (area[:, None] / c.M_earth)
+    dM_sanitizer[...] = dM_sanitizer + dM_inc
+    dM_cycle = float(to_numpy(dM_inc.sum()))
+    dust._san_dM_total_mearth += dM_cycle
+    dust._san_clip_cycles += 1
+    dust._san_sum_clipped_cells += n_clipped
+    if n_clipped > dust._san_max_cells_per_cycle:
+        dust._san_max_cells_per_cycle = n_clipped
+    if dust._san_first_clip_cycle is None:
+        dust._san_first_clip_cycle = int(sim.RL_count_cycle)
+        dust._san_first_clip_t_years = t_years
+        dust._san_first_clip_cells = n_clipped
+
+    ratio_after = amod.where(sigma_floor > 0.0, sigma / sigma_floor, 0.0)
+    dust._san_prev_ratio = ratio_after.copy()
+
+    stop_thresh_mearth = float(cfg["stop_thresh_mearth"])
+    if stop_thresh_mearth > 0.0:
+        if dust._san_dM_total_mearth > stop_thresh_mearth:
+            print(
+                "[SANITIZER_STOP] "
+                f"cycle={int(sim.RL_count_cycle)}, t={t_years:.3f}yr, "
+                f"dM_san={dust._san_dM_total_mearth:.6e} Mearth, "
+                f"stop_thresh_mearth={stop_thresh_mearth:.6e}"
+            )
+            if sim.writer is not None:
+                datadir = sim.writer.datadir
+                try:
+                    sim.writer.write(
+                        sim,
+                        int(sim.RL_count_cycle),
+                        True,
+                        filename=os.path.join(str(datadir), "sanitizer_stop.hdf5"),
+                    )
+                except Exception:
+                    pass
+                try:
+                    sim.writer.writedump(
+                        sim,
+                        filename=os.path.join(str(datadir), "frame_sanitizer_stop.dmp"),
+                    )
+                except Exception:
+                    pass
+            raise SystemExit("DustPy sanitizer stop threshold exceeded.")
+
+
+def sanitizer_report(sim):
+    """Return sanitizer status dictionary for diagnostics."""
+    cfg = _SANITIZER_CONFIG
+    dust = sim.dust
+    return {
+        "enabled": bool(cfg.get("enabled", False)),
+        "mode": str(cfg.get("mode", "implicit")),
+        "stop_thresh_mearth": float(cfg.get("stop_thresh_mearth", 1.0e-2)),
+        "dM_total_mearth": float(getattr(dust, "_san_dM_total_mearth", 0.0)),
+        "dM_frac_init": float(
+            getattr(dust, "_san_dM_total_mearth", 0.0)
+            / max(float(getattr(dust, "_san_Mdust0_mearth", 1.0)), 1e-300)
+        ),
+        "n_clipped_last": int(getattr(dust, "_san_last_n_clipped", 0)),
+        "active_cycles": int(getattr(dust, "_san_active_cycles", 0)),
+        "clip_cycles": int(getattr(dust, "_san_clip_cycles", 0)),
+        "sum_clipped_cells": int(getattr(dust, "_san_sum_clipped_cells", 0)),
+        "max_cells_per_cycle": int(getattr(dust, "_san_max_cells_per_cycle", 0)),
+        "first_clip_cycle": getattr(dust, "_san_first_clip_cycle", None),
+        "first_clip_t_years": getattr(dust, "_san_first_clip_t_years", None),
+        "first_clip_cells": getattr(dust, "_san_first_clip_cells", None),
+    }
+
+
 def prepare(sim):
     """Function prepares implicit dust integration step.
     It stores the current value of the surface density in a hidden field.
@@ -2978,6 +3203,8 @@ def finalize_explicit(sim):
     if not is_zero_flux_enabled(sim):
         boundary(sim)
     enforce_floor_value(sim)
+    if _SANITIZER_CONFIG.get("enabled", False) and _SANITIZER_CONFIG.get("mode", "implicit") == "both":
+        _sanitize_floorborn_islands(sim)
 
 
 def finalize_implicit(sim):
@@ -2991,6 +3218,8 @@ def finalize_implicit(sim):
     if not is_zero_flux_enabled(sim):
         boundary(sim)
     enforce_floor_value(sim)
+    if _SANITIZER_CONFIG.get("enabled", False):
+        _sanitize_floorborn_islands(sim)
     sim.dust.v.rad.update()
     sim.dust.Fi.update()
     sim.dust.S.hyd.update()

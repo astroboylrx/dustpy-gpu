@@ -49,10 +49,18 @@ def dt(sim):
 
     if sim.RL_count_cycle % sim.RL_ncycle_out == 0:
         median_dt = float(np.median(sim.RL_recent_dts))
+        san = std.dust.sanitizer_report(sim)
+        san_extra = ""
+        if san.get("enabled", False):
+            san_extra = (
+                f", dM_san_Mearth={san['dM_total_mearth']:.6e}, "
+                f"nclip_last={san['n_clipped_last']:6d}"
+            )
         print(
             f"[RL_debug]: cycle={sim.RL_count_cycle:9d}, t={sim.t/31557600.0:12.3f}yr, "
             f"dt={dt_host/31557600.0:12.6f}yr, <dt>={sim.RL_recent_dts.mean()/31557600.0:12.6f}yr, "
             f"median_dt={median_dt/31557600.0:12.6f}yr"
+            f"{san_extra}"
         )  #, M_pl={sim.planetesimals.M/5.972e27:12.4f}M_e")
     sim.RL_recent_dts[sim.RL_count_cycle % 100] = dt_step
     sim.RL_count_cycle += 1

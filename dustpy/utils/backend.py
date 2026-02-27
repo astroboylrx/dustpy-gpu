@@ -63,9 +63,30 @@ def _env_bool(name, default=False):
     return raw in ("1", "true", "yes", "on")
 
 
+def _env_float(name, default):
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _env_int(name, default, minimum=1):
+    raw = os.getenv(name)
+    if raw is None:
+        return max(int(default), int(minimum))
+    try:
+        val = int(raw)
+    except Exception:
+        val = int(default)
+    return max(val, int(minimum))
+
+
 def _load_cupy_gmres_config():
     solver_optimized = _env_bool("DUSTPY_CUPY_SOLVER_OPTIMIZED", default=True)
-    default_x0_mode = "prev"
+    default_x0_mode = "zero"
     default_reuse_precond = not solver_optimized
 
     x0_mode = os.getenv("DUSTPY_CUPY_GMRES_X0", default_x0_mode).strip().lower()
@@ -74,6 +95,14 @@ def _load_cupy_gmres_config():
     return {
         "x0_mode": x0_mode,
         "reuse_precond": _env_bool("DUSTPY_CUPY_GMRES_REUSE_PRECOND", default=default_reuse_precond),
+        "tier1_rtol": _env_float("DUSTPY_CUPY_GMRES_TIER1_RTOL", 2e-15),
+        "tier1_atol": _env_float("DUSTPY_CUPY_GMRES_TIER1_ATOL", 2e-15),
+        "tier1_maxiter": _env_int("DUSTPY_CUPY_GMRES_TIER1_MAXITER", 1000, minimum=1),
+        "tier1_restart": _env_int("DUSTPY_CUPY_GMRES_TIER1_RESTART", 64, minimum=1),
+        "tier2_rtol": _env_float("DUSTPY_CUPY_GMRES_TIER2_RTOL", 1e-13),
+        "tier2_atol": _env_float("DUSTPY_CUPY_GMRES_TIER2_ATOL", 1e-13),
+        "tier2_maxiter": _env_int("DUSTPY_CUPY_GMRES_TIER2_MAXITER", 2000, minimum=1),
+        "tier2_restart": _env_int("DUSTPY_CUPY_GMRES_TIER2_RESTART", 150, minimum=1),
     }
 
 
@@ -377,10 +406,10 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
 
         # Tier-1: strict tolerances (fast/default path).
         tier1_kwargs = _cupy_gmres_kwargs(
-            rtol=1e-14,
-            atol=1e-14,
-            maxiter=1000,
-            restart=64,
+            rtol=cfg["tier1_rtol"],
+            atol=cfg["tier1_atol"],
+            maxiter=cfg["tier1_maxiter"],
+            restart=cfg["tier1_restart"],
             precond=precond,
             x0=x0_tier1,
         )
@@ -392,10 +421,10 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
 
         # Tier-2: relaxed tolerances + more iterations for hard timesteps.
         tier2_kwargs = _cupy_gmres_kwargs(
-            rtol=1e-10,
-            atol=1e-10,
-            maxiter=2000,
-            restart=150,
+            rtol=cfg["tier2_rtol"],
+            atol=cfg["tier2_atol"],
+            maxiter=cfg["tier2_maxiter"],
+            restart=cfg["tier2_restart"],
             precond=precond,
             x0=sol,
         )
