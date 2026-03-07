@@ -17,6 +17,7 @@ from dustpy import std
 from simframe.io.writers import hdf5writer
 from dustpy.utils.boundary import Boundary
 from dustpy.utils.backend import call_numpy
+from dustpy.utils.boundary_modes import is_dust_inner_outflow_only_enabled
 from dustpy.utils.simplenamespace import SimpleNamespace
 from simframe.backends.api import BackendContext
 from simframe.backends.api import get_backend
@@ -93,7 +94,7 @@ class Simulation(Frame):
                                                                  "rmax": 1000.*c.au
                                                                  }
                                                                ),
-                                       "boundary": SimpleNamespace(**{"zeroFlux": False}),
+                                       "boundary": SimpleNamespace(**{"zeroFlux": False, "dustInnerOutflowOnly": False}),
                                        "star": SimpleNamespace(**{"M": 1.*c.M_sun,
                                                                   "R": 2.*c.R_sun,
                                                                   "T": 5772.,
@@ -760,8 +761,7 @@ class Simulation(Frame):
             )
         # Set boundary conditions, enforce floor values,
         # and store old surface densities
-        self.dust.boundary.inner.setboundary()
-        self.dust.boundary.outer.setboundary()
+        std.dust.boundary(self)
         std.dust.enforce_floor_value(self)
         self.dust._SigmaOld[...] = self.dust.Sigma
 

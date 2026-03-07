@@ -103,6 +103,7 @@ def _load_cupy_gmres_config():
         "tier2_atol": _env_float("DUSTPY_CUPY_GMRES_TIER2_ATOL", 1e-13),
         "tier2_maxiter": _env_int("DUSTPY_CUPY_GMRES_TIER2_MAXITER", 2000, minimum=1),
         "tier2_restart": _env_int("DUSTPY_CUPY_GMRES_TIER2_RESTART", 150, minimum=1),
+        "cpu_fallback_max": _env_int("DUSTPY_CUPY_CPU_FALLBACK_MAX", 1000, minimum=0),
     }
 
 
@@ -279,6 +280,143 @@ def _record_gmres_stat(key, always=False):
         _GMRES_STATS[key] += 1
 
 
+def _cupy_fallback_debug_enabled():
+    raw = os.getenv("DUSTPY_CUPY_FALLBACK_DEBUG", "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _cupy_fallback_dump_max():
+    return _env_int("DUSTPY_CUPY_FALLBACK_DUMP_MAX", 0, minimum=0)
+
+
+def _cupy_fallback_dump_dir():
+    raw = os.getenv("DUSTPY_CUPY_FALLBACK_DUMP_DIR", "").strip()
+    return raw
+
+
+def _summarize_fallback_matrix(matrix_cpu, rhs_cpu):
+    if sp.issparse(matrix_cpu):
+        mat = matrix_cpu.tocsr()
+        data = mat.data
+        nnz = int(mat.nnz)
+    else:
+        mat = np.asarray(matrix_cpu)
+        data = mat.ravel()
+        nnz = int(np.count_nonzero(data))
+
+    if data.size > 0:
+        finite_data = np.isfinite(data)
+        n_data_nonfinite = int(data.size - np.count_nonzero(finite_data))
+        if np.any(finite_data):
+            abs_data = np.abs(data[finite_data])
+            data_abs_max = float(np.max(abs_data))
+            nonzero = abs_data[abs_data > 0]
+            data_abs_min_pos = float(np.min(nonzero)) if nonzero.size > 0 else 0.0
+        else:
+            data_abs_max = float("nan")
+            data_abs_min_pos = float("nan")
+    else:
+        n_data_nonfinite = 0
+        data_abs_max = 0.0
+        data_abs_min_pos = 0.0
+
+    rhs_arr = np.asarray(rhs_cpu).ravel()
+    finite_rhs = np.isfinite(rhs_arr)
+    n_rhs_nonfinite = int(rhs_arr.size - np.count_nonzero(finite_rhs))
+    rhs_abs_max = float(np.max(np.abs(rhs_arr[finite_rhs]))) if np.any(finite_rhs) else float("nan")
+
+    diag = np.asarray(mat.diagonal()).ravel() if sp.issparse(mat) else np.asarray(np.diag(mat)).ravel()
+    finite_diag = np.isfinite(diag)
+    n_diag_nonfinite = int(diag.size - np.count_nonzero(finite_diag))
+    if np.any(finite_diag):
+        abs_diag = np.abs(diag[finite_diag])
+        diag_abs_max = float(np.max(abs_diag))
+        nz = abs_diag[abs_diag > 0]
+        diag_abs_min_pos = float(np.min(nz)) if nz.size > 0 else 0.0
+    else:
+        diag_abs_max = float("nan")
+        diag_abs_min_pos = float("nan")
+
+    return {
+        "shape": tuple(int(v) for v in mat.shape),
+        "nnz": nnz,
+        "n_data_nonfinite": n_data_nonfinite,
+        "n_rhs_nonfinite": n_rhs_nonfinite,
+        "n_diag_nonfinite": n_diag_nonfinite,
+        "data_abs_max": data_abs_max,
+        "data_abs_min_pos": data_abs_min_pos,
+        "rhs_abs_max": rhs_abs_max,
+        "diag_abs_max": diag_abs_max,
+        "diag_abs_min_pos": diag_abs_min_pos,
+    }
+
+
+def _dump_fallback_system(matrix_cpu, rhs_cpu, *, fallback_id, tier1_info, tier2_info, cause):
+    dump_max = _cupy_fallback_dump_max()
+    if dump_max <= 0 or fallback_id > dump_max:
+        return
+    dump_dir = _cupy_fallback_dump_dir()
+    if not dump_dir:
+        return
+    os.makedirs(dump_dir, exist_ok=True)
+    stem = os.path.join(dump_dir, f"fallback_{fallback_id:05d}")
+    matrix_csr = matrix_cpu.tocsr() if sp.issparse(matrix_cpu) else sp.csr_matrix(np.asarray(matrix_cpu))
+    sp.save_npz(stem + "_A.npz", matrix_csr)
+    np.savez(
+        stem + "_rhs_meta.npz",
+        rhs=np.asarray(rhs_cpu),
+        tier1_info=str(tier1_info),
+        tier2_info=str(tier2_info),
+        cause=str(cause),
+    )
+
+
+def _cupy_matrix_to_cpu_csr(matrix_gpu):
+    if isinstance(matrix_gpu, cp_sparse.spmatrix):
+        if hasattr(matrix_gpu, "get"):
+            matrix_cpu = matrix_gpu.get()
+        else:
+            matrix_cpu = sp.csr_matrix(
+                (
+                    cp.asnumpy(matrix_gpu.data),
+                    cp.asnumpy(matrix_gpu.indices),
+                    cp.asnumpy(matrix_gpu.indptr),
+                ),
+                shape=matrix_gpu.shape,
+            )
+    else:
+        matrix_cpu = sp.csr_matrix(cp.asnumpy(matrix_gpu))
+    if not sp.issparse(matrix_cpu):
+        matrix_cpu = sp.csr_matrix(matrix_cpu)
+    elif not sp.isspmatrix_csr(matrix_cpu):
+        matrix_cpu = matrix_cpu.tocsr()
+    return matrix_cpu
+
+
+def _equilibrate_sparse_system_cpu(matrix_cpu, rhs_cpu, *, passes=2):
+    mat = matrix_cpu.tocsr(copy=True)
+    rhs_eq = np.asarray(rhs_cpu, dtype=np.float64).copy()
+    n = mat.shape[0]
+    row_scale_total = np.ones(n, dtype=np.float64)
+    col_scale_total = np.ones(n, dtype=np.float64)
+
+    for _ in range(max(1, int(passes))):
+        row_norm = np.asarray(np.abs(mat).max(axis=1).toarray()).ravel()
+        row_norm[~np.isfinite(row_norm) | (row_norm <= 0.0)] = 1.0
+        row_scale = 1.0 / row_norm
+        mat = sp.diags(row_scale).dot(mat).tocsr()
+        rhs_eq *= row_scale
+        row_scale_total *= row_scale
+
+        col_norm = np.asarray(np.abs(mat).max(axis=0).toarray()).ravel()
+        col_norm[~np.isfinite(col_norm) | (col_norm <= 0.0)] = 1.0
+        col_scale = 1.0 / col_norm
+        mat = mat.dot(sp.diags(col_scale)).tocsr()
+        col_scale_total *= col_scale
+
+    return mat, rhs_eq, row_scale_total, col_scale_total
+
+
 def _contains_backend_array(value):
     if xp.is_array(value):
         return True
@@ -369,6 +507,119 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
     rhs_raw = rhs._data if hasattr(rhs, "_data") else rhs
     rhs_gpu = cp.asarray(rhs_raw)
 
+    def _gmres_true_residual_ok(sol, *, rtol, atol):
+        b_norm = float(cp.linalg.norm(rhs_gpu))
+        tol = max(float(atol), float(rtol) * b_norm)
+        res = matrix_gpu.dot(sol) - rhs_gpu
+        res_norm = float(cp.linalg.norm(res))
+        return (res_norm <= tol), res_norm, tol
+
+    def _solve_equilibrated_retry(*, tier1_info, tier2_info):
+        _record_gmres_stat("tier3_equilibrate_attempt", always=True)
+        matrix_cpu = _cupy_matrix_to_cpu_csr(matrix_gpu)
+        rhs_cpu = cp.asnumpy(rhs_gpu)
+        A_eq_cpu, rhs_eq_cpu, _, col_scale = _equilibrate_sparse_system_cpu(matrix_cpu, rhs_cpu, passes=2)
+        A_eq_gpu = cp_sparse.csr_matrix(A_eq_cpu)
+        rhs_eq_gpu = cp.asarray(rhs_eq_cpu)
+        diag_eq = A_eq_gpu.diagonal()
+        diag_eq = cp.where(cp.abs(diag_eq) > 1e-15, diag_eq, cp.ones_like(diag_eq))
+        inv_diag_eq = 1.0 / diag_eq
+
+        def eq_matvec(x):
+            return inv_diag_eq * x
+
+        precond_eq = cp_splinalg.LinearOperator(A_eq_gpu.shape, matvec=eq_matvec)
+        tier3_kwargs = _cupy_gmres_kwargs(
+            rtol=cfg["tier2_rtol"],
+            atol=cfg["tier2_atol"],
+            maxiter=cfg["tier2_maxiter"],
+            restart=cfg["tier2_restart"],
+            precond=precond_eq,
+            x0=cp.zeros_like(rhs_eq_gpu),
+        )
+        tier3_info = None
+        tier3_cause = "nonconverged"
+        try:
+            sol3_eq, tier3_info = cp_splinalg.gmres(A_eq_gpu, rhs_eq_gpu, **tier3_kwargs)
+            if tier3_info == 0:
+                sol3 = cp.asarray(col_scale) * sol3_eq
+                ok, res_norm, tol = _gmres_true_residual_ok(
+                    sol3,
+                    rtol=cfg["tier2_rtol"],
+                    atol=cfg["tier2_atol"],
+                )
+                if ok:
+                    _record_gmres_stat("tier3_equilibrate_success", always=True)
+                    return sol3
+                tier3_info = f"postcheck:{res_norm:.6e}>{tol:.6e}"
+                tier3_cause = "postcheck_failed"
+                _record_gmres_stat("tier3_postcheck_failed", always=True)
+        except Exception as exc:
+            tier3_info = f"exc:{type(exc).__name__}"
+            tier3_cause = f"exception:{type(exc).__name__}"
+            _record_gmres_stat("tier3_exception", always=True)
+        _record_gmres_stat("tier3_failed", always=True)
+        return _solve_cpu_fallback(
+            tier1_info=tier1_info,
+            tier2_info=f"{tier2_info};tier3={tier3_info}",
+            cause=f"tier3_equilibrate:{tier3_cause}",
+        )
+
+    def _solve_cpu_fallback(*, tier1_info, tier2_info, cause):
+        cfg_local = _CUPY_GMRES_CONFIG
+        _record_gmres_stat("cpu_fallback", always=True)
+        n_fallback = int(_GMRES_STATS.get("cpu_fallback", 0))
+        try:
+            matrix_cpu = _cupy_matrix_to_cpu_csr(matrix_gpu)
+            rhs_cpu = cp.asnumpy(rhs_gpu)
+
+            if _cupy_fallback_debug_enabled():
+                summary = _summarize_fallback_matrix(matrix_cpu, rhs_cpu)
+                print(
+                    "[CPU_FALLBACK] "
+                    f"id={n_fallback}, cause={cause}, tier1_info={tier1_info}, tier2_info={tier2_info}, "
+                    f"shape={summary['shape']}, nnz={summary['nnz']}, "
+                    f"n_data_nonfinite={summary['n_data_nonfinite']}, "
+                    f"n_rhs_nonfinite={summary['n_rhs_nonfinite']}, "
+                    f"n_diag_nonfinite={summary['n_diag_nonfinite']}, "
+                    f"data_abs_min_pos={summary['data_abs_min_pos']:.6e}, data_abs_max={summary['data_abs_max']:.6e}, "
+                    f"diag_abs_min_pos={summary['diag_abs_min_pos']:.6e}, diag_abs_max={summary['diag_abs_max']:.6e}, "
+                    f"rhs_abs_max={summary['rhs_abs_max']:.6e}",
+                    flush=True,
+                )
+            _dump_fallback_system(
+                matrix_cpu,
+                rhs_cpu,
+                fallback_id=n_fallback,
+                tier1_info=tier1_info,
+                tier2_info=tier2_info,
+                cause=cause,
+            )
+
+            matrix_lu = sp.linalg.splu(
+                matrix_cpu.tocsc(),
+                permc_spec="MMD_AT_PLUS_A",
+                diag_pivot_thresh=0.0,
+                options=dict(SymmetricMode=True),
+            )
+            sol_cpu = matrix_lu.solve(rhs_cpu)
+            sol_fallback = cp.asarray(sol_cpu)
+            max_allowed = int(cfg_local.get("cpu_fallback_max", 0))
+            if max_allowed > 0 and n_fallback > max_allowed:
+                _record_gmres_stat("cpu_fallback_limit_exceeded", always=True)
+                raise RuntimeError(
+                    "CuPy GMRES fallback limit exceeded "
+                    f"(cpu_fallback={n_fallback}, max={max_allowed}, "
+                    f"tier1_info={tier1_info}, tier2_info={tier2_info}, cause={cause})."
+                )
+            return sol_fallback
+        except Exception as exc:
+            _record_gmres_stat("cpu_fallback_failed", always=True)
+            raise RuntimeError(
+                "CuPy GMRES failed to converge and CPU fallback failed "
+                f"(tier1_info={tier1_info}, tier2_info={tier2_info}, cause={cause})."
+            ) from exc
+
     if is_scipy_sparse or is_cupy_sparse:
         cfg = _CUPY_GMRES_CONFIG
         precond = None
@@ -413,48 +664,70 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
             precond=precond,
             x0=x0_tier1,
         )
-        sol, info = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier1_kwargs)
-        if info == 0:
-            _GMRES_PREV_SOL = sol
-            _record_gmres_stat("tier1_success")
-            return sol
+        tier1_info = None
+        tier1_cause = "nonconverged"
+        tier1_sol = None
+        try:
+            tier1_sol, tier1_info = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier1_kwargs)
+            if tier1_info == 0:
+                ok, res_norm, tol = _gmres_true_residual_ok(
+                    tier1_sol,
+                    rtol=cfg["tier1_rtol"],
+                    atol=cfg["tier1_atol"],
+                )
+                if not ok:
+                    tier1_info = f"postcheck:{res_norm:.6e}>{tol:.6e}"
+                    tier1_cause = "postcheck_failed"
+                    _record_gmres_stat("tier1_postcheck_failed", always=True)
+                else:
+                    _GMRES_PREV_SOL = tier1_sol
+                    _record_gmres_stat("tier1_success")
+                    return tier1_sol
+        except Exception as exc:
+            tier1_info = f"exc:{type(exc).__name__}"
+            tier1_cause = f"exception:{type(exc).__name__}"
+            _record_gmres_stat("tier1_exception", always=True)
 
         # Tier-2: relaxed tolerances + more iterations for hard timesteps.
+        x0_tier2 = tier1_sol if tier1_sol is not None else x0_tier1
         tier2_kwargs = _cupy_gmres_kwargs(
             rtol=cfg["tier2_rtol"],
             atol=cfg["tier2_atol"],
             maxiter=cfg["tier2_maxiter"],
             restart=cfg["tier2_restart"],
             precond=precond,
-            x0=sol,
+            x0=x0_tier2,
         )
-        sol2, info2 = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier2_kwargs)
-        if info2 == 0:
-            _GMRES_PREV_SOL = sol2
-            _record_gmres_stat("tier2_success")
-            return sol2
+        tier2_info = None
+        tier2_cause = "nonconverged"
+        try:
+            sol2, tier2_info = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier2_kwargs)
+            if tier2_info == 0:
+                ok, res_norm, tol = _gmres_true_residual_ok(
+                    sol2,
+                    rtol=cfg["tier2_rtol"],
+                    atol=cfg["tier2_atol"],
+                )
+                if not ok:
+                    tier2_info = f"postcheck:{res_norm:.6e}>{tol:.6e}"
+                    tier2_cause = "postcheck_failed"
+                    _record_gmres_stat("tier2_postcheck_failed", always=True)
+                else:
+                    _GMRES_PREV_SOL = sol2
+                    _record_gmres_stat("tier2_success")
+                    return sol2
+        except Exception as exc:
+            tier2_info = f"exc:{type(exc).__name__}"
+            tier2_cause = f"exception:{type(exc).__name__}"
+            _record_gmres_stat("tier2_exception", always=True)
 
         _record_gmres_stat("tier2_failed", always=True)
-        _record_gmres_stat("cpu_fallback", always=True)
-        try:
-            matrix_cpu = sp.csr_matrix(cp.asnumpy(matrix_gpu))
-            rhs_cpu = cp.asnumpy(rhs_gpu)
-            matrix_lu = sp.linalg.splu(
-                matrix_cpu.tocsc(),
-                permc_spec="MMD_AT_PLUS_A",
-                diag_pivot_thresh=0.0,
-                options=dict(SymmetricMode=True),
-            )
-            sol_cpu = matrix_lu.solve(rhs_cpu)
-            sol_fallback = cp.asarray(sol_cpu)
-            _GMRES_PREV_SOL = sol_fallback
-            return sol_fallback
-        except Exception as exc:
-            _record_gmres_stat("cpu_fallback_failed", always=True)
-            raise RuntimeError(
-                "CuPy GMRES failed to converge and CPU fallback failed "
-                f"(tier1_info={info}, tier2_info={info2})."
-            ) from exc
+        sol_fallback = _solve_equilibrated_retry(
+            tier1_info=tier1_info,
+            tier2_info=tier2_info,
+        )
+        _GMRES_PREV_SOL = sol_fallback
+        return sol_fallback
 
     return cp.linalg.solve(matrix_gpu, rhs_gpu)
 

@@ -9,7 +9,7 @@ from dustpy.utils.backend import call_numpy
 from dustpy.utils.backend import bind_sparse_solver
 from dustpy.utils.backend import solve_sparse_linear_system
 from dustpy.utils.backend import to_numpy
-from dustpy.utils.boundary_modes import is_zero_flux_enabled
+from dustpy.utils.boundary_modes import is_dust_inner_outflow_only_enabled, is_zero_flux_enabled
 from simframe.backends.api import get_backend
 from simframe.backends.api import select_backend
 from simframe.backends.api import xp
@@ -144,9 +144,11 @@ _JCOAG_CHUNK_SIZE_OVERRIDE = None
 _SANITIZER_CONFIG = {
     "enabled": False,
     "mode": "implicit",
-    "tiny_max_ratio": 100.0,
+    "tiny_max_ratio": 10000.0,
     "born_ratio": 1.0,
     "stop_thresh_mearth": 1.0e-2,
+    "tinymax_report": False,
+    "tinymax_report_cadence": 1,
 }
 _RUNTIME_STATES = {}
 _ACTIVE_RUNTIME_TOKEN = None
@@ -303,9 +305,11 @@ def _fresh_runtime_state():
         "_SANITIZER_CONFIG": {
             "enabled": False,
             "mode": "implicit",
-            "tiny_max_ratio": 100.0,
+            "tiny_max_ratio": 10000.0,
             "born_ratio": 1.0,
             "stop_thresh_mearth": 1.0e-2,
+            "tinymax_report": False,
+            "tinymax_report_cadence": 1,
         },
     }
 
@@ -854,9 +858,14 @@ def _load_sanitizer_config():
     return {
         "enabled": _env_bool("DUSTPY_SANITIZER_ENABLE", default=False),
         "mode": mode,
-        "tiny_max_ratio": _env_float("DUSTPY_SANITIZER_TINY_MAX_RATIO", 100.0),
+        "tiny_max_ratio": _env_float("DUSTPY_SANITIZER_TINY_MAX_RATIO", 10000.0),
         "born_ratio": _env_float("DUSTPY_SANITIZER_BORN_RATIO", 1.0),
         "stop_thresh_mearth": _env_float("DUSTPY_SANITIZER_STOP_THRESH_MEARTH", 1.0e-2),
+        "tinymax_report": _env_bool("DUSTPY_SANITIZER_TINYMAX_REPORT", default=False),
+        "tinymax_report_cadence": max(
+            1,
+            int(_env_float("DUSTPY_SANITIZER_TINYMAX_REPORT_CADENCE", 1.0)),
+        ),
     }
 
 
@@ -2266,6 +2275,49 @@ def _apply_zero_flux_dust_hyd_edges_numpy(A, B, C, area, D, r, ri, SigmaGas, v):
     return A, B, C
 
 
+def _apply_inner_zero_flux_dust_hyd_edge_numpy(A, B, C, area, D, r, ri, SigmaGas, v, block_mask):
+    """Inject conservative zero-flux row at the inner edge only for selected mass bins."""
+    Nr = int(A.shape[0])
+    if Nr < 2:
+        return A, B, C
+
+    area = np.asarray(area)
+    D = np.asarray(D)
+    r = np.asarray(r)
+    ri = np.asarray(ri)
+    SigmaGas = np.asarray(SigmaGas)
+    v = np.asarray(v)
+
+    h = SigmaGas * r
+    hi = np.asarray(_interp_to_interfaces_numpy(h, r, ri))
+    Di = np.asarray(_interp_to_interfaces_numpy(D, r, ri))
+    vi = np.asarray(_interp_to_interfaces_numpy(v, r, ri))
+    vip = np.maximum(vi, 0.0)
+    vim = np.minimum(vi, 0.0)
+    Vinv = (2.0 * c.pi) / area
+    w_in = r[1] - r[0]
+
+    h0 = h[0] + 1.0e-300
+    h1 = h[1] + 1.0e-300
+
+    block_mask = np.asarray(to_numpy(block_mask), dtype=bool)
+    if block_mask.ndim != 1 or block_mask.size != B.shape[1] or not np.any(block_mask):
+        return A, B, C
+
+    b0 = (
+        -vip[1, :] * r[0]
+        - Di[1, :] * hi[1] / (w_in * h0) * r[0]
+    ) * Vinv[0]
+    c0 = (
+        -vim[1, :] * r[1]
+        + Di[1, :] * hi[1] / (w_in * h1) * r[1]
+    ) * Vinv[0]
+    A[0, block_mask] = 0.0
+    B[0, block_mask] = b0[block_mask]
+    C[0, block_mask] = c0[block_mask]
+    return A, B, C
+
+
 def _apply_zero_flux_dust_hyd_edges_cupy(A, B, C, area, D, r, ri, SigmaGas, v):
     """Inject conservative zero-flux boundary rows into dust hydrodynamic Jacobian."""
     Nr = int(A.shape[0])
@@ -2314,6 +2366,106 @@ def _apply_zero_flux_dust_hyd_edges_cupy(A, B, C, area, D, r, ri, SigmaGas, v):
     ) * Vinv[-1]
     C[-1, :] = 0.0
     return A, B, C
+
+
+def _apply_inner_zero_flux_dust_hyd_edge_cupy(A, B, C, area, D, r, ri, SigmaGas, v, block_mask):
+    """Inject conservative zero-flux row at the inner edge only for selected mass bins."""
+    Nr = int(A.shape[0])
+    if Nr < 2:
+        return A, B, C
+
+    area = _field_data(area)
+    D = _field_data(D)
+    r = _field_data(r)
+    ri = _field_data(ri)
+    SigmaGas = _field_data(SigmaGas)
+    v = _field_data(v)
+
+    h = SigmaGas * r
+    hi = _interp_to_interfaces(h, r, ri)
+    Di = _interp_to_interfaces(D, r, ri)
+    vi = _interp_to_interfaces(v, r, ri)
+    vip = xp.maximum(vi, 0.0)
+    vim = xp.minimum(vi, 0.0)
+    Vinv = (2.0 * c.pi) / area
+    w_in = r[1] - r[0]
+
+    h0 = h[0] + 1.0e-300
+    h1 = h[1] + 1.0e-300
+
+    if block_mask is None:
+        return A, B, C
+    block_mask = xp.asarray(block_mask, dtype=bool)
+    if int(to_numpy(block_mask.sum())) == 0:
+        return A, B, C
+
+    b0 = (
+        -vip[1, :] * r[0]
+        - Di[1, :] * hi[1] / (w_in * h0) * r[0]
+    ) * Vinv[0]
+    c0 = (
+        -vim[1, :] * r[1]
+        + Di[1, :] * hi[1] / (w_in * h1) * r[1]
+    ) * Vinv[0]
+    A0 = A[0, :]
+    B0 = B[0, :]
+    C0 = C[0, :]
+    A0[block_mask] = 0.0
+    B0[block_mask] = b0[block_mask]
+    C0[block_mask] = c0[block_mask]
+    return A, B, C
+
+
+def _inner_diode_block_mask(sim):
+    """Return per-mass-bin mask for inner-edge outward drift (potential artificial feed)."""
+    if not is_dust_inner_outflow_only_enabled(sim):
+        return None
+    try:
+        v0 = _field_data(sim.dust.v.rad)[0, :]
+        return v0 > 0.0
+    except Exception:
+        return None
+
+
+def _refresh_dust_boundary_views(sim):
+    """Refresh boundary helper views so boundary formulas use the current dust field."""
+    inner = getattr(sim.dust.boundary, "inner", None)
+    if inner is not None:
+        inner._r = sim.grid.r[:3]
+        inner._ri = sim.grid.ri[:3]
+        inner._S = sim.dust.Sigma[:3]
+
+    outer = getattr(sim.dust.boundary, "outer", None)
+    if outer is not None:
+        outer._r = sim.grid.r[::-1][:3]
+        outer._ri = sim.grid.ri[::-1][:3]
+        outer._S = sim.dust.Sigma[::-1][:3]
+
+
+def _apply_inner_boundary_selective(sim, block_mask=None):
+    """Apply the configured inner boundary condition only for bins not blocked by the diode."""
+    _refresh_dust_boundary_views(sim)
+    boundary = getattr(sim.dust.boundary, "inner", None)
+    if boundary is None:
+        return
+
+    vb = boundary._getboundary()
+    if vb is None:
+        return
+
+    sigma0 = sim.dust.Sigma[0]
+    if block_mask is None:
+        sigma0[...] = vb
+        return
+
+    mask = xp.asarray(block_mask, dtype=bool)
+    if sigma0.ndim != 1 or mask.ndim != 1 or sigma0.shape[0] != mask.shape[0]:
+        sigma0[...] = vb
+        return
+
+    open_mask = ~mask
+    if bool(to_numpy(xp.any(open_mask))):
+        sigma0[open_mask] = vb[open_mask]
 
 
 def _kernel_fortran(sim):
@@ -2976,7 +3128,11 @@ def boundary(sim):
     ----------
     sim : Frame
         Parent simulation frame"""
-    sim.dust.boundary.inner.setboundary()
+    _refresh_dust_boundary_views(sim)
+    if is_dust_inner_outflow_only_enabled(sim):
+        _apply_inner_boundary_selective(sim, _inner_diode_block_mask(sim))
+    else:
+        sim.dust.boundary.inner.setboundary()
     sim.dust.boundary.outer.setboundary()
 
 
@@ -3036,6 +3192,9 @@ def _sanitize_floorborn_islands(sim):
         dust._san_first_clip_cycle = None
         dust._san_first_clip_t_years = None
         dust._san_first_clip_cells = None
+        dust._san_tinymax_block_cycles = 0
+        dust._san_tinymax_block_cells = 0
+        dust._san_tinymax_block_max_ratio = 0.0
 
     if not hasattr(dust, "dM_sanitizer"):
         dust.addfield(
@@ -3094,6 +3253,33 @@ def _sanitize_floorborn_islands(sim):
     )
     candidate[0, :] = False
     candidate[-1, :] = False
+
+    tinymax_blocked = (
+        (ratio_now > born_ratio)
+        & (ratio_now > tiny_max)
+        & radial_ok
+    )
+    tinymax_blocked[0, :] = False
+    tinymax_blocked[-1, :] = False
+    n_tinymax_blocked = int(to_numpy(tinymax_blocked.sum()))
+    if n_tinymax_blocked > 0:
+        dust._san_tinymax_block_cycles += 1
+        dust._san_tinymax_block_cells += n_tinymax_blocked
+        max_ratio_blocked = float(to_numpy(amod.max(amod.where(tinymax_blocked, ratio_now, 0.0))))
+        if max_ratio_blocked > dust._san_tinymax_block_max_ratio:
+            dust._san_tinymax_block_max_ratio = max_ratio_blocked
+        if cfg.get("tinymax_report", False):
+            cadence = max(1, int(cfg.get("tinymax_report_cadence", 1)))
+            cycle_now = int(sim.RL_count_cycle)
+            if cycle_now % cadence == 0:
+                print(
+                    "[SAN_TINYMAX_BLOCK] "
+                    f"cycle={cycle_now}, t={t_years:.3f}yr, "
+                    f"n_cells={n_tinymax_blocked}, "
+                    f"tiny_max_ratio={tiny_max:.6e}, "
+                    f"max_ratio={max_ratio_blocked:.6e}"
+                )
+
     target = 0.1 * sigma_floor
     delta = amod.where(candidate, sigma - target, 0.0)
     to_clip = delta > 0.0
@@ -3174,6 +3360,9 @@ def sanitizer_report(sim):
         "first_clip_cycle": getattr(dust, "_san_first_clip_cycle", None),
         "first_clip_t_years": getattr(dust, "_san_first_clip_t_years", None),
         "first_clip_cells": getattr(dust, "_san_first_clip_cells", None),
+        "tinymax_block_cycles": int(getattr(dust, "_san_tinymax_block_cycles", 0)),
+        "tinymax_block_cells": int(getattr(dust, "_san_tinymax_block_cells", 0)),
+        "tinymax_block_max_ratio": float(getattr(dust, "_san_tinymax_block_max_ratio", 0.0)),
     }
 
 
@@ -3239,6 +3428,7 @@ def set_implicit_boundaries(sim):
                          sim.dust._SigmaOld[0])/(sim.t.prevstepsize+1.e-100)
     sim.dust.S.tot[-1] = (sim.dust.Sigma[-1] -
                           sim.dust._SigmaOld[-1])/(sim.t.prevstepsize+1.e-100)
+    diode_block_mask = _inner_diode_block_mask(sim)
     if is_zero_flux_enabled(sim):
         sim.dust.Fi.adv[0] = 0.0
         sim.dust.Fi.adv[-1] = 0.0
@@ -3253,6 +3443,10 @@ def set_implicit_boundaries(sim):
                                                      sim.grid.ri[0]**2) + sim.grid.ri[1]*sim.dust.Fi.adv[1])/sim.grid.ri[0]
         sim.dust.Fi.adv[-1] = (sim.dust.Fi.adv[-2]*sim.grid.ri[-2] - 0.5*sim.dust.S.hyd[-1]
                                * (sim.grid.ri[-1]**2-sim.grid.ri[-2]**2))/sim.grid.ri[-1]
+        if is_dust_inner_outflow_only_enabled(sim):
+            sim.dust.Fi.adv[0] = xp.minimum(sim.dust.Fi.adv[0], 0.0)
+            if diode_block_mask is not None:
+                sim.dust.Fi.adv[0][diode_block_mask] = 0.0
         sim.dust.Fi.tot[0] = sim.dust.Fi.adv[0]
         sim.dust.Fi.tot[-1] = sim.dust.Fi.adv[-1]
 
@@ -3366,6 +3560,12 @@ def F_adv(sim, Sigma=None):
     if is_zero_flux_enabled(sim):
         Fi[0, :] = 0.0
         Fi[-1, :] = 0.0
+    elif is_dust_inner_outflow_only_enabled(sim):
+        # Inner diode BC: allow only outflow to the star, block inward supply.
+        Fi[0, :] = xp.minimum(Fi[0, :], 0.0)
+        diode_block_mask = _inner_diode_block_mask(sim)
+        if diode_block_mask is not None:
+            Fi[0, diode_block_mask] = 0.0
     return Fi
 
 
@@ -3402,6 +3602,12 @@ def F_tot(sim, Sigma=None):
     if is_zero_flux_enabled(sim):
         Fi[0, :] = 0.0
         Fi[-1, :] = 0.0
+    elif is_dust_inner_outflow_only_enabled(sim):
+        # Inner diode BC: allow only outflow to the star, block inward supply.
+        Fi[0, :] = xp.minimum(Fi[0, :], 0.0)
+        diode_block_mask = _inner_diode_block_mask(sim)
+        if diode_block_mask is not None:
+            Fi[0, diode_block_mask] = 0.0
     return Fi
 
 
@@ -3477,6 +3683,8 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
     Nr = int(sim.grid.Nr)
     Nm = int(sim.grid.Nm)
     zero_flux = is_zero_flux_enabled(sim)
+    inner_outflow_only = is_dust_inner_outflow_only_enabled(sim)
+    diode_block_mask = _inner_diode_block_mask(sim) if inner_outflow_only else None
 
     # Building coagulation Jacobian
 
@@ -3507,6 +3715,10 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
         A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_numpy(
             A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
         )
+    elif diode_block_mask is not None and np.any(to_numpy(diode_block_mask)):
+        A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_numpy(
+            A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, diode_block_mask
+        )
     J_hyd = sp.diags(
         (A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]),
         offsets=(-Nm, 0, Nm),
@@ -3531,40 +3743,49 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
     col = np.concatenate((col0, col1, col2))
 
     # Filling data vector depending on boundary condition
+    inner_bc_mask = None
     if (not zero_flux) and sim.dust.boundary.inner is not None:
+        if inner_outflow_only and diode_block_mask is not None:
+            inner_bc_mask = ~np.asarray(to_numpy(diode_block_mask), dtype=bool)
+            if not np.any(inner_bc_mask):
+                inner_bc_mask = None
+        else:
+            inner_bc_mask = np.ones((Nm,), dtype=bool)
+    if inner_bc_mask is not None:
         # Given value
         if sim.dust.boundary.inner.condition == "val":
-            sim.dust._rhs[:Nm] = sim.dust.boundary.inner.value
+            sim.dust._rhs[:Nm][inner_bc_mask] = sim.dust.boundary.inner.value[inner_bc_mask]
         # Constant value
         elif sim.dust.boundary.inner.condition == "const_val":
-            dat[Nm:2*Nm] = 1./dt
-            sim.dust._rhs[:Nm] = 0.
+            dat[Nm:2*Nm][inner_bc_mask] = 1./dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
         # Given gradient
         elif sim.dust.boundary.inner.condition == "grad":
             K1 = - r_np[1]/r_np[0]
-            dat[Nm:2*Nm] = -K1/dt
-            sim.dust._rhs[:Nm] = - ri_np[1]/r_np[0] * \
-                (r_np[1]-r_np[0])*sim.dust.boundary.inner.value
+            dat[Nm:2*Nm][inner_bc_mask] = -K1/dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = (
+                - ri_np[1]/r_np[0] * (r_np[1]-r_np[0]) * sim.dust.boundary.inner.value[inner_bc_mask]
+            )
         # Constant gradient
         elif sim.dust.boundary.inner.condition == "const_grad":
             Di = ri_np[1]/ri_np[2] * (r_np[1]-r_np[0]) / (r_np[2]-r_np[0])
             K1 = - r_np[1]/r_np[0] * (1. + Di)
             K2 = r_np[2]/r_np[0] * Di
-            dat[:Nm] = 0.
-            dat[Nm:2*Nm] = -K1/dt
-            dat[2*Nm:] = -K2/dt
-            sim.dust._rhs[:Nm] = 0.
+            dat[:Nm][inner_bc_mask] = 0.
+            dat[Nm:2*Nm][inner_bc_mask] = -K1/dt
+            dat[2*Nm:][inner_bc_mask] = -K2/dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
         # Given power law
         elif sim.dust.boundary.inner.condition == "pow":
             p = sim.dust.boundary.inner.value
-            sim.dust._rhs[:Nm] = sim.dust.Sigma[1] * (r_np[0]/r_np[1])**p
+            sim.dust._rhs[:Nm][inner_bc_mask] = sim.dust.Sigma[1][inner_bc_mask] * (r_np[0]/r_np[1])**p
         # Constant power law
         elif sim.dust.boundary.inner.condition == "const_pow":
             p = np.log(Sigma_np[2] /
                        Sigma_np[1]) / np.log(r_np[2]/r_np[1])
             K1 = - (r_np[0]/r_np[1])**p
-            dat[Nm:2*Nm] = -K1/dt
-            sim.dust._rhs[:Nm] = 0.
+            dat[Nm:2*Nm][inner_bc_mask] = -K1[inner_bc_mask]/dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
 
     # Creating sparce matrix for inner boundary
     gen = (dat, (row, col))
@@ -3662,6 +3883,8 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     Nm = int(sim.grid.Nm)
     Ntot = int((Nr * Nm))
     zero_flux = is_zero_flux_enabled(sim)
+    inner_outflow_only = is_dust_inner_outflow_only_enabled(sim)
+    diode_block_mask = _inner_diode_block_mask(sim) if inner_outflow_only else None
     q = _get_mass_grid_q(cp.asarray(_field_data(m)), Nm)
     _, _, _, _, _, jcoag_indices, jcoag_indptr, jcoag_perm = _get_jcoag_pattern_cupy(Nr, Nm, q)
 
@@ -3678,44 +3901,56 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
         A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(
             A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
         )
+    elif diode_block_mask is not None and int(to_numpy(diode_block_mask.sum())) > 0:
+        A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_cupy(
+            A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, diode_block_mask
+        )
     n_hyd, jhb_map, jhb_indices, jhb_indptr = _get_dust_hyd_boundary_pattern_cupy(Nr, Nm)
     dat_hyd = cp.concatenate((A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]))
 
     # Right-hand side defaults to the current state for all rows.
     sim.dust._rhs[:] = sim.dust.Sigma.ravel()
-    c_in0 = 0.0
-    c_in1 = 0.0
-    c_in2 = 0.0
+    c_in0 = cp.zeros((Nm,), dtype=dat_hyd.dtype)
+    c_in1 = cp.zeros((Nm,), dtype=dat_hyd.dtype)
+    c_in2 = cp.zeros((Nm,), dtype=dat_hyd.dtype)
 
+    inner_bc_mask = None
     if (not zero_flux) and sim.dust.boundary.inner is not None:
+        if inner_outflow_only and diode_block_mask is not None:
+            inner_bc_mask = ~cp.asarray(diode_block_mask, dtype=bool)
+            if int(to_numpy(inner_bc_mask.sum())) == 0:
+                inner_bc_mask = None
+        else:
+            inner_bc_mask = cp.ones((Nm,), dtype=bool)
+    if inner_bc_mask is not None:
         if sim.dust.boundary.inner.condition == "val":
-            sim.dust._rhs[:Nm] = sim.dust.boundary.inner.value
+            sim.dust._rhs[:Nm][inner_bc_mask] = sim.dust.boundary.inner.value[inner_bc_mask]
         elif sim.dust.boundary.inner.condition == "const_val":
-            c_in1 = 1. / dt
-            sim.dust._rhs[:Nm] = 0.
+            c_in1[inner_bc_mask] = 1. / dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
         elif sim.dust.boundary.inner.condition == "grad":
             K1 = - (r[1] / r[0])
-            c_in1 = -K1 / dt
+            c_in1[inner_bc_mask] = -K1 / dt
             fac = - (ri[1] / r[0] * (r[1] - r[0]))
-            sim.dust._rhs[:Nm] = fac * sim.dust.boundary.inner.value
+            sim.dust._rhs[:Nm][inner_bc_mask] = fac * sim.dust.boundary.inner.value[inner_bc_mask]
         elif sim.dust.boundary.inner.condition == "const_grad":
             Di = (ri[1] / ri[2] * (r[1] - r[0]) / (r[2] - r[0]))
             K1 = - (r[1] / r[0]) * (1. + Di)
             K2 = (r[2] / r[0]) * Di
-            c_in0 = 0.0
-            c_in1 = -K1 / dt
-            c_in2 = -K2 / dt
-            sim.dust._rhs[:Nm] = 0.
+            c_in0[inner_bc_mask] = 0.0
+            c_in1[inner_bc_mask] = -K1 / dt
+            c_in2[inner_bc_mask] = -K2 / dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
         elif sim.dust.boundary.inner.condition == "pow":
             p = sim.dust.boundary.inner.value
             ratio = (r[0] / r[1])
-            sim.dust._rhs[:Nm] = SigmaArr[1] * ratio**p
+            sim.dust._rhs[:Nm][inner_bc_mask] = SigmaArr[1][inner_bc_mask] * ratio**p
         elif sim.dust.boundary.inner.condition == "const_pow":
             logr = cp.log(r[2] / r[1])
             p = cp.log(SigmaArr[2] / SigmaArr[1]) / logr
             K1 = - (r[0] / r[1])**p
-            c_in1 = -K1 / dt
-            sim.dust._rhs[:Nm] = 0.
+            c_in1[inner_bc_mask] = -K1[inner_bc_mask] / dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
 
     c_out0 = 0.0
     c_out1 = 0.0
@@ -3798,6 +4033,8 @@ def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
     Nm = int(sim.grid.Nm)
     Ntot = int(Nr * Nm)
     zero_flux = is_zero_flux_enabled(sim)
+    inner_outflow_only = is_dust_inner_outflow_only_enabled(sim)
+    diode_block_mask = _inner_diode_block_mask(sim) if inner_outflow_only else None
 
     q = _get_mass_grid_q(cp.asarray(_field_data(m)), Nm)
     _, _, row, col, _, _, _, _ = _get_jcoag_pattern_cupy(Nr, Nm, q)
@@ -3816,6 +4053,10 @@ def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
         A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(
             A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
         )
+    elif diode_block_mask is not None and int(to_numpy(diode_block_mask.sum())) > 0:
+        A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_cupy(
+            A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, diode_block_mask
+        )
 
     idx = cp.arange(Ntot, dtype=cp.int64)
     Bflat = B_h.ravel()
@@ -3827,39 +4068,47 @@ def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
 
     # Right-hand side defaults to the current state for all rows.
     sim.dust._rhs[:] = sim.dust.Sigma.ravel()
-    c_in0 = 0.0
-    c_in1 = 0.0
-    c_in2 = 0.0
+    c_in0 = cp.zeros((Nm,), dtype=dtype)
+    c_in1 = cp.zeros((Nm,), dtype=dtype)
+    c_in2 = cp.zeros((Nm,), dtype=dtype)
 
+    inner_bc_mask = None
     if (not zero_flux) and sim.dust.boundary.inner is not None:
+        if inner_outflow_only and diode_block_mask is not None:
+            inner_bc_mask = ~cp.asarray(diode_block_mask, dtype=bool)
+            if int(to_numpy(inner_bc_mask.sum())) == 0:
+                inner_bc_mask = None
+        else:
+            inner_bc_mask = cp.ones((Nm,), dtype=bool)
+    if inner_bc_mask is not None:
         if sim.dust.boundary.inner.condition == "val":
-            sim.dust._rhs[:Nm] = sim.dust.boundary.inner.value
+            sim.dust._rhs[:Nm][inner_bc_mask] = sim.dust.boundary.inner.value[inner_bc_mask]
         elif sim.dust.boundary.inner.condition == "const_val":
-            c_in1 = 1. / dt
-            sim.dust._rhs[:Nm] = 0.
+            c_in1[inner_bc_mask] = 1. / dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
         elif sim.dust.boundary.inner.condition == "grad":
             K1 = - (r[1] / r[0])
-            c_in1 = -K1 / dt
+            c_in1[inner_bc_mask] = -K1 / dt
             fac = - (ri[1] / r[0] * (r[1] - r[0]))
-            sim.dust._rhs[:Nm] = fac * sim.dust.boundary.inner.value
+            sim.dust._rhs[:Nm][inner_bc_mask] = fac * sim.dust.boundary.inner.value[inner_bc_mask]
         elif sim.dust.boundary.inner.condition == "const_grad":
             Di = (ri[1] / ri[2] * (r[1] - r[0]) / (r[2] - r[0]))
             K1 = - (r[1] / r[0]) * (1. + Di)
             K2 = (r[2] / r[0]) * Di
-            c_in0 = 0.0
-            c_in1 = -K1 / dt
-            c_in2 = -K2 / dt
-            sim.dust._rhs[:Nm] = 0.
+            c_in0[inner_bc_mask] = 0.0
+            c_in1[inner_bc_mask] = -K1 / dt
+            c_in2[inner_bc_mask] = -K2 / dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
         elif sim.dust.boundary.inner.condition == "pow":
             p = sim.dust.boundary.inner.value
             ratio = (r[0] / r[1])
-            sim.dust._rhs[:Nm] = SigmaArr[1] * ratio**p
+            sim.dust._rhs[:Nm][inner_bc_mask] = SigmaArr[1][inner_bc_mask] * ratio**p
         elif sim.dust.boundary.inner.condition == "const_pow":
             logr = cp.log(r[2] / r[1])
             p = cp.log(SigmaArr[2] / SigmaArr[1]) / logr
             K1 = - (r[0] / r[1])**p
-            c_in1 = -K1 / dt
-            sim.dust._rhs[:Nm] = 0.
+            c_in1[inner_bc_mask] = -K1[inner_bc_mask] / dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
 
     c_out0 = 0.0
     c_out1 = 0.0
