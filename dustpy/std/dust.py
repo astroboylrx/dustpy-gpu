@@ -4,6 +4,7 @@
 import dustpy.constants as c
 import math
 import os
+from types import SimpleNamespace
 from dustpy.std import dust_f
 from dustpy.utils.backend import call_numpy
 from dustpy.utils.backend import bind_sparse_solver
@@ -95,6 +96,7 @@ _K_VREL_TURB = None
 _K_VREL_VERT = None
 _K_COAG_PARAMS = None
 _K_IMPL_1_DIRECT = None
+_K_IMPLICIT_FLOOR_RETRY = None
 _K_JACOBIAN = None
 _K_INTERP_TO_INTERFACES = None
 _KERNEL_LOWER_MASK = None
@@ -150,6 +152,16 @@ _SANITIZER_CONFIG = {
     "tinymax_report": False,
     "tinymax_report_cadence": 1,
 }
+_GAS_FLOOR_FREEZE_CONFIG = {
+    "enabled": True,
+    "ratio": 1.0e3,
+}
+_IMPLICIT_FLOOR_RETRY_CONFIG = {
+    "enabled": True,
+    "threshold_mearth": 1.0e-6,
+    "shrink": 0.5,
+    "max_retries": 8,
+}
 _RUNTIME_STATES = {}
 _ACTIVE_RUNTIME_TOKEN = None
 _RAW_SCATTER_KERNEL_F32 = None
@@ -185,6 +197,7 @@ _RUNTIME_STATE_VARS = (
     "_K_VREL_VERT",
     "_K_COAG_PARAMS",
     "_K_IMPL_1_DIRECT",
+    "_K_IMPLICIT_FLOOR_RETRY",
     "_K_JACOBIAN",
     "_K_INTERP_TO_INTERFACES",
     "_KERNEL_LOWER_MASK",
@@ -232,6 +245,8 @@ _RUNTIME_STATE_VARS = (
     "_CUPY_DIAG_POS_CACHE_VALUE",
     "_JCOAG_CHUNK_SIZE_OVERRIDE",
     "_SANITIZER_CONFIG",
+    "_GAS_FLOOR_FREEZE_CONFIG",
+    "_IMPLICIT_FLOOR_RETRY_CONFIG",
 )
 
 
@@ -256,6 +271,7 @@ def _fresh_runtime_state():
         "_K_VREL_VERT": None,
         "_K_COAG_PARAMS": None,
         "_K_IMPL_1_DIRECT": None,
+        "_K_IMPLICIT_FLOOR_RETRY": None,
         "_K_JACOBIAN": None,
         "_K_INTERP_TO_INTERFACES": None,
         "_KERNEL_LOWER_MASK": None,
@@ -310,6 +326,16 @@ def _fresh_runtime_state():
             "stop_thresh_mearth": 1.0e-2,
             "tinymax_report": False,
             "tinymax_report_cadence": 1,
+        },
+        "_GAS_FLOOR_FREEZE_CONFIG": {
+            "enabled": True,
+            "ratio": 1.0e3,
+        },
+        "_IMPLICIT_FLOOR_RETRY_CONFIG": {
+            "enabled": True,
+            "threshold_mearth": 1.0e-6,
+            "shrink": 0.5,
+            "max_retries": 8,
         },
     }
 
@@ -869,6 +895,203 @@ def _load_sanitizer_config():
     }
 
 
+def _load_gas_floor_freeze_config():
+    ratio = _env_float("DUSTPY_GAS_FLOOR_FREEZE_RATIO", 1.0e3)
+    if not np.isfinite(ratio):
+        ratio = 1.0e3
+    ratio = max(float(ratio), 0.0)
+    return {
+        "enabled": ratio > 0.0,
+        "ratio": ratio,
+    }
+
+
+def _load_implicit_floor_retry_config():
+    shrink = _env_float("DUSTPY_IMPLICIT_FLOOR_RETRY_SHRINK", 0.5)
+    if not np.isfinite(shrink):
+        shrink = 0.5
+    shrink = min(max(float(shrink), 1.0e-6), 0.99)
+    threshold = _env_float("DUSTPY_IMPLICIT_FLOOR_RETRY_THRESH_MEARTH", 1.0e-6)
+    if not np.isfinite(threshold):
+        threshold = 1.0e-6
+    threshold = max(float(threshold), 0.0)
+    max_retries = _env_float("DUSTPY_IMPLICIT_FLOOR_RETRY_MAX_RETRIES", 8.0)
+    if not np.isfinite(max_retries):
+        max_retries = 8.0
+    max_retries = max(0, int(max_retries))
+    enabled = _env_bool("DUSTPY_IMPLICIT_FLOOR_RETRY_ENABLE", default=True) and threshold > 0.0
+    return {
+        "enabled": enabled,
+        "threshold_mearth": threshold,
+        "shrink": shrink,
+        "max_retries": max_retries,
+    }
+
+
+def _gas_floor_freeze_mask_from_arrays(SigmaGas, SigmaGasFloor):
+    cfg = _GAS_FLOOR_FREEZE_CONFIG
+    if not cfg.get("enabled", True):
+        return xp.zeros(SigmaGas.shape, dtype=bool)
+    ratio = float(cfg.get("ratio", 0.0))
+    if ratio <= 0.0:
+        return xp.zeros(SigmaGas.shape, dtype=bool)
+    return xp.asarray(SigmaGas <= ratio * SigmaGasFloor, dtype=bool)
+
+
+def _gas_floor_freeze_mask(sim, SigmaGas=None):
+    SigmaGas = _field_data(sim.gas.Sigma if SigmaGas is None else SigmaGas)
+    SigmaGasFloor = _field_data(sim.gas.SigmaFloor)
+    return _gas_floor_freeze_mask_from_arrays(SigmaGas, SigmaGasFloor)
+
+
+def _gas_floor_freeze_interface_mask(sim, SigmaGas=None):
+    radial_mask = _gas_floor_freeze_mask(sim, SigmaGas=SigmaGas)
+    iface_mask = xp.zeros((int(radial_mask.shape[0]) + 1,), dtype=bool)
+    iface_mask[:-1] = iface_mask[:-1] | radial_mask
+    iface_mask[1:] = iface_mask[1:] | radial_mask
+    return iface_mask
+
+
+def _apply_gas_floor_freeze_to_radial_field(sim, arr, SigmaGas=None):
+    mask = _gas_floor_freeze_mask(sim, SigmaGas=SigmaGas)
+    if int(to_numpy(mask.sum())) == 0:
+        return arr
+    arr = _field_data(arr)
+    arr[mask, ...] = 0.0
+    return arr
+
+
+def _apply_gas_floor_freeze_to_flux(sim, Fi, SigmaGas=None):
+    iface_mask = _gas_floor_freeze_interface_mask(sim, SigmaGas=SigmaGas)
+    if int(to_numpy(iface_mask.sum())) == 0:
+        return Fi
+    Fi = _field_data(Fi)
+    Fi[iface_mask, ...] = 0.0
+    return Fi
+
+
+def _record_implicit_floor_retry(owner, added_mearth):
+    state = _ensure_dust_floor_retry_state(owner.dust)
+    state.total_mearth += float(added_mearth)
+    state.last_mearth = float(added_mearth)
+    state.count += 1
+    state.step_count += 1
+
+
+def _record_implicit_floor_retry_exhausted(owner, added_mearth):
+    state = _ensure_dust_floor_retry_state(owner.dust)
+    state.giveup_count += 1
+    state.giveup_last_mearth = float(added_mearth)
+
+
+def _ensure_dust_san_state(dust):
+    state = getattr(dust, "san", None)
+    if state is None:
+        state = SimpleNamespace(
+            enabled=bool(_SANITIZER_CONFIG.get("enabled", False)),
+            mode=str(_SANITIZER_CONFIG.get("mode", "implicit")),
+            stop_thresh_mearth=float(_SANITIZER_CONFIG.get("stop_thresh_mearth", 1.0e-2)),
+            prev_ratio=None,
+            Mdust0_mearth=None,
+            dM_total_mearth=0.0,
+            last_n_clipped=0,
+            active_cycles=0,
+            clip_cycles=0,
+            sum_clipped_cells=0,
+            max_cells_per_cycle=0,
+            first_clip_cycle=None,
+            first_clip_t_years=None,
+            first_clip_cells=None,
+            tinymax_block_cycles=0,
+            tinymax_block_cells=0,
+            tinymax_block_max_ratio=0.0,
+            half_idx=None,
+        )
+        dust.san = state
+    else:
+        state.enabled = bool(_SANITIZER_CONFIG.get("enabled", False))
+        state.mode = str(_SANITIZER_CONFIG.get("mode", "implicit"))
+        state.stop_thresh_mearth = float(_SANITIZER_CONFIG.get("stop_thresh_mearth", 1.0e-2))
+    return state
+
+
+def _ensure_dust_floor_topup_state(dust):
+    state = getattr(dust, "floor_topup", None)
+    if state is None:
+        state = SimpleNamespace(
+            total_mearth=0.0,
+            last_mearth=0.0,
+            count=0,
+        )
+        dust.floor_topup = state
+    return state
+
+
+def _ensure_dust_floor_retry_state(dust):
+    state = getattr(dust, "floor_retry", None)
+    if state is None:
+        state = SimpleNamespace(
+            total_mearth=0.0,
+            last_mearth=0.0,
+            count=0,
+            step_count=0,
+            giveup_count=0,
+            giveup_last_mearth=0.0,
+        )
+        dust.floor_retry = state
+    return state
+
+
+def _maybe_retry_implicit_floor_injection_numpy(x0, Y0, dx, sigma1):
+    cfg = _IMPLICIT_FLOOR_RETRY_CONFIG
+    if not cfg.get("enabled", True):
+        return False
+    sigma1_np = np.asarray(_field_data(sigma1), dtype=np.float64)
+    floor_np = np.asarray(_field_data(Y0._owner.dust.SigmaFloor), dtype=np.float64)
+    area_np = np.asarray(_field_data(Y0._owner.grid.A), dtype=np.float64)
+    delta_np = np.maximum(0.1 * floor_np - sigma1_np, 0.0)
+    added_mearth = float(np.sum(delta_np * area_np[:, None] / c.M_earth))
+    if added_mearth <= float(cfg.get("threshold_mearth", 0.0)):
+        return False
+    retry = _ensure_dust_floor_retry_state(Y0._owner.dust)
+    if retry.step_count >= int(cfg.get("max_retries", 0)):
+        _record_implicit_floor_retry_exhausted(Y0._owner, added_mearth)
+        return False
+    _record_implicit_floor_retry(Y0._owner, added_mearth)
+    dx_host = float(dx)
+    shrink = float(cfg.get("shrink", 0.5))
+    x0.suggest(max(dx_host * shrink, 1.0e-300), reset=True)
+    return True
+
+
+def _maybe_retry_implicit_floor_injection_cupy(x0, Y0, dx, sigma1):
+    cfg = _IMPLICIT_FLOOR_RETRY_CONFIG
+    if not cfg.get("enabled", True):
+        return False
+    if cp is None:
+        return _maybe_retry_implicit_floor_injection_numpy(x0, Y0, dx, sigma1)
+    sigma1_cp = cp.asarray(_field_data(sigma1))
+    floor_cp = cp.asarray(_field_data(Y0._owner.dust.SigmaFloor))
+    area_cp = cp.asarray(_field_data(Y0._owner.grid.A))
+    delta_cp = cp.maximum(0.1 * floor_cp - sigma1_cp, 0.0)
+    added_mearth = float(to_numpy(cp.sum(delta_cp * area_cp[:, None] / c.M_earth)))
+    if added_mearth <= float(cfg.get("threshold_mearth", 0.0)):
+        return False
+    retry = _ensure_dust_floor_retry_state(Y0._owner.dust)
+    if retry.step_count >= int(cfg.get("max_retries", 0)):
+        _record_implicit_floor_retry_exhausted(Y0._owner, added_mearth)
+        return False
+    _record_implicit_floor_retry(Y0._owner, added_mearth)
+    dx_host = float(dx)
+    shrink = float(cfg.get("shrink", 0.5))
+    x0.suggest(max(dx_host * shrink, 1.0e-300), reset=True)
+    return True
+
+
+def _maybe_retry_implicit_floor_injection(x0, Y0, dx, sigma1):
+    return _K_IMPLICIT_FLOOR_RETRY(x0, Y0, dx, sigma1)
+
+
 def _get_cupy_dust_solver_mode():
     """Return CuPy dust implicit solver mode."""
     raw = os.getenv("DUSTPY_CUPY_DUST_SOLVER", "sparse").strip().lower()
@@ -939,6 +1162,7 @@ def _D_fortran(sim):
     Diff = _dust_f_call(dust_f.d, v2, sim.grid.OmegaK, sim.dust.St)
     Diff[:2, ...] = 0.
     Diff[-2:, ...] = 0.
+    _apply_gas_floor_freeze_to_radial_field(sim, Diff)
     return Diff
 
 
@@ -947,6 +1171,7 @@ def _D_cupy(sim):
     Diff = v2[:, None] / (sim.grid.OmegaK[:, None] * (1.0 + sim.dust.St**2))
     Diff[:2, ...] = 0.
     Diff[-2:, ...] = 0.
+    _apply_gas_floor_freeze_to_radial_field(sim, Diff)
     return Diff
 
 
@@ -962,7 +1187,9 @@ def _H_cupy(sim):
 
 def _F_adv_fortran(sim, Sigma=None):
     Sigma = Sigma if Sigma is not None else sim.dust.Sigma
-    return _dust_f_call(dust_f.fi_adv, Sigma, sim.dust.v.rad, sim.grid.r, sim.grid.ri)
+    Fi = _dust_f_call(dust_f.fi_adv, Sigma, sim.dust.v.rad, sim.grid.r, sim.grid.ri)
+    _apply_gas_floor_freeze_to_flux(sim, Fi)
+    return Fi
 
 
 def _F_adv_cupy(sim, Sigma=None):
@@ -988,6 +1215,7 @@ def _F_adv_cupy(sim, Sigma=None):
     if is_zero_flux_enabled(sim):
         Fi[0, :] = 0.0
         Fi[-1, :] = 0.0
+    _apply_gas_floor_freeze_to_flux(sim, Fi)
     return Fi
 
 
@@ -1053,6 +1281,7 @@ def _F_diff_fortran(sim, Sigma=None):
     )
     Fi[:1, :] = 0.
     Fi[-1:, :] = 0.
+    _apply_gas_floor_freeze_to_flux(sim, Fi)
     return Fi
 
 
@@ -1134,6 +1363,7 @@ def _F_diff_cupy(sim, Sigma=None):
     # Preserve current dust.py behavior at boundaries.
     Fi[:1, :] = 0.
     Fi[-1:, :] = 0.
+    _apply_gas_floor_freeze_to_flux(sim, Fi)
     return Fi
 
 
@@ -1165,7 +1395,7 @@ def _S_hyd_cupy(sim, Sigma=None):
 def _S_coag_fortran(sim, Sigma=None):
     if Sigma is None:
         Sigma = sim.dust.Sigma
-    return _dust_f_call(
+    S = _dust_f_call(
         dust_f.s_coag,
         sim.dust.coagulation.stick,
         sim.dust.coagulation.stick_ind,
@@ -1180,6 +1410,8 @@ def _S_coag_fortran(sim, Sigma=None):
         Sigma,
         sim.dust.SigmaFloor,
     )
+    _apply_gas_floor_freeze_to_radial_field(sim, S)
+    return S
 
 
 def _get_coag_pair_indices(Nm):
@@ -1520,6 +1752,10 @@ def _S_coag_cupy(sim, Sigma=None):
 
         S = cp.zeros_like(SigmaArr)
         S[1:-1] = S_mid * m[None, :]
+        freeze_mask = _gas_floor_freeze_mask(sim)[1:-1]
+        if int(to_numpy(freeze_mask.sum())) > 0:
+            freeze_rows = cp.where(freeze_mask)[0] + 1
+            S[freeze_rows, :] = 0.0
         return S
 
     # Sticking contribution.
@@ -1577,6 +1813,10 @@ def _S_coag_cupy(sim, Sigma=None):
 
     S = cp.zeros_like(SigmaArr)
     S[1:-1] = S_flat.reshape(Nr_int, Nm) * m[None, :]
+    freeze_mask = _gas_floor_freeze_mask(sim)[1:-1]
+    if int(to_numpy(freeze_mask.sum())) > 0:
+        freeze_rows = cp.where(freeze_mask)[0] + 1
+        S[freeze_rows, :] = 0.0
     return S
 
 
@@ -2178,7 +2418,59 @@ def _jacobian_coagulation_generator_cupy(
     return dat_gpu, row, col
 
 
-def _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v):
+def _jacobian_hydrodynamic_generator_numpy(area, D, r, ri, SigmaGas, v, freeze_interface_mask=None):
+    """NumPy equivalent of dust_f.jacobian_hydrodynamic_generator with optional interface freeze."""
+    area = np.asarray(_field_data(area))
+    D = np.asarray(_field_data(D))
+    r = np.asarray(_field_data(r))
+    ri = np.asarray(_field_data(ri))
+    SigmaGas = np.asarray(_field_data(SigmaGas))
+    v = np.asarray(_field_data(v))
+
+    Nr = int(r.shape[0])
+    Nm = int(D.shape[1])
+
+    h = SigmaGas * r
+    hi = np.asarray(_interp_to_interfaces_numpy(h, r, ri))
+    vi = np.asarray(_interp_to_interfaces_numpy(v, r, ri))
+    Di = np.asarray(_interp_to_interfaces_numpy(D, r, ri))
+
+    if freeze_interface_mask is not None:
+        freeze_interface_mask = np.asarray(to_numpy(freeze_interface_mask), dtype=bool)
+        if freeze_interface_mask.ndim == 1 and freeze_interface_mask.size == vi.shape[0] and np.any(freeze_interface_mask):
+            vi[freeze_interface_mask, :] = 0.0
+            Di[freeze_interface_mask, :] = 0.0
+
+    vim = np.minimum(vi, 0.0)
+    vip = np.maximum(vi, 0.0)
+
+    A = np.zeros((Nr, Nm))
+    B = np.zeros((Nr, Nm))
+    C = np.zeros((Nr, Nm))
+
+    Vinv = np.zeros((Nr,))
+    Vinv[:-1] = (2.0 * c.pi) / area[:-1]
+
+    w = np.ones((Nr,))
+    w[:-1] = r[1:] - r[:-1]
+
+    A[1:-1, :] += vip[1:-2, :] * r[:-2, None]
+    B[1:-1, :] += -vip[2:-1, :] * r[1:-1, None] + vim[1:-2, :] * r[1:-1, None]
+    C[1:-1, :] += -vim[2:-1, :] * r[2:, None]
+
+    A[1:-1, :] += Di[1:-2, :] * hi[1:-2, None] / (w[:-2, None] * h[:-2, None]) * r[:-2, None]
+    B[1:-1, :] += -Di[1:-2, :] * hi[1:-2, None] / (w[:-2, None] * h[1:-1, None]) * r[1:-1, None]
+    B[1:-1, :] += -Di[2:-1, :] * hi[2:-1, None] / (w[1:-1, None] * h[1:-1, None]) * r[1:-1, None]
+    C[1:-1, :] += Di[2:-1, :] * hi[2:-1, None] / (w[1:-1, None] * h[2:, None]) * r[2:, None]
+
+    A = A * Vinv[:, None]
+    B = B * Vinv[:, None]
+    C = C * Vinv[:, None]
+
+    return A, B, C
+
+
+def _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v, freeze_interface_mask=None):
     """CuPy-native equivalent of dust_f.jacobian_hydrodynamic_generator."""
     area = _field_data(area)
     D = _field_data(D)
@@ -2194,6 +2486,12 @@ def _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v):
     hi = _interp_to_interfaces(h, r, ri)
     vi = _interp_to_interfaces(v, r, ri)
     Di = _interp_to_interfaces(D, r, ri)
+
+    if freeze_interface_mask is not None:
+        freeze_interface_mask = xp.asarray(freeze_interface_mask, dtype=bool)
+        if int(to_numpy(freeze_interface_mask.sum())) > 0:
+            vi[freeze_interface_mask, :] = 0.0
+            Di[freeze_interface_mask, :] = 0.0
 
     vim = xp.minimum(vi, 0.0)
     vip = xp.maximum(vi, 0.0)
@@ -2569,12 +2867,16 @@ def _St_Epstein_StokesI_cupy(sim):
 
 
 def _vrad_fortran(sim):
-    return _dust_f_call(dust_f.vrad, sim.dust.St, sim.dust.v.driftmax, sim.gas.v.rad)
+    vr = _dust_f_call(dust_f.vrad, sim.dust.St, sim.dust.v.driftmax, sim.gas.v.rad)
+    _apply_gas_floor_freeze_to_radial_field(sim, vr)
+    return vr
 
 
 def _vrad_cupy(sim):
     St = sim.dust.St
-    return (sim.gas.v.rad[:, None] + 2.0 * sim.dust.v.driftmax[:, None] * St) / (St**2 + 1.0)
+    vr = (sim.gas.v.rad[:, None] + 2.0 * sim.dust.v.driftmax[:, None] * St) / (St**2 + 1.0)
+    _apply_gas_floor_freeze_to_radial_field(sim, vr)
+    return vr
 
 
 def _vrel_brownian_motion_fortran(sim):
@@ -2957,7 +3259,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     """Bind hot dust kernels to backend-specific implementations once."""
     global _BOUND_BACKEND, _K_A, _K_D, _K_H, _K_F_ADV, _K_F_DIFF, _K_S_COAG, _K_S_HYD
     global _K_KERNEL, _K_P_FRAG, _K_ST, _K_VRAD, _K_VREL_BROWN, _K_VREL_AZI, _K_VREL_RAD, _K_VREL_TURB, _K_VREL_VERT
-    global _K_COAG_PARAMS, _K_IMPL_1_DIRECT, _K_JACOBIAN, _K_INTERP_TO_INTERFACES
+    global _K_COAG_PARAMS, _K_IMPL_1_DIRECT, _K_IMPLICIT_FLOOR_RETRY, _K_JACOBIAN, _K_INTERP_TO_INTERFACES
     global _KERNEL_LOWER_MASK, _COAG_CACHE_KEY, _COAG_CACHE_VALUE
     global _COAG_PAIR_CACHE_KEY, _COAG_PAIR_CACHE_VALUE, _SCOAG_PAIRMAP_CACHE_KEY, _SCOAG_PAIRMAP_CACHE_VALUE
     global _FRAG_P_CACHE_KEY, _FRAG_P_CACHE_VALUE, _MGRID_Q_CACHE_KEY, _MGRID_Q_CACHE_VALUE
@@ -2971,7 +3273,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     global _JCOAG_GEN_MODE, _S_COAG_MODE, _F_DIFF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE
     global _VREL_TURB_MODE, _VREL_TOT_MODE, _P_FRAG_MODE, _COLLISION_KERNEL_MODE
     global _CUPY_A_BUILD_MODE, _CUPY_DIAG_POS_CACHE_KEY, _CUPY_DIAG_POS_CACHE_VALUE
-    global _JCOAG_CHUNK_SIZE_OVERRIDE, _SANITIZER_CONFIG
+    global _JCOAG_CHUNK_SIZE_OVERRIDE, _SANITIZER_CONFIG, _GAS_FLOOR_FREEZE_CONFIG, _IMPLICIT_FLOOR_RETRY_CONFIG
 
     _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
@@ -3023,6 +3325,8 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
             jcoag_chunk_size_override = None
     cupy_dust_solver_mode = _get_cupy_dust_solver_mode() if backend == "cupy" else "sparse"
     sanitizer_cfg = _load_sanitizer_config()
+    gas_floor_freeze_cfg = _load_gas_floor_freeze_config()
+    implicit_floor_retry_cfg = _load_implicit_floor_retry_config()
     if (
         (not force)
         and backend == _BOUND_BACKEND
@@ -3039,6 +3343,8 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
         and cupy_a_build_mode == _CUPY_A_BUILD_MODE
         and jcoag_chunk_size_override == _JCOAG_CHUNK_SIZE_OVERRIDE
         and sanitizer_cfg == _SANITIZER_CONFIG
+        and gas_floor_freeze_cfg == _GAS_FLOOR_FREEZE_CONFIG
+        and implicit_floor_retry_cfg == _IMPLICIT_FLOOR_RETRY_CONFIG
     ):
         return
 
@@ -3065,6 +3371,11 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     else:
         _K_IMPL_1_DIRECT = select_backend({"cupy": _f_impl_1_direct_cupy}, backend=backend, default=_f_impl_1_direct_numpy)
         _K_JACOBIAN = select_backend({"cupy": _jacobian_cupy}, backend=backend, default=_jacobian_numpy)
+    _K_IMPLICIT_FLOOR_RETRY = select_backend(
+        {"cupy": _maybe_retry_implicit_floor_injection_cupy},
+        backend=backend,
+        default=_maybe_retry_implicit_floor_injection_numpy,
+    )
     _K_INTERP_TO_INTERFACES = select_backend({"cupy": _interp_to_interfaces_cupy}, backend=backend, default=_interp_to_interfaces_numpy)
 
     _JCOAG_GEN_MODE = jcoag_gen_mode
@@ -3079,6 +3390,8 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     _CUPY_A_BUILD_MODE = cupy_a_build_mode
     _JCOAG_CHUNK_SIZE_OVERRIDE = jcoag_chunk_size_override
     _SANITIZER_CONFIG = sanitizer_cfg
+    _GAS_FLOOR_FREEZE_CONFIG = gas_floor_freeze_cfg
+    _IMPLICIT_FLOOR_RETRY_CONFIG = implicit_floor_retry_cfg
 
     _KERNEL_LOWER_MASK = None
     _COAG_CACHE_KEY = None
@@ -3143,17 +3456,25 @@ def enforce_floor_value(sim):
     ----------
     sim : Frame
         Parent simulation frame"""
-    sim.dust.Sigma = xp.where(
-        sim.dust.Sigma > sim.dust.SigmaFloor,
-        sim.dust.Sigma,
-        0.1*sim.dust.SigmaFloor)
+    sigma = _field_data(sim.dust.Sigma)
+    floor = _field_data(sim.dust.SigmaFloor)
+    target = xp.where(sigma > floor, sigma, 0.1 * floor)
+    delta = xp.maximum(target - sigma, 0.0)
+    added_mearth = float(to_numpy(xp.sum(delta * _field_data(sim.grid.A)[:, None] / c.M_earth)))
+    if added_mearth > 0.0:
+        topup = _ensure_dust_floor_topup_state(sim.dust)
+        topup.total_mearth += added_mearth
+        topup.last_mearth = added_mearth
+        topup.count += 1
+    sim.dust.Sigma = target
 
 
 def _sanitize_floorborn_islands(sim):
     """Optionally clip floor-born tiny islands after implicit/explicit floor enforcement."""
     cfg = _SANITIZER_CONFIG
     dust = sim.dust
-    dust._san_last_n_clipped = 0
+    san = _ensure_dust_san_state(dust)
+    san.last_n_clipped = 0
 
     if not cfg.get("enabled", False):
         return
@@ -3172,29 +3493,18 @@ def _sanitize_floorborn_islands(sim):
 
     ratio_now = amod.where(sigma_floor > 0.0, sigma / sigma_floor, 0.0)
 
-    prev_ratio = getattr(dust, "_san_prev_ratio", None)
+    prev_ratio = san.prev_ratio
     if prev_ratio is None or prev_ratio.shape != ratio_now.shape:
-        dust._san_prev_ratio = ratio_now.copy()
+        san.prev_ratio = ratio_now.copy()
         return
 
     t_years = float(sim.t) / c.year
 
-    if getattr(dust, "_san_Mdust0_mearth", None) is None:
+    if san.Mdust0_mearth is None:
         area = _field_data(sim.grid.A)
         mdust0 = amod.sum(sigma * area[:, None]) / c.M_earth
         mdust0 = float(to_numpy(mdust0))
-        dust._san_Mdust0_mearth = max(mdust0, 1e-300)
-        dust._san_dM_total_mearth = 0.0
-        dust._san_active_cycles = 0
-        dust._san_clip_cycles = 0
-        dust._san_sum_clipped_cells = 0
-        dust._san_max_cells_per_cycle = 0
-        dust._san_first_clip_cycle = None
-        dust._san_first_clip_t_years = None
-        dust._san_first_clip_cells = None
-        dust._san_tinymax_block_cycles = 0
-        dust._san_tinymax_block_cells = 0
-        dust._san_tinymax_block_max_ratio = 0.0
+        san.Mdust0_mearth = max(mdust0, 1e-300)
 
     if not hasattr(dust, "dM_sanitizer"):
         dust.addfield(
@@ -3217,7 +3527,7 @@ def _sanitize_floorborn_islands(sim):
         axis=1,
     ).astype(bool)
 
-    half_idx = getattr(dust, "_san_half_idx", None)
+    half_idx = san.half_idx
     if half_idx is None or int(getattr(half_idx, "size", -1)) != int(nm):
         # Map each mass bin m_j to the closest bin to m_j / 2 on the actual grid.
         m_np = to_numpy(_field_data(sim.grid.m)).astype(np.float64, copy=False)
@@ -3231,7 +3541,7 @@ def _sanitize_floorborn_islands(sim):
             half_idx = half_idx_np
         else:
             half_idx = cp.asarray(half_idx_np, dtype=cp.int64)
-        dust._san_half_idx = half_idx
+        san.half_idx = half_idx
     row_ok = suffix_ok[:, half_idx]
 
     radial_ok = amod.ones_like(row_ok, dtype=bool)
@@ -3263,11 +3573,11 @@ def _sanitize_floorborn_islands(sim):
     tinymax_blocked[-1, :] = False
     n_tinymax_blocked = int(to_numpy(tinymax_blocked.sum()))
     if n_tinymax_blocked > 0:
-        dust._san_tinymax_block_cycles += 1
-        dust._san_tinymax_block_cells += n_tinymax_blocked
+        san.tinymax_block_cycles += 1
+        san.tinymax_block_cells += n_tinymax_blocked
         max_ratio_blocked = float(to_numpy(amod.max(amod.where(tinymax_blocked, ratio_now, 0.0))))
-        if max_ratio_blocked > dust._san_tinymax_block_max_ratio:
-            dust._san_tinymax_block_max_ratio = max_ratio_blocked
+        if max_ratio_blocked > san.tinymax_block_max_ratio:
+            san.tinymax_block_max_ratio = max_ratio_blocked
         if cfg.get("tinymax_report", False):
             cadence = max(1, int(cfg.get("tinymax_report_cadence", 1)))
             cycle_now = int(sim.RL_count_cycle)
@@ -3285,10 +3595,10 @@ def _sanitize_floorborn_islands(sim):
     to_clip = delta > 0.0
     n_clipped = int(to_numpy(to_clip.sum()))
 
-    dust._san_active_cycles += 1
-    dust._san_last_n_clipped = n_clipped
+    san.active_cycles += 1
+    san.last_n_clipped = n_clipped
     if n_clipped == 0:
-        dust._san_prev_ratio = ratio_now.copy()
+        san.prev_ratio = ratio_now.copy()
         return
 
     sigma[to_clip] = target[to_clip]
@@ -3296,26 +3606,26 @@ def _sanitize_floorborn_islands(sim):
     dM_inc = delta * to_clip * (area[:, None] / c.M_earth)
     dM_sanitizer[...] = dM_sanitizer + dM_inc
     dM_cycle = float(to_numpy(dM_inc.sum()))
-    dust._san_dM_total_mearth += dM_cycle
-    dust._san_clip_cycles += 1
-    dust._san_sum_clipped_cells += n_clipped
-    if n_clipped > dust._san_max_cells_per_cycle:
-        dust._san_max_cells_per_cycle = n_clipped
-    if dust._san_first_clip_cycle is None:
-        dust._san_first_clip_cycle = int(sim.RL_count_cycle)
-        dust._san_first_clip_t_years = t_years
-        dust._san_first_clip_cells = n_clipped
+    san.dM_total_mearth += dM_cycle
+    san.clip_cycles += 1
+    san.sum_clipped_cells += n_clipped
+    if n_clipped > san.max_cells_per_cycle:
+        san.max_cells_per_cycle = n_clipped
+    if san.first_clip_cycle is None:
+        san.first_clip_cycle = int(sim.RL_count_cycle)
+        san.first_clip_t_years = t_years
+        san.first_clip_cells = n_clipped
 
     ratio_after = amod.where(sigma_floor > 0.0, sigma / sigma_floor, 0.0)
-    dust._san_prev_ratio = ratio_after.copy()
+    san.prev_ratio = ratio_after.copy()
 
     stop_thresh_mearth = float(cfg["stop_thresh_mearth"])
     if stop_thresh_mearth > 0.0:
-        if dust._san_dM_total_mearth > stop_thresh_mearth:
+        if san.dM_total_mearth > stop_thresh_mearth:
             print(
                 "[SANITIZER_STOP] "
                 f"cycle={int(sim.RL_count_cycle)}, t={t_years:.3f}yr, "
-                f"dM_san={dust._san_dM_total_mearth:.6e} Mearth, "
+                f"dM_san={san.dM_total_mearth:.6e} Mearth, "
                 f"stop_thresh_mearth={stop_thresh_mearth:.6e}"
             )
             if sim.writer is not None:
@@ -3338,34 +3648,6 @@ def _sanitize_floorborn_islands(sim):
                     pass
             raise SystemExit("DustPy sanitizer stop threshold exceeded.")
 
-
-def sanitizer_report(sim):
-    """Return sanitizer status dictionary for diagnostics."""
-    cfg = _SANITIZER_CONFIG
-    dust = sim.dust
-    return {
-        "enabled": bool(cfg.get("enabled", False)),
-        "mode": str(cfg.get("mode", "implicit")),
-        "stop_thresh_mearth": float(cfg.get("stop_thresh_mearth", 1.0e-2)),
-        "dM_total_mearth": float(getattr(dust, "_san_dM_total_mearth", 0.0)),
-        "dM_frac_init": float(
-            getattr(dust, "_san_dM_total_mearth", 0.0)
-            / max(float(getattr(dust, "_san_Mdust0_mearth", 1.0)), 1e-300)
-        ),
-        "n_clipped_last": int(getattr(dust, "_san_last_n_clipped", 0)),
-        "active_cycles": int(getattr(dust, "_san_active_cycles", 0)),
-        "clip_cycles": int(getattr(dust, "_san_clip_cycles", 0)),
-        "sum_clipped_cells": int(getattr(dust, "_san_sum_clipped_cells", 0)),
-        "max_cells_per_cycle": int(getattr(dust, "_san_max_cells_per_cycle", 0)),
-        "first_clip_cycle": getattr(dust, "_san_first_clip_cycle", None),
-        "first_clip_t_years": getattr(dust, "_san_first_clip_t_years", None),
-        "first_clip_cells": getattr(dust, "_san_first_clip_cells", None),
-        "tinymax_block_cycles": int(getattr(dust, "_san_tinymax_block_cycles", 0)),
-        "tinymax_block_cells": int(getattr(dust, "_san_tinymax_block_cells", 0)),
-        "tinymax_block_max_ratio": float(getattr(dust, "_san_tinymax_block_max_ratio", 0.0)),
-    }
-
-
 def prepare(sim):
     """Function prepares implicit dust integration step.
     It stores the current value of the surface density in a hidden field.
@@ -3379,6 +3661,7 @@ def prepare(sim):
     sim.dust.S.ext[-1] = 0.
     # Storing current surface density
     sim.dust._SigmaOld[...] = sim.dust.Sigma[...]
+    _ensure_dust_floor_retry_state(sim.dust).step_count = 0
 
 
 def finalize_explicit(sim):
@@ -3449,6 +3732,8 @@ def set_implicit_boundaries(sim):
                 sim.dust.Fi.adv[0][diode_block_mask] = 0.0
         sim.dust.Fi.tot[0] = sim.dust.Fi.adv[0]
         sim.dust.Fi.tot[-1] = sim.dust.Fi.adv[-1]
+    _apply_gas_floor_freeze_to_flux(sim, sim.dust.Fi.adv)
+    _apply_gas_floor_freeze_to_flux(sim, sim.dust.Fi.tot)
 
 
 def dt_adaptive(sim):
@@ -3571,7 +3856,9 @@ def F_adv(sim, Sigma=None):
 
 def F_diff(sim, Sigma=None):
     '''Function calculates the diffusive flux at the cell interfaces'''
-    return _K_F_DIFF(sim, Sigma=Sigma)
+    Fi = _K_F_DIFF(sim, Sigma=Sigma)
+    _apply_gas_floor_freeze_to_flux(sim, Fi)
+    return Fi
 
 
 def F_tot(sim, Sigma=None):
@@ -3608,6 +3895,7 @@ def F_tot(sim, Sigma=None):
         diode_block_mask = _inner_diode_block_mask(sim)
         if diode_block_mask is not None:
             Fi[0, diode_block_mask] = 0.0
+    _apply_gas_floor_freeze_to_flux(sim, Fi)
     return Fi
 
 
@@ -3685,6 +3973,8 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
     zero_flux = is_zero_flux_enabled(sim)
     inner_outflow_only = is_dust_inner_outflow_only_enabled(sim)
     diode_block_mask = _inner_diode_block_mask(sim) if inner_outflow_only else None
+    freeze_mask = np.asarray(to_numpy(_gas_floor_freeze_mask(sim)), dtype=bool)
+    freeze_interface_mask = np.asarray(to_numpy(_gas_floor_freeze_interface_mask(sim)), dtype=bool)
 
     # Building coagulation Jacobian
 
@@ -3696,21 +3986,38 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
         to_backend_result=False,
     )
     gen = (dat, (row, col))
+    if np.any(freeze_mask[1:-1]):
+        freeze_rows = freeze_mask[row // Nm]
+        if np.any(freeze_rows):
+            dat = np.array(dat, copy=True)
+            dat[freeze_rows] = 0.0
+            gen = (dat, (row, col))
     J_coag = sp.csc_matrix(
         gen,
         shape=(Ntot, Ntot)
     )
 
-    A_h, B_h, C_h = _dust_f_call(
-        dust_f.jacobian_hydrodynamic_generator,
-        area,
-        sim.dust.D,
-        r,
-        ri,
-        sim.gas.Sigma,
-        sim.dust.v.rad,
-        to_backend_result=False,
-    )
+    if np.any(freeze_interface_mask):
+        A_h, B_h, C_h = _jacobian_hydrodynamic_generator_numpy(
+            area,
+            sim.dust.D,
+            r,
+            ri,
+            sim.gas.Sigma,
+            sim.dust.v.rad,
+            freeze_interface_mask=freeze_interface_mask,
+        )
+    else:
+        A_h, B_h, C_h = _dust_f_call(
+            dust_f.jacobian_hydrodynamic_generator,
+            area,
+            sim.dust.D,
+            r,
+            ri,
+            sim.gas.Sigma,
+            sim.dust.v.rad,
+            to_backend_result=False,
+        )
     if zero_flux:
         A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_numpy(
             A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
@@ -3885,17 +4192,22 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     zero_flux = is_zero_flux_enabled(sim)
     inner_outflow_only = is_dust_inner_outflow_only_enabled(sim)
     diode_block_mask = _inner_diode_block_mask(sim) if inner_outflow_only else None
+    freeze_mask = _gas_floor_freeze_mask(sim)
+    freeze_interface_mask = _gas_floor_freeze_interface_mask(sim)
     q = _get_mass_grid_q(cp.asarray(_field_data(m)), Nm)
     _, _, _, _, _, jcoag_indices, jcoag_indptr, jcoag_perm = _get_jcoag_pattern_cupy(Nr, Nm, q)
 
     dat, _, _ = _jacobian_coagulation_generator_cupy(
         A, cstick, eps, ilf, irm, istick, m, phi, Rf, Rs, SigD, SigDfloor
     )
+    if int(to_numpy(freeze_mask[1:-1].sum())) > 0:
+        dat_mid = dat.reshape(Nr - 2, -1)
+        dat_mid[freeze_mask[1:-1], :] = 0.0
     dat_csr = dat if jcoag_perm is None else dat[jcoag_perm]
     J_coag = cp_sparse.csr_matrix((dat_csr, jcoag_indices, jcoag_indptr), shape=(Ntot, Ntot))
 
     A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(
-        area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
+        area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, freeze_interface_mask=freeze_interface_mask
     )
     if zero_flux:
         A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(
@@ -4035,19 +4347,24 @@ def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
     zero_flux = is_zero_flux_enabled(sim)
     inner_outflow_only = is_dust_inner_outflow_only_enabled(sim)
     diode_block_mask = _inner_diode_block_mask(sim) if inner_outflow_only else None
+    freeze_mask = _gas_floor_freeze_mask(sim)
+    freeze_interface_mask = _gas_floor_freeze_interface_mask(sim)
 
     q = _get_mass_grid_q(cp.asarray(_field_data(m)), Nm)
     _, _, row, col, _, _, _, _ = _get_jcoag_pattern_cupy(Nr, Nm, q)
     dat_coag, _, _ = _jacobian_coagulation_generator_cupy(
         A, cstick, eps, ilf, irm, istick, m, phi, Rf, Rs, SigD, SigDfloor
     )
+    if int(to_numpy(freeze_mask[1:-1].sum())) > 0:
+        dat_coag_mid = dat_coag.reshape(Nr - 2, -1)
+        dat_coag_mid[freeze_mask[1:-1], :] = 0.0
     dtype = dat_coag.dtype
     J = cp.zeros((Ntot, Ntot), dtype=dtype)
     J_flat = J.ravel()
     _scatter_add_1d(J_flat, row * Ntot + col, dat_coag)
 
     A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(
-        area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
+        area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, freeze_interface_mask=freeze_interface_mask
     )
     if zero_flux:
         A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(
@@ -4637,6 +4954,9 @@ def _f_impl_1_direct_numpy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
 
     Y1 = Y1_ravel.reshape(Y0.shape)
 
+    if _maybe_retry_implicit_floor_injection(x0, Y0, dx, Y1):
+        return False
+
     return Y1 - Y0
 
 
@@ -4668,6 +4988,8 @@ def _f_impl_1_direct_cupy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
 
     Y1_ravel = solve_sparse_linear_system(A, rhs)
     Y1 = Y1_ravel.reshape(Y0.shape)
+    if _maybe_retry_implicit_floor_injection(x0, Y0, dx, Y1):
+        return False
     return Y1 - Y0
 
 
@@ -4691,6 +5013,8 @@ def _f_impl_1_direct_cupy_dense(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs)
     A = cp.eye(int(jac_dense.shape[0]), dtype=jac_dense.dtype) - dx * jac_dense
     Y1_ravel = cp.linalg.solve(A, rhs)
     Y1 = Y1_ravel.reshape(Y0.shape)
+    if _maybe_retry_implicit_floor_injection(x0, Y0, dx, Y1):
+        return False
     return Y1 - Y0
 
 

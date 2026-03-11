@@ -233,6 +233,8 @@ class Simulation(Frame):
         self.RL_count_cycle = 0
         self.RL_ncycle_out = 100
         self.RL_recent_dts = np.zeros(100)
+        self.RL_recent_wts = np.zeros(100)
+        self.RL_last_wall_s = None
 
     @property
     def backend(self):

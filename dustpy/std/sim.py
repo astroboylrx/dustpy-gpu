@@ -1,9 +1,59 @@
 '''Module containing standard functions for the main simulation object.'''
 
 import numpy as np
+import time
 
 from dustpy import std
 from simframe.backends.api import xp
+
+
+def _field_data(value):
+    return value._data if hasattr(value, "_data") else value
+
+
+def _to_numpy(value):
+    if hasattr(value, "get"):
+        return value.get()
+    if hasattr(xp, "to_numpy"):
+        return xp.to_numpy(value)
+    return np.asarray(value)
+
+
+def _ensure_rl_debug_state(sim):
+    if not hasattr(sim, "RL_recent_dts"):
+        sim.RL_recent_dts = np.zeros(100)
+    if not hasattr(sim, "RL_recent_wts"):
+        sim.RL_recent_wts = np.zeros(100)
+    if not hasattr(sim, "RL_last_wall_s"):
+        sim.RL_last_wall_s = None
+
+
+def _rl_debug_line(sim, dt_step):
+    _ensure_rl_debug_state(sim)
+    median_dt = float(np.median(sim.RL_recent_dts))
+    mean_dt = float(np.mean(sim.RL_recent_dts))
+    wt_100 = float(np.sum(sim.RL_recent_wts))
+    dust = getattr(sim, "dust", None)
+    nfloor_retry = 0
+    dM_san_mearth = 0.0
+    if dust is not None and hasattr(dust, "floor_retry"):
+        nfloor_retry = int(dust.floor_retry.count)
+    if dust is not None and hasattr(dust, "san"):
+        dM_san_mearth = float(dust.san.dM_total_mearth)
+    return (
+        f"[RL_debug]: cycle={sim.RL_count_cycle:9d}, t={sim.t/31557600.0:12.3f}yr, "
+        f"dt={dt_step/31557600.0:.4e}/{mean_dt/31557600.0:.4e}/{median_dt/31557600.0:.4e}yr, "
+        f"n_dt↘={nfloor_retry:6d}, dM_M⊕={dM_san_mearth:.4e}, wt={wt_100:.4e}"
+    )
+
+
+def _record_cycle_wall(sim):
+    _ensure_rl_debug_state(sim)
+    wall_now = time.perf_counter()
+    wall_prev = getattr(sim, "RL_last_wall_s", None)
+    if wall_prev is not None and sim.RL_count_cycle > 0:
+        sim.RL_recent_wts[(sim.RL_count_cycle - 1) % 100] = wall_now - wall_prev
+    sim.RL_last_wall_s = wall_now
 
 
 def dt_adaptive(sim):
@@ -36,6 +86,12 @@ def dt(sim):
     dt : float
         Time step"""
 
+    _record_cycle_wall(sim)
+
+    # Gas dt relies on retrospective operator diagnostics. Refresh them from the
+    # current coupled gas+dust state so the limiter does not read stale fields.
+    _refresh_coupled_gas_state(sim)
+
     dt_gas = std.gas.dt(sim)
     if dt_gas is None:
         dt_gas = 1.e100
@@ -48,20 +104,7 @@ def dt(sim):
     dt_step = sim.t.cfl * dt_host
 
     if sim.RL_count_cycle % sim.RL_ncycle_out == 0:
-        median_dt = float(np.median(sim.RL_recent_dts))
-        san = std.dust.sanitizer_report(sim)
-        san_extra = ""
-        if san.get("enabled", False):
-            san_extra = (
-                f", dM_san_Mearth={san['dM_total_mearth']:.6e}, "
-                f"nclip_last={san['n_clipped_last']:6d}"
-            )
-        print(
-            f"[RL_debug]: cycle={sim.RL_count_cycle:9d}, t={sim.t/31557600.0:12.3f}yr, "
-            f"dt={dt_host/31557600.0:12.6f}yr, <dt>={sim.RL_recent_dts.mean()/31557600.0:12.6f}yr, "
-            f"median_dt={median_dt/31557600.0:12.6f}yr"
-            f"{san_extra}"
-        )  #, M_pl={sim.planetesimals.M/5.972e27:12.4f}M_e")
+        print(_rl_debug_line(sim, dt_step))
     sim.RL_recent_dts[sim.RL_count_cycle % 100] = dt_step
     sim.RL_count_cycle += 1
     return dt_step
@@ -90,6 +133,18 @@ def prepare_implicit_dust(sim):
     std.dust.prepare(sim)
 
 
+def _refresh_coupled_gas_state(sim):
+    """Refresh dust-coupled gas operator fields after dust state changes."""
+    sim.dust.rho.update()
+    sim.dust.eps.update()
+    sim.dust.backreaction.update()
+    sim.gas.v.update()
+    sim.gas.Fi.update()
+    sim.gas.S.hyd.update()
+    sim.gas.S.tot.update()
+    std.gas.set_implicit_boundaries(sim)
+
+
 def finalize_explicit_dust(sim):
     """This function is the finalization function that is called
     after every integration step. It is managing the boundary
@@ -101,6 +156,7 @@ def finalize_explicit_dust(sim):
         Parent simulation frame"""
     std.gas.finalize(sim)
     std.dust.finalize_explicit(sim)
+    _refresh_coupled_gas_state(sim)
 
 
 def finalize_implicit_dust(sim):
@@ -114,3 +170,4 @@ def finalize_implicit_dust(sim):
         Parent simulation frame"""
     std.gas.finalize(sim)
     std.dust.finalize_implicit(sim)
+    _refresh_coupled_gas_state(sim)

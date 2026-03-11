@@ -1,5 +1,6 @@
 """Module containing standard functions for the gas."""
 
+import os
 import numpy as np
 import scipy.sparse as sp
 try:
@@ -37,6 +38,16 @@ def _field_data(value):
     return value._data if hasattr(value, "_data") else value
 
 
+def _env_float(name, default):
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
 def _interp_to_interfaces_1d_numpy(values, r, ri):
     values = _field_data(values)
     r = _field_data(r)
@@ -72,7 +83,69 @@ def _interp_to_interfaces_1d(values, r, ri):
     return _K_INTERP_TO_INTERFACES_1D(values, r, ri)
 
 
-def _jac_abc_cupy(area, nu, r, ri, v):
+def _load_gas_interface_floor_config():
+    raw = os.getenv("DUSTPY_GAS_ONE_SIDED_INTERFACE_FLOOR_RATIO")
+    try:
+        ratio = float(1.0e3 if raw is None else raw)
+    except Exception:
+        ratio = 1.0e3
+    if not np.isfinite(ratio):
+        ratio = 1.0e3
+    ratio = max(float(ratio), 0.0)
+    return {
+        "enabled": ratio > 0.0,
+        "ratio": ratio,
+    }
+
+
+def _gas_interface_floor_mask(sim, Sigma=None):
+    cfg = _GAS_INTERFACE_FLOOR_CONFIG
+    Sigma = _field_data(sim.gas.Sigma if Sigma is None else Sigma)
+    SigmaFloor = _field_data(sim.gas.SigmaFloor)
+    if not cfg.get("enabled", True):
+        return xp.zeros(Sigma.shape, dtype=bool)
+    ratio = float(cfg.get("ratio", 0.0))
+    if ratio <= 0.0:
+        return xp.zeros(Sigma.shape, dtype=bool)
+    return xp.asarray(Sigma <= ratio * SigmaFloor, dtype=bool)
+
+
+def _masked_interface_values_1d(values, r, ri, mask, zero_both_masked=False, zero_masked_boundaries=False):
+    values = _field_data(values)
+    r = _field_data(r)
+    ri = _field_data(ri)
+    mask_np = np.asarray(to_numpy(mask), dtype=bool)
+    vi = _interp_to_interfaces_1d(values, r, ri)
+    if vi.shape[0] < 2 or not np.any(mask_np):
+        return vi
+
+    values_np = np.asarray(to_numpy(values))
+    vi_np = np.asarray(to_numpy(vi))
+    Nr = int(values_np.shape[0])
+
+    for k in range(1, Nr):
+        left_bad = bool(mask_np[k - 1])
+        right_bad = bool(mask_np[k])
+        if left_bad and not right_bad:
+            vi_np[k] = values_np[k]
+        elif right_bad and not left_bad:
+            vi_np[k] = values_np[k - 1]
+        elif left_bad and right_bad and zero_both_masked:
+            vi_np[k] = 0.0
+
+    if zero_masked_boundaries:
+        vi_np[0] = 0.0 if bool(mask_np[0]) else values_np[0]
+        vi_np[-1] = 0.0 if bool(mask_np[-1]) else values_np[-1]
+    return to_backend(vi_np)
+
+
+def _one_sided_interface_velocity_1d(values, r, ri, mask):
+    return _masked_interface_values_1d(
+        values, r, ri, mask, zero_both_masked=True, zero_masked_boundaries=True
+    )
+
+
+def _jac_abc_cupy(area, nu, r, ri, v, freeze_mask=None):
     area = _field_data(area)
     nu = _field_data(nu)
     r = _field_data(r)
@@ -80,7 +153,10 @@ def _jac_abc_cupy(area, nu, r, ri, v):
     v = _field_data(v)
 
     Nr = int(r.shape[0])
-    vi = _interp_to_interfaces_1d(v, r, ri)
+    if freeze_mask is None:
+        vi = _interp_to_interfaces_1d(v, r, ri)
+    else:
+        vi = _one_sided_interface_velocity_1d(v, r, ri, freeze_mask)
     vim = xp.minimum(vi, 0.0)
     vip = xp.maximum(vi, 0.0)
 
@@ -282,6 +358,10 @@ _CSR_HOST_META_KEY = None
 _CSR_HOST_META_VALUE = None
 _GAS_JAC_PATTERN_KEY = None
 _GAS_JAC_PATTERN_VALUE = None
+_GAS_INTERFACE_FLOOR_CONFIG = {
+    "enabled": True,
+    "ratio": 1.0e3,
+}
 _RUNTIME_STATES = {}
 _ACTIVE_RUNTIME_TOKEN = None
 
@@ -311,6 +391,7 @@ _RUNTIME_STATE_VARS = (
     "_CSR_HOST_META_VALUE",
     "_GAS_JAC_PATTERN_KEY",
     "_GAS_JAC_PATTERN_VALUE",
+    "_GAS_INTERFACE_FLOOR_CONFIG",
 )
 
 
@@ -341,6 +422,10 @@ def _fresh_runtime_state():
         "_CSR_HOST_META_VALUE": None,
         "_GAS_JAC_PATTERN_KEY": None,
         "_GAS_JAC_PATTERN_VALUE": None,
+        "_GAS_INTERFACE_FLOOR_CONFIG": {
+            "enabled": True,
+            "ratio": 1.0e3,
+        },
     }
 
 
@@ -394,7 +479,14 @@ def _cs_isothermal_cupy(sim):
 
 
 def _eta_midplane_fortran(sim):
-    return _gas_f_call(gas_f.eta_midplane, sim.gas.Hp, sim.gas.P, sim.grid.r, sim.grid.ri)
+    Hp = _field_data(sim.gas.Hp)
+    P = _field_data(sim.gas.P)
+    r = _field_data(sim.grid.r)
+    ri = _field_data(sim.grid.ri)
+    mask = _gas_interface_floor_mask(sim, Sigma=sim.gas.Sigma)
+    Pi = _masked_interface_values_1d(P, r, ri, mask)
+    grad = (Pi[1:] - Pi[:-1]) / (ri[1:] - ri[:-1])
+    return -0.5 * Hp**2 / (r * P) * grad
 
 
 def _eta_midplane_cupy(sim):
@@ -402,13 +494,34 @@ def _eta_midplane_cupy(sim):
     P = _field_data(sim.gas.P)
     r = _field_data(sim.grid.r)
     ri = _field_data(sim.grid.ri)
-    Pi = _interp_to_interfaces_1d(P, r, ri)
+    mask = _gas_interface_floor_mask(sim, Sigma=sim.gas.Sigma)
+    Pi = _masked_interface_values_1d(P, r, ri, mask)
     grad = (Pi[1:] - Pi[:-1]) / (ri[1:] - ri[:-1])
     return -0.5 * Hp**2 / (r * P) * grad
 
 
 def _fi_fortran(sim):
-    return _gas_f_call(gas_f.fi, sim.gas.Sigma, sim.gas.v.rad, sim.grid.r, sim.grid.ri)
+    Sigma = _field_data(sim.gas.Sigma)
+    v = _field_data(sim.gas.v.rad)
+    r = _field_data(sim.grid.r)
+    ri = _field_data(sim.grid.ri)
+    Nr = int(sim.grid.Nr)
+    mask = _gas_interface_floor_mask(sim, Sigma=Sigma)
+
+    vi = _one_sided_interface_velocity_1d(v, r, ri, mask)
+    vip = xp.maximum(vi, 0.0)
+    vim = xp.minimum(vi, 0.0)
+    vip[0] = 0.0
+    vim[-1] = 0.0
+
+    Fi = xp.zeros((Nr + 1,), dtype=Sigma.dtype)
+    Fi[1:-1] = Sigma[:-1] * vip[1:-1] + Sigma[1:] * vim[1:-1]
+    Fi[0] = Sigma[0] * vim[0]
+    Fi[-1] = Sigma[-1] * vip[-1]
+    if is_zero_flux_enabled(sim):
+        Fi[0] = 0.0
+        Fi[-1] = 0.0
+    return Fi
 
 
 def _fi_cupy(sim):
@@ -417,10 +530,9 @@ def _fi_cupy(sim):
     r = _field_data(sim.grid.r)
     ri = _field_data(sim.grid.ri)
     Nr = int(sim.grid.Nr)
+    mask = _gas_interface_floor_mask(sim, Sigma=Sigma)
 
-    vi = _interp_to_interfaces_1d(v, r, ri)
-    vi[0] = v[0]
-    vi[-1] = v[-1]
+    vi = _one_sided_interface_velocity_1d(v, r, ri, mask)
 
     vip = xp.maximum(vi, 0.0)
     vim = xp.minimum(vi, 0.0)
@@ -537,7 +649,22 @@ def _vrad_cupy(sim):
 
 
 def _vvisc_fortran(sim):
-    return _gas_f_call(gas_f.v_visc, sim.gas.Sigma, sim.gas.nu, sim.grid.r, sim.grid.ri)
+    Sigma = _field_data(sim.gas.Sigma)
+    nu = _field_data(sim.gas.nu)
+    r = _field_data(sim.grid.r)
+    ri = _field_data(sim.grid.ri)
+    Nr = int(sim.grid.Nr)
+    mask = _gas_interface_floor_mask(sim, Sigma=Sigma)
+
+    arg = Sigma * nu * xp.sqrt(r)
+    argi = _masked_interface_values_1d(arg, r, ri, mask)
+    grad = (argi[1:] - argi[:-1]) / (ri[1:] - ri[:-1])
+
+    vvisc = -3.0 * grad / (Sigma * xp.sqrt(r))
+    if Nr >= 3:
+        vvisc[0] = (vvisc[2] - vvisc[1]) * (r[0] - r[1]) / (r[2] - r[1]) + vvisc[1]
+        vvisc[-1] = (vvisc[-2] - vvisc[-3]) * (r[-1] - r[-3]) / (r[-2] - r[-3]) + vvisc[-3]
+    return vvisc
 
 
 def _vvisc_cupy(sim):
@@ -546,9 +673,10 @@ def _vvisc_cupy(sim):
     r = _field_data(sim.grid.r)
     ri = _field_data(sim.grid.ri)
     Nr = int(sim.grid.Nr)
+    mask = _gas_interface_floor_mask(sim, Sigma=Sigma)
 
     arg = Sigma * nu * xp.sqrt(r)
-    argi = _interp_to_interfaces_1d(arg, r, ri)
+    argi = _masked_interface_values_1d(arg, r, ri, mask)
     grad = (argi[1:] - argi[:-1]) / (ri[1:] - ri[:-1])
 
     vvisc = -3.0 * grad / (Sigma * xp.sqrt(r))
@@ -597,11 +725,17 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     global _K_N, _K_P, _K_RHO, _K_S_HYD, _K_TIMESTEP, _K_VRAD, _K_VVISC
     global _K_IMPLICIT_BOUNDARIES, _K_MFP, _K_NU, _K_S_TOT, _K_T_PASS, _K_IMPL_1_DIRECT, _K_INTERP_TO_INTERFACES_1D
     global _K_JACOBIAN, _CSR_HOST_META_KEY, _CSR_HOST_META_VALUE
-    global _GAS_JAC_PATTERN_KEY, _GAS_JAC_PATTERN_VALUE
+    global _GAS_JAC_PATTERN_KEY, _GAS_JAC_PATTERN_VALUE, _GAS_INTERFACE_FLOOR_CONFIG
 
     _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
-    if (not force) and backend == _BOUND_BACKEND and _K_FI is not None:
+    gas_interface_floor_cfg = _load_gas_interface_floor_config()
+    if (
+        (not force)
+        and backend == _BOUND_BACKEND
+        and _K_FI is not None
+        and gas_interface_floor_cfg == _GAS_INTERFACE_FLOOR_CONFIG
+    ):
         return
 
     bind_gas_sparse_solver(backend=backend, force=force, runtime_token=runtime_token)
@@ -631,6 +765,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     _CSR_HOST_META_VALUE = None
     _GAS_JAC_PATTERN_KEY = None
     _GAS_JAC_PATTERN_VALUE = None
+    _GAS_INTERFACE_FLOOR_CONFIG = gas_interface_floor_cfg
     _BOUND_BACKEND = backend
     if runtime_token is not None:
         _RUNTIME_STATES[runtime_token] = _capture_runtime_state()
@@ -808,8 +943,9 @@ def _jacobian_numpy(sim, x, *args, **kwargs):
     area = sim.grid.A
     Nr = int(sim.grid.Nr)
     zero_flux = is_zero_flux_enabled(sim)
+    freeze_mask = _gas_interface_floor_mask(sim)
 
-    A, B, C = _gas_f_call(gas_f.jac_abc, area, nu, r, ri, v, to_backend_result=False)
+    A, B, C = _jac_abc_cupy(area, nu, r, ri, v, freeze_mask=freeze_mask)
     if zero_flux:
         A, B, C = _apply_zero_flux_gas_edges_numpy(A, B, C, area, nu, r, ri, v)
     sim.gas._rhs[:] = sim.gas.Sigma
@@ -830,8 +966,9 @@ def _jacobian_cupy(sim, x, *args, **kwargs):
     area = sim.grid.A
     Nr = int(sim.grid.Nr)
     zero_flux = is_zero_flux_enabled(sim)
+    freeze_mask = _gas_interface_floor_mask(sim)
 
-    A, B, C = _jac_abc_cupy(area, nu, r, ri, v)
+    A, B, C = _jac_abc_cupy(area, nu, r, ri, v, freeze_mask=freeze_mask)
     if zero_flux:
         A, B, C = _apply_zero_flux_gas_edges_cupy(A, B, C, area, nu, r, ri, v)
     sim.gas._rhs[:] = sim.gas.Sigma
