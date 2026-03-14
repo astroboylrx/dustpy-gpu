@@ -1,5 +1,6 @@
 '''Module containing standard functions for the main simulation object.'''
 
+import os
 import numpy as np
 import time
 
@@ -17,6 +18,25 @@ def _to_numpy(value):
     if hasattr(xp, "to_numpy"):
         return xp.to_numpy(value)
     return np.asarray(value)
+
+
+def _env_bool(name, default=False):
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    raw = raw.strip().lower()
+    if raw in ("1", "true", "on", "yes"):
+        return True
+    if raw in ("0", "false", "off", "no"):
+        return False
+    return bool(default)
+
+
+_DT_GAS_REFRESH_ENABLED = _env_bool("DUSTPY_DT_GAS_REFRESH_ENABLE", default=False)
+
+
+def is_dt_gas_refresh_enabled():
+    return _DT_GAS_REFRESH_ENABLED
 
 
 def _ensure_rl_debug_state(sim):
@@ -90,7 +110,8 @@ def dt(sim):
 
     # Gas dt relies on retrospective operator diagnostics. Refresh them from the
     # current coupled gas+dust state so the limiter does not read stale fields.
-    _refresh_coupled_gas_state(sim)
+    if _DT_GAS_REFRESH_ENABLED:
+        _refresh_coupled_gas_state(sim)
 
     dt_gas = std.gas.dt(sim)
     if dt_gas is None:
@@ -156,7 +177,6 @@ def finalize_explicit_dust(sim):
         Parent simulation frame"""
     std.gas.finalize(sim)
     std.dust.finalize_explicit(sim)
-    _refresh_coupled_gas_state(sim)
 
 
 def finalize_implicit_dust(sim):
@@ -170,4 +190,3 @@ def finalize_implicit_dust(sim):
         Parent simulation frame"""
     std.gas.finalize(sim)
     std.dust.finalize_implicit(sim)
-    _refresh_coupled_gas_state(sim)

@@ -896,9 +896,9 @@ def _load_sanitizer_config():
 
 
 def _load_gas_floor_freeze_config():
-    ratio = _env_float("DUSTPY_GAS_FLOOR_FREEZE_RATIO", 1.0e3)
+    ratio = _env_float("DUSTPY_GAS_FLOOR_FREEZE_RATIO", 0.0)
     if not np.isfinite(ratio):
-        ratio = 1.0e3
+        ratio = 0.0
     ratio = max(float(ratio), 0.0)
     return {
         "enabled": ratio > 0.0,
@@ -919,7 +919,7 @@ def _load_implicit_floor_retry_config():
     if not np.isfinite(max_retries):
         max_retries = 8.0
     max_retries = max(0, int(max_retries))
-    enabled = _env_bool("DUSTPY_IMPLICIT_FLOOR_RETRY_ENABLE", default=True) and threshold > 0.0
+    enabled = _env_bool("DUSTPY_IMPLICIT_FLOOR_RETRY_ENABLE", default=False) and threshold > 0.0
     return {
         "enabled": enabled,
         "threshold_mearth": threshold,
