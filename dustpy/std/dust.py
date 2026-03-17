@@ -156,11 +156,15 @@ _GAS_FLOOR_FREEZE_CONFIG = {
     "enabled": True,
     "ratio": 1.0e3,
 }
+_DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG = {
+    "enabled": False,
+    "ratio": 1.0,
+}
 _IMPLICIT_FLOOR_RETRY_CONFIG = {
     "enabled": True,
     "threshold_mearth": 1.0e-6,
     "shrink": 0.5,
-    "max_retries": 8,
+    "max_retries": 4,
 }
 _RUNTIME_STATES = {}
 _ACTIVE_RUNTIME_TOKEN = None
@@ -246,6 +250,7 @@ _RUNTIME_STATE_VARS = (
     "_JCOAG_CHUNK_SIZE_OVERRIDE",
     "_SANITIZER_CONFIG",
     "_GAS_FLOOR_FREEZE_CONFIG",
+    "_DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG",
     "_IMPLICIT_FLOOR_RETRY_CONFIG",
 )
 
@@ -330,6 +335,10 @@ def _fresh_runtime_state():
         "_GAS_FLOOR_FREEZE_CONFIG": {
             "enabled": True,
             "ratio": 1.0e3,
+        },
+        "_DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG": {
+            "enabled": False,
+            "ratio": 1.0,
         },
         "_IMPLICIT_FLOOR_RETRY_CONFIG": {
             "enabled": True,
@@ -906,6 +915,18 @@ def _load_gas_floor_freeze_config():
     }
 
 
+def _load_dust_transport_inactive_floor_config():
+    ratio = _env_float("DUSTPY_DUST_TRANSPORT_INACTIVE_FLOOR_RATIO", 1.0)
+    if not np.isfinite(ratio):
+        ratio = 1.0
+    ratio = max(float(ratio), 0.0)
+    enabled = _env_bool("DUSTPY_DUST_TRANSPORT_INACTIVE_FLOOR_ENABLE", default=False) and ratio > 0.0
+    return {
+        "enabled": enabled,
+        "ratio": ratio,
+    }
+
+
 def _load_implicit_floor_retry_config():
     shrink = _env_float("DUSTPY_IMPLICIT_FLOOR_RETRY_SHRINK", 0.5)
     if not np.isfinite(shrink):
@@ -915,9 +936,9 @@ def _load_implicit_floor_retry_config():
     if not np.isfinite(threshold):
         threshold = 1.0e-6
     threshold = max(float(threshold), 0.0)
-    max_retries = _env_float("DUSTPY_IMPLICIT_FLOOR_RETRY_MAX_RETRIES", 8.0)
+    max_retries = _env_float("DUSTPY_IMPLICIT_FLOOR_RETRY_MAX_RETRIES", 4.0)
     if not np.isfinite(max_retries):
-        max_retries = 8.0
+        max_retries = 4.0
     max_retries = max(0, int(max_retries))
     enabled = _env_bool("DUSTPY_IMPLICIT_FLOOR_RETRY_ENABLE", default=False) and threshold > 0.0
     return {
@@ -950,6 +971,83 @@ def _gas_floor_freeze_interface_mask(sim, SigmaGas=None):
     iface_mask[:-1] = iface_mask[:-1] | radial_mask
     iface_mask[1:] = iface_mask[1:] | radial_mask
     return iface_mask
+
+
+def _dust_transport_inactive_mask_from_arrays(SigmaDust, SigmaDustFloor):
+    cfg = _DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG
+    if not cfg.get("enabled", False):
+        return xp.zeros(SigmaDust.shape, dtype=bool)
+    ratio = float(cfg.get("ratio", 0.0))
+    if ratio <= 0.0:
+        return xp.zeros(SigmaDust.shape, dtype=bool)
+    return xp.asarray(SigmaDust <= ratio * SigmaDustFloor, dtype=bool)
+
+
+def _dust_transport_inactive_mask(sim, SigmaDust=None):
+    SigmaDust = _field_data(sim.dust.Sigma if SigmaDust is None else SigmaDust)
+    SigmaDustFloor = _field_data(sim.dust.SigmaFloor)
+    return _dust_transport_inactive_mask_from_arrays(SigmaDust, SigmaDustFloor)
+
+
+def _interface_drain_mask_from_flux(Fi, inactive):
+    Fi = _field_data(Fi)
+    inactive = xp.asarray(inactive, dtype=bool)
+    iface_mask = xp.zeros(Fi.shape, dtype=bool)
+    if Fi.shape[0] != inactive.shape[0] + 1 or Fi.shape[1] != inactive.shape[1]:
+        return iface_mask
+    iface_mask[1:-1, :] = (
+        ((Fi[1:-1, :] > 0.0) & inactive[:-1, :])
+        | ((Fi[1:-1, :] < 0.0) & inactive[1:, :])
+    )
+    iface_mask[0, :] = (Fi[0, :] < 0.0) & inactive[0, :]
+    iface_mask[-1, :] = (Fi[-1, :] > 0.0) & inactive[-1, :]
+    return iface_mask
+
+
+def _dust_transport_drain_interface_mask(sim, SigmaDust=None, Fi_adv=None, Fi_diff=None):
+    inactive = _dust_transport_inactive_mask(sim, SigmaDust=SigmaDust)
+    if int(to_numpy(inactive.sum())) == 0:
+        nr = int(inactive.shape[0]) + 1
+        nm = int(inactive.shape[1])
+        return xp.zeros((nr, nm), dtype=bool)
+    iface_mask = xp.zeros((int(inactive.shape[0]) + 1, int(inactive.shape[1])), dtype=bool)
+    if Fi_adv is not None:
+        iface_mask |= _interface_drain_mask_from_flux(Fi_adv, inactive)
+    if Fi_diff is not None:
+        iface_mask |= _interface_drain_mask_from_flux(Fi_diff, inactive)
+    return iface_mask
+
+
+def _transport_velocity_freeze_interface_mask(sim, SigmaDust=None, SigmaGas=None, Fi_adv=None):
+    gas_mask = _gas_floor_freeze_interface_mask(sim, SigmaGas=SigmaGas)[:, None]
+    dust_mask = _dust_transport_drain_interface_mask(
+        sim,
+        SigmaDust=SigmaDust,
+        Fi_adv=Fi_adv,
+        Fi_diff=None,
+    )
+    return gas_mask | dust_mask
+
+
+def _transport_diffusion_freeze_interface_mask(sim, SigmaDust=None, SigmaGas=None):
+    gas_mask = _gas_floor_freeze_interface_mask(sim, SigmaGas=SigmaGas)[:, None]
+    return gas_mask
+
+
+def _inner_boundary_advective_drain_mask(sim, SigmaDust=None, Fi_adv=None):
+    inactive = _dust_transport_inactive_mask(sim, SigmaDust=SigmaDust)
+    if inactive.ndim != 2 or inactive.shape[0] == 0:
+        return None
+    inner_inactive = xp.asarray(inactive[0, :], dtype=bool)
+    if int(to_numpy(inner_inactive.sum())) == 0:
+        return None
+    if Fi_adv is not None:
+        fi_adv = _field_data(Fi_adv)
+        if fi_adv.shape[0] > 1:
+            adv_mask = inner_inactive & xp.asarray(fi_adv[1, :] > 0.0, dtype=bool)
+            if int(to_numpy(adv_mask.sum())) > 0:
+                return adv_mask
+    return None
 
 
 def _apply_gas_floor_freeze_to_radial_field(sim, arr, SigmaGas=None):
@@ -1331,6 +1429,7 @@ def _F_diff_cupy(sim, Sigma=None):
     if _F_DIFF_MODE == "elementwise":
         Fi = _F_diff_cupy_elementwise(D, SigmaD, SigmaG, St, u, r, ri)
         if Fi is not None:
+            _apply_gas_floor_freeze_to_flux(sim, Fi)
             return Fi
 
     SigGi = _interp_to_interfaces(SigmaG, r, ri)
@@ -2418,7 +2517,16 @@ def _jacobian_coagulation_generator_cupy(
     return dat_gpu, row, col
 
 
-def _jacobian_hydrodynamic_generator_numpy(area, D, r, ri, SigmaGas, v, freeze_interface_mask=None):
+def _jacobian_hydrodynamic_generator_numpy(
+    area,
+    D,
+    r,
+    ri,
+    SigmaGas,
+    v,
+    freeze_velocity_mask=None,
+    freeze_diffusion_mask=None,
+):
     """NumPy equivalent of dust_f.jacobian_hydrodynamic_generator with optional interface freeze."""
     area = np.asarray(_field_data(area))
     D = np.asarray(_field_data(D))
@@ -2435,11 +2543,18 @@ def _jacobian_hydrodynamic_generator_numpy(area, D, r, ri, SigmaGas, v, freeze_i
     vi = np.asarray(_interp_to_interfaces_numpy(v, r, ri))
     Di = np.asarray(_interp_to_interfaces_numpy(D, r, ri))
 
-    if freeze_interface_mask is not None:
-        freeze_interface_mask = np.asarray(to_numpy(freeze_interface_mask), dtype=bool)
-        if freeze_interface_mask.ndim == 1 and freeze_interface_mask.size == vi.shape[0] and np.any(freeze_interface_mask):
-            vi[freeze_interface_mask, :] = 0.0
-            Di[freeze_interface_mask, :] = 0.0
+    if freeze_velocity_mask is not None:
+        freeze_velocity_mask = np.asarray(to_numpy(freeze_velocity_mask), dtype=bool)
+        if freeze_velocity_mask.ndim == 1 and freeze_velocity_mask.size == vi.shape[0] and np.any(freeze_velocity_mask):
+            vi[freeze_velocity_mask, :] = 0.0
+        elif freeze_velocity_mask.shape == vi.shape and np.any(freeze_velocity_mask):
+            vi[freeze_velocity_mask] = 0.0
+    if freeze_diffusion_mask is not None:
+        freeze_diffusion_mask = np.asarray(to_numpy(freeze_diffusion_mask), dtype=bool)
+        if freeze_diffusion_mask.ndim == 1 and freeze_diffusion_mask.size == Di.shape[0] and np.any(freeze_diffusion_mask):
+            Di[freeze_diffusion_mask, :] = 0.0
+        elif freeze_diffusion_mask.shape == Di.shape and np.any(freeze_diffusion_mask):
+            Di[freeze_diffusion_mask] = 0.0
 
     vim = np.minimum(vi, 0.0)
     vip = np.maximum(vi, 0.0)
@@ -2470,7 +2585,16 @@ def _jacobian_hydrodynamic_generator_numpy(area, D, r, ri, SigmaGas, v, freeze_i
     return A, B, C
 
 
-def _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v, freeze_interface_mask=None):
+def _jacobian_hydrodynamic_generator_cupy(
+    area,
+    D,
+    r,
+    ri,
+    SigmaGas,
+    v,
+    freeze_velocity_mask=None,
+    freeze_diffusion_mask=None,
+):
     """CuPy-native equivalent of dust_f.jacobian_hydrodynamic_generator."""
     area = _field_data(area)
     D = _field_data(D)
@@ -2487,11 +2611,20 @@ def _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v, freeze_in
     vi = _interp_to_interfaces(v, r, ri)
     Di = _interp_to_interfaces(D, r, ri)
 
-    if freeze_interface_mask is not None:
-        freeze_interface_mask = xp.asarray(freeze_interface_mask, dtype=bool)
-        if int(to_numpy(freeze_interface_mask.sum())) > 0:
-            vi[freeze_interface_mask, :] = 0.0
-            Di[freeze_interface_mask, :] = 0.0
+    if freeze_velocity_mask is not None:
+        freeze_velocity_mask = xp.asarray(freeze_velocity_mask, dtype=bool)
+        if int(to_numpy(freeze_velocity_mask.sum())) > 0:
+            if freeze_velocity_mask.ndim == 1 and int(freeze_velocity_mask.shape[0]) == int(vi.shape[0]):
+                vi[freeze_velocity_mask, :] = 0.0
+            elif freeze_velocity_mask.shape == vi.shape:
+                vi[freeze_velocity_mask] = 0.0
+    if freeze_diffusion_mask is not None:
+        freeze_diffusion_mask = xp.asarray(freeze_diffusion_mask, dtype=bool)
+        if int(to_numpy(freeze_diffusion_mask.sum())) > 0:
+            if freeze_diffusion_mask.ndim == 1 and int(freeze_diffusion_mask.shape[0]) == int(Di.shape[0]):
+                Di[freeze_diffusion_mask, :] = 0.0
+            elif freeze_diffusion_mask.shape == Di.shape:
+                Di[freeze_diffusion_mask] = 0.0
 
     vim = xp.minimum(vi, 0.0)
     vip = xp.maximum(vi, 0.0)
@@ -2573,7 +2706,20 @@ def _apply_zero_flux_dust_hyd_edges_numpy(A, B, C, area, D, r, ri, SigmaGas, v):
     return A, B, C
 
 
-def _apply_inner_zero_flux_dust_hyd_edge_numpy(A, B, C, area, D, r, ri, SigmaGas, v, block_mask):
+def _apply_inner_zero_flux_dust_hyd_edge_numpy(
+    A,
+    B,
+    C,
+    area,
+    D,
+    r,
+    ri,
+    SigmaGas,
+    v,
+    block_mask,
+    adv_drain_mask=None,
+    diff_drain_mask=None,
+):
     """Inject conservative zero-flux row at the inner edge only for selected mass bins."""
     Nr = int(A.shape[0])
     if Nr < 2:
@@ -2602,13 +2748,24 @@ def _apply_inner_zero_flux_dust_hyd_edge_numpy(A, B, C, area, D, r, ri, SigmaGas
     if block_mask.ndim != 1 or block_mask.size != B.shape[1] or not np.any(block_mask):
         return A, B, C
 
+    vip1 = vip[1, :].copy()
+    di1 = Di[1, :].copy()
+    if adv_drain_mask is not None:
+        adv_drain_mask = np.asarray(to_numpy(adv_drain_mask), dtype=bool)
+        if adv_drain_mask.ndim == 1 and adv_drain_mask.size == B.shape[1]:
+            vip1[adv_drain_mask] = 0.0
+    if diff_drain_mask is not None:
+        diff_drain_mask = np.asarray(to_numpy(diff_drain_mask), dtype=bool)
+        if diff_drain_mask.ndim == 1 and diff_drain_mask.size == B.shape[1]:
+            di1[diff_drain_mask] = 0.0
+
     b0 = (
-        -vip[1, :] * r[0]
-        - Di[1, :] * hi[1] / (w_in * h0) * r[0]
+        -vip1 * r[0]
+        - di1 * hi[1] / (w_in * h0) * r[0]
     ) * Vinv[0]
     c0 = (
         -vim[1, :] * r[1]
-        + Di[1, :] * hi[1] / (w_in * h1) * r[1]
+        + di1 * hi[1] / (w_in * h1) * r[1]
     ) * Vinv[0]
     A[0, block_mask] = 0.0
     B[0, block_mask] = b0[block_mask]
@@ -2666,7 +2823,20 @@ def _apply_zero_flux_dust_hyd_edges_cupy(A, B, C, area, D, r, ri, SigmaGas, v):
     return A, B, C
 
 
-def _apply_inner_zero_flux_dust_hyd_edge_cupy(A, B, C, area, D, r, ri, SigmaGas, v, block_mask):
+def _apply_inner_zero_flux_dust_hyd_edge_cupy(
+    A,
+    B,
+    C,
+    area,
+    D,
+    r,
+    ri,
+    SigmaGas,
+    v,
+    block_mask,
+    adv_drain_mask=None,
+    diff_drain_mask=None,
+):
     """Inject conservative zero-flux row at the inner edge only for selected mass bins."""
     Nr = int(A.shape[0])
     if Nr < 2:
@@ -2697,13 +2867,24 @@ def _apply_inner_zero_flux_dust_hyd_edge_cupy(A, B, C, area, D, r, ri, SigmaGas,
     if int(to_numpy(block_mask.sum())) == 0:
         return A, B, C
 
+    vip1 = vip[1, :].copy()
+    di1 = Di[1, :].copy()
+    if adv_drain_mask is not None:
+        adv_drain_mask = xp.asarray(adv_drain_mask, dtype=bool)
+        if int(to_numpy(adv_drain_mask.sum())) > 0:
+            vip1[adv_drain_mask] = 0.0
+    if diff_drain_mask is not None:
+        diff_drain_mask = xp.asarray(diff_drain_mask, dtype=bool)
+        if int(to_numpy(diff_drain_mask.sum())) > 0:
+            di1[diff_drain_mask] = 0.0
+
     b0 = (
-        -vip[1, :] * r[0]
-        - Di[1, :] * hi[1] / (w_in * h0) * r[0]
+        -vip1 * r[0]
+        - di1 * hi[1] / (w_in * h0) * r[0]
     ) * Vinv[0]
     c0 = (
         -vim[1, :] * r[1]
-        + Di[1, :] * hi[1] / (w_in * h1) * r[1]
+        + di1 * hi[1] / (w_in * h1) * r[1]
     ) * Vinv[0]
     A0 = A[0, :]
     B0 = B[0, :]
@@ -2718,11 +2899,35 @@ def _inner_diode_block_mask(sim):
     """Return per-mass-bin mask for inner-edge outward drift (potential artificial feed)."""
     if not is_dust_inner_outflow_only_enabled(sim):
         return None
+    block = None
     try:
         v0 = _field_data(sim.dust.v.rad)[0, :]
-        return v0 > 0.0
+        block = xp.asarray(v0 > 0.0, dtype=bool)
     except Exception:
-        return None
+        block = None
+    inactive = None
+    try:
+        inactive = _dust_transport_inactive_mask(sim)[0, :]
+        inactive = xp.asarray(inactive, dtype=bool)
+    except Exception:
+        inactive = None
+    floor_mask = None
+    negative_vb_mask = None
+    try:
+        _refresh_dust_boundary_views(sim)
+        inner = getattr(sim.dust.boundary, "inner", None)
+        if inner is not None:
+            vb = inner._getboundary()
+            if vb is not None:
+                negative_vb_mask = xp.asarray(vb < 0.0, dtype=bool)
+    except Exception:
+        negative_vb_mask = None
+    merged = None
+    for mask in (block, inactive, floor_mask, negative_vb_mask):
+        if mask is None:
+            continue
+        merged = mask if merged is None else (merged | mask)
+    return merged
 
 
 def _refresh_dust_boundary_views(sim):
@@ -3273,7 +3478,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     global _JCOAG_GEN_MODE, _S_COAG_MODE, _F_DIFF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE
     global _VREL_TURB_MODE, _VREL_TOT_MODE, _P_FRAG_MODE, _COLLISION_KERNEL_MODE
     global _CUPY_A_BUILD_MODE, _CUPY_DIAG_POS_CACHE_KEY, _CUPY_DIAG_POS_CACHE_VALUE
-    global _JCOAG_CHUNK_SIZE_OVERRIDE, _SANITIZER_CONFIG, _GAS_FLOOR_FREEZE_CONFIG, _IMPLICIT_FLOOR_RETRY_CONFIG
+    global _JCOAG_CHUNK_SIZE_OVERRIDE, _SANITIZER_CONFIG, _GAS_FLOOR_FREEZE_CONFIG, _DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG, _IMPLICIT_FLOOR_RETRY_CONFIG
 
     _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
@@ -3326,6 +3531,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     cupy_dust_solver_mode = _get_cupy_dust_solver_mode() if backend == "cupy" else "sparse"
     sanitizer_cfg = _load_sanitizer_config()
     gas_floor_freeze_cfg = _load_gas_floor_freeze_config()
+    dust_transport_inactive_floor_cfg = _load_dust_transport_inactive_floor_config()
     implicit_floor_retry_cfg = _load_implicit_floor_retry_config()
     if (
         (not force)
@@ -3344,6 +3550,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
         and jcoag_chunk_size_override == _JCOAG_CHUNK_SIZE_OVERRIDE
         and sanitizer_cfg == _SANITIZER_CONFIG
         and gas_floor_freeze_cfg == _GAS_FLOOR_FREEZE_CONFIG
+        and dust_transport_inactive_floor_cfg == _DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG
         and implicit_floor_retry_cfg == _IMPLICIT_FLOOR_RETRY_CONFIG
     ):
         return
@@ -3391,6 +3598,7 @@ def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     _JCOAG_CHUNK_SIZE_OVERRIDE = jcoag_chunk_size_override
     _SANITIZER_CONFIG = sanitizer_cfg
     _GAS_FLOOR_FREEZE_CONFIG = gas_floor_freeze_cfg
+    _DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG = dust_transport_inactive_floor_cfg
     _IMPLICIT_FLOOR_RETRY_CONFIG = implicit_floor_retry_cfg
 
     _KERNEL_LOWER_MASK = None
@@ -3973,8 +4181,33 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
     zero_flux = is_zero_flux_enabled(sim)
     inner_outflow_only = is_dust_inner_outflow_only_enabled(sim)
     diode_block_mask = _inner_diode_block_mask(sim) if inner_outflow_only else None
+    inner_adv_drain_mask = None
+    if inner_outflow_only:
+        inner_adv_drain_mask = _inner_boundary_advective_drain_mask(
+            sim,
+            SigmaDust=sim.dust.Sigma,
+            Fi_adv=sim.dust.Fi.adv,
+        )
     freeze_mask = np.asarray(to_numpy(_gas_floor_freeze_mask(sim)), dtype=bool)
-    freeze_interface_mask = np.asarray(to_numpy(_gas_floor_freeze_interface_mask(sim)), dtype=bool)
+    freeze_velocity_mask = np.asarray(
+        to_numpy(
+            _transport_velocity_freeze_interface_mask(
+                sim,
+                SigmaDust=sim.dust.Sigma,
+                Fi_adv=sim.dust.Fi.adv,
+            )
+        ),
+        dtype=bool,
+    )
+    freeze_diffusion_mask = np.asarray(
+        to_numpy(
+            _transport_diffusion_freeze_interface_mask(
+                sim,
+                SigmaDust=sim.dust.Sigma,
+            )
+        ),
+        dtype=bool,
+    )
 
     # Building coagulation Jacobian
 
@@ -3997,7 +4230,7 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
         shape=(Ntot, Ntot)
     )
 
-    if np.any(freeze_interface_mask):
+    if np.any(freeze_velocity_mask) or np.any(freeze_diffusion_mask):
         A_h, B_h, C_h = _jacobian_hydrodynamic_generator_numpy(
             area,
             sim.dust.D,
@@ -4005,7 +4238,8 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
             ri,
             sim.gas.Sigma,
             sim.dust.v.rad,
-            freeze_interface_mask=freeze_interface_mask,
+            freeze_velocity_mask=freeze_velocity_mask,
+            freeze_diffusion_mask=freeze_diffusion_mask,
         )
     else:
         A_h, B_h, C_h = _dust_f_call(
@@ -4024,7 +4258,17 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
         )
     elif diode_block_mask is not None and np.any(to_numpy(diode_block_mask)):
         A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_numpy(
-            A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, diode_block_mask
+            A_h,
+            B_h,
+            C_h,
+            area,
+            sim.dust.D,
+            r,
+            ri,
+            sim.gas.Sigma,
+            sim.dust.v.rad,
+            diode_block_mask,
+            adv_drain_mask=inner_adv_drain_mask,
         )
     J_hyd = sp.diags(
         (A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]),
@@ -4192,8 +4436,23 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     zero_flux = is_zero_flux_enabled(sim)
     inner_outflow_only = is_dust_inner_outflow_only_enabled(sim)
     diode_block_mask = _inner_diode_block_mask(sim) if inner_outflow_only else None
+    inner_adv_drain_mask = None
+    if inner_outflow_only:
+        inner_adv_drain_mask = _inner_boundary_advective_drain_mask(
+            sim,
+            SigmaDust=sim.dust.Sigma,
+            Fi_adv=sim.dust.Fi.adv,
+        )
     freeze_mask = _gas_floor_freeze_mask(sim)
-    freeze_interface_mask = _gas_floor_freeze_interface_mask(sim)
+    freeze_velocity_mask = _transport_velocity_freeze_interface_mask(
+        sim,
+        SigmaDust=sim.dust.Sigma,
+        Fi_adv=sim.dust.Fi.adv,
+    )
+    freeze_diffusion_mask = _transport_diffusion_freeze_interface_mask(
+        sim,
+        SigmaDust=sim.dust.Sigma,
+    )
     q = _get_mass_grid_q(cp.asarray(_field_data(m)), Nm)
     _, _, _, _, _, jcoag_indices, jcoag_indptr, jcoag_perm = _get_jcoag_pattern_cupy(Nr, Nm, q)
 
@@ -4207,7 +4466,14 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     J_coag = cp_sparse.csr_matrix((dat_csr, jcoag_indices, jcoag_indptr), shape=(Ntot, Ntot))
 
     A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(
-        area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, freeze_interface_mask=freeze_interface_mask
+        area,
+        sim.dust.D,
+        r,
+        ri,
+        sim.gas.Sigma,
+        sim.dust.v.rad,
+        freeze_velocity_mask=freeze_velocity_mask,
+        freeze_diffusion_mask=freeze_diffusion_mask,
     )
     if zero_flux:
         A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(
@@ -4215,7 +4481,17 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
         )
     elif diode_block_mask is not None and int(to_numpy(diode_block_mask.sum())) > 0:
         A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_cupy(
-            A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, diode_block_mask
+            A_h,
+            B_h,
+            C_h,
+            area,
+            sim.dust.D,
+            r,
+            ri,
+            sim.gas.Sigma,
+            sim.dust.v.rad,
+            diode_block_mask,
+            adv_drain_mask=inner_adv_drain_mask,
         )
     n_hyd, jhb_map, jhb_indices, jhb_indptr = _get_dust_hyd_boundary_pattern_cupy(Nr, Nm)
     dat_hyd = cp.concatenate((A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]))
@@ -4347,8 +4623,23 @@ def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
     zero_flux = is_zero_flux_enabled(sim)
     inner_outflow_only = is_dust_inner_outflow_only_enabled(sim)
     diode_block_mask = _inner_diode_block_mask(sim) if inner_outflow_only else None
+    inner_adv_drain_mask = None
+    if inner_outflow_only:
+        inner_adv_drain_mask = _inner_boundary_advective_drain_mask(
+            sim,
+            SigmaDust=sim.dust.Sigma,
+            Fi_adv=sim.dust.Fi.adv,
+        )
     freeze_mask = _gas_floor_freeze_mask(sim)
-    freeze_interface_mask = _gas_floor_freeze_interface_mask(sim)
+    freeze_velocity_mask = _transport_velocity_freeze_interface_mask(
+        sim,
+        SigmaDust=sim.dust.Sigma,
+        Fi_adv=sim.dust.Fi.adv,
+    )
+    freeze_diffusion_mask = _transport_diffusion_freeze_interface_mask(
+        sim,
+        SigmaDust=sim.dust.Sigma,
+    )
 
     q = _get_mass_grid_q(cp.asarray(_field_data(m)), Nm)
     _, _, row, col, _, _, _, _ = _get_jcoag_pattern_cupy(Nr, Nm, q)
@@ -4364,7 +4655,14 @@ def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
     _scatter_add_1d(J_flat, row * Ntot + col, dat_coag)
 
     A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(
-        area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, freeze_interface_mask=freeze_interface_mask
+        area,
+        sim.dust.D,
+        r,
+        ri,
+        sim.gas.Sigma,
+        sim.dust.v.rad,
+        freeze_velocity_mask=freeze_velocity_mask,
+        freeze_diffusion_mask=freeze_diffusion_mask,
     )
     if zero_flux:
         A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(
@@ -4372,7 +4670,17 @@ def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
         )
     elif diode_block_mask is not None and int(to_numpy(diode_block_mask.sum())) > 0:
         A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_cupy(
-            A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, diode_block_mask
+            A_h,
+            B_h,
+            C_h,
+            area,
+            sim.dust.D,
+            r,
+            ri,
+            sim.gas.Sigma,
+            sim.dust.v.rad,
+            diode_block_mask,
+            adv_drain_mask=inner_adv_drain_mask,
         )
 
     idx = cp.arange(Ntot, dtype=cp.int64)
@@ -4953,7 +5261,6 @@ def _f_impl_1_direct_numpy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
     Y1_ravel = solve_sparse_linear_system(A, rhs)
 
     Y1 = Y1_ravel.reshape(Y0.shape)
-
     if _maybe_retry_implicit_floor_injection(x0, Y0, dx, Y1):
         return False
 
