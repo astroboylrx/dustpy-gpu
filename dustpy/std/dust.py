@@ -3687,19 +3687,13 @@ def _sanitize_floorborn_islands(sim):
     if not cfg.get("enabled", False):
         return
 
-    backend = get_backend()
-    if backend == "cupy" and cp is not None:
-        amod = cp
-    else:
-        amod = np
-
     sigma = _field_data(dust.Sigma)
     sigma_floor = _field_data(dust.SigmaFloor)
 
     if sigma.shape != sigma_floor.shape:
         return
 
-    ratio_now = amod.where(sigma_floor > 0.0, sigma / sigma_floor, 0.0)
+    ratio_now = xp.where(sigma_floor > 0.0, sigma / sigma_floor, 0.0)
 
     prev_ratio = san.prev_ratio
     if prev_ratio is None or prev_ratio.shape != ratio_now.shape:
@@ -3710,7 +3704,7 @@ def _sanitize_floorborn_islands(sim):
 
     if san.Mdust0_mearth is None:
         area = _field_data(sim.grid.A)
-        mdust0 = amod.sum(sigma * area[:, None]) / c.M_earth
+        mdust0 = xp.sum(sigma * area[:, None]) / c.M_earth
         mdust0 = float(to_numpy(mdust0))
         san.Mdust0_mearth = max(mdust0, 1e-300)
 
@@ -3729,9 +3723,9 @@ def _sanitize_floorborn_islands(sim):
     nrad = 1
 
     prev_floor = prev_ratio <= prev_floor_max
-    prev_floor_i8 = prev_floor.astype(np.int8 if amod is np else cp.int8, copy=False)
-    suffix_ok = amod.flip(
-        amod.cumprod(amod.flip(prev_floor_i8, axis=1), axis=1),
+    prev_floor_i = prev_floor.astype(xp.int64, copy=False)
+    suffix_ok = xp.flip(
+        xp.cumprod(xp.flip(prev_floor_i, axis=1), axis=1),
         axis=1,
     ).astype(bool)
 
@@ -3745,16 +3739,13 @@ def _sanitize_floorborn_islands(sim):
         idx_lo = np.clip(idx_hi - 1, 0, nm - 1)
         use_lo = np.abs(m_np[idx_lo] - m_half) <= np.abs(m_np[idx_hi] - m_half)
         half_idx_np = np.where(use_lo, idx_lo, idx_hi).astype(np.int64, copy=False)
-        if amod is np:
-            half_idx = half_idx_np
-        else:
-            half_idx = cp.asarray(half_idx_np, dtype=cp.int64)
+        half_idx = xp.asarray(half_idx_np, dtype=xp.int64)
         san.half_idx = half_idx
     row_ok = suffix_ok[:, half_idx]
 
-    radial_ok = amod.ones_like(row_ok, dtype=bool)
+    radial_ok = xp.ones_like(row_ok, dtype=bool)
     for dr in range(-nrad, nrad + 1):
-        shifted = amod.zeros_like(row_ok, dtype=bool)
+        shifted = xp.zeros_like(row_ok, dtype=bool)
         if dr == 0:
             shifted[...] = row_ok
         elif dr > 0:
@@ -3783,7 +3774,7 @@ def _sanitize_floorborn_islands(sim):
     if n_tinymax_blocked > 0:
         san.tinymax_block_cycles += 1
         san.tinymax_block_cells += n_tinymax_blocked
-        max_ratio_blocked = float(to_numpy(amod.max(amod.where(tinymax_blocked, ratio_now, 0.0))))
+        max_ratio_blocked = float(to_numpy(xp.max(xp.where(tinymax_blocked, ratio_now, 0.0))))
         if max_ratio_blocked > san.tinymax_block_max_ratio:
             san.tinymax_block_max_ratio = max_ratio_blocked
         if cfg.get("tinymax_report", False):
@@ -3799,7 +3790,7 @@ def _sanitize_floorborn_islands(sim):
                 )
 
     target = 0.1 * sigma_floor
-    delta = amod.where(candidate, sigma - target, 0.0)
+    delta = xp.where(candidate, sigma - target, 0.0)
     to_clip = delta > 0.0
     n_clipped = int(to_numpy(to_clip.sum()))
 
@@ -3824,7 +3815,7 @@ def _sanitize_floorborn_islands(sim):
         san.first_clip_t_years = t_years
         san.first_clip_cells = n_clipped
 
-    ratio_after = amod.where(sigma_floor > 0.0, sigma / sigma_floor, 0.0)
+    ratio_after = xp.where(sigma_floor > 0.0, sigma / sigma_floor, 0.0)
     san.prev_ratio = ratio_after.copy()
 
     stop_thresh_mearth = float(cfg["stop_thresh_mearth"])
