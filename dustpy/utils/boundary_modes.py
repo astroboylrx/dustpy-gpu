@@ -21,3 +21,14 @@ def is_zero_flux_enabled(sim):
     if boundary is None:
         return False
     return bool(_unwrap_scalar(getattr(boundary, "zeroFlux", False)))
+
+
+def is_dust_inner_outflow_only_enabled(sim):
+    """Return True if dust inner edge is configured as outflow-only."""
+    ini = getattr(sim, "ini", None)
+    if ini is None:
+        return False
+    boundary = getattr(ini, "boundary", None)
+    if boundary is None:
+        return False
+    return bool(_unwrap_scalar(getattr(boundary, "dustInnerOutflowOnly", False)))

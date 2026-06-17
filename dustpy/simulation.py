@@ -1,4 +1,5 @@
 import os
+import threading
 
 from simframe import Frame
 from simframe import Instruction
@@ -16,8 +17,10 @@ from dustpy import std
 from simframe.io.writers import hdf5writer
 from dustpy.utils.boundary import Boundary
 from dustpy.utils.backend import call_numpy
+from dustpy.utils.boundary_modes import is_dust_inner_outflow_only_enabled
 from dustpy.utils.simplenamespace import SimpleNamespace
-from simframe.backends.api import set_backend
+from simframe.backends.api import BackendContext
+from simframe.backends.api import get_backend
 from simframe.backends.api import xp
 
 import numpy as np
@@ -40,6 +43,9 @@ class Simulation(Frame):
     Please have a look at the documentation of ``simframe`` for further details."""
 
     __name__ = "DustPy"
+    _bound_backend_name = None
+    _bound_runtime_token = None
+    _backend_runtime_lock = threading.RLock()
 
     def __init__(self, backend=None, **kwargs):
         """Main simulation class.
@@ -47,16 +53,19 @@ class Simulation(Frame):
         Parameters
         ----------
         backend : {"numpy", "cupy", "torch", "auto"}, optional
-            Convenience wrapper around ``simframe.backends.api.set_backend``.
-            Backend selection remains process-global for the Python process.
+            Backend preference stored on this simulation and activated
+            automatically for initialize/run/update calls.
+            Backend execution remains process-global for the Python process.
         """
 
-        if backend is not None:
-            set_backend(backend)
-
         super().__init__(**kwargs)
-        self._requested_backend = backend
+        self._backend_context = BackendContext(backend)
+        self._requested_backend = self._backend_context.requested_backend
+        self._backend_name = self._backend_context.backend
+        self._runtime_token = id(self)
+        self._strict_backend_lock = _env_flag_enabled("DUSTPY_STRICT_BACKEND_LOCK", "0")
         self._skip_mass_check = _env_flag_enabled("DUSTPY_SKIP_MASS_CHECK", "0")
+        self._run_context_active = False
 
         # Namespace with parameters to set the initial conditions
         self._ini = SimpleNamespace(**{"dust": SimpleNamespace(**{"aIniMax": 0.0001,
@@ -85,7 +94,7 @@ class Simulation(Frame):
                                                                  "rmax": 1000.*c.au
                                                                  }
                                                                ),
-                                       "boundary": SimpleNamespace(**{"zeroFlux": False}),
+                                       "boundary": SimpleNamespace(**{"zeroFlux": False, "dustInnerOutflowOnly": False}),
                                        "star": SimpleNamespace(**{"M": 1.*c.M_sun,
                                                                   "R": 2.*c.R_sun,
                                                                   "T": 5772.,
@@ -222,11 +231,44 @@ class Simulation(Frame):
 
         self.t = None
         self.RL_count_cycle = 0
+        self.RL_count_accepted = 0
         self.RL_ncycle_out = 100
         self.RL_recent_dts = np.zeros(100)
+        self.RL_recent_wts = np.zeros(100)
+        self.RL_last_wall_s = None
 
-    def run(self):
-        """This functions runs the simulation."""
+    @property
+    def backend(self):
+        """Resolved backend for this simulation object."""
+        return self._backend_name
+
+    def _activate_backend_context(self, *, require_rebind=False):
+        """Activate this simulation backend and rebind kernels when needed."""
+        active = get_backend()
+        if active != self._backend_name:
+            self._backend_context.activate()
+            require_rebind = True
+
+        runtime_switched = self.__class__._bound_runtime_token != self._runtime_token
+        if require_rebind or runtime_switched or self.__class__._bound_backend_name != self._backend_name:
+            std.dust.bind_backend_kernels(force=require_rebind, runtime_token=self._runtime_token)
+            std.gas.bind_backend_kernels(force=require_rebind, runtime_token=self._runtime_token)
+            self.__class__._bound_backend_name = self._backend_name
+            self.__class__._bound_runtime_token = self._runtime_token
+
+    def update(self, *args, **kwargs):
+        if self._run_context_active:
+            return super().update(*args, **kwargs)
+
+        if self._strict_backend_lock:
+            with self.__class__._backend_runtime_lock:
+                self._activate_backend_context()
+                return super().update(*args, **kwargs)
+        else:
+            self._activate_backend_context()
+            return super().update(*args, **kwargs)
+
+    def _run_with_active_context(self):
         # Print welcome message
         if self.verbosity > 0:
             msg = ""
@@ -246,6 +288,24 @@ class Simulation(Frame):
             self.checkmassconservation()
         # Actually run the simulation
         super().run()
+
+    def run(self):
+        """This functions runs the simulation."""
+        if self._strict_backend_lock:
+            with self.__class__._backend_runtime_lock:
+                self._activate_backend_context()
+                self._run_context_active = True
+                try:
+                    self._run_with_active_context()
+                finally:
+                    self._run_context_active = False
+        else:
+            self._activate_backend_context()
+            self._run_context_active = True
+            try:
+                self._run_with_active_context()
+            finally:
+                self._run_context_active = False
 
     @property
     def ini(self):
@@ -426,6 +486,14 @@ class Simulation(Frame):
 
         Function sets all fields that are None with a standard value.
         If the grids are not set, it will call ``Simulation.makegrids()`` first.'''
+        if self._strict_backend_lock:
+            with self.__class__._backend_runtime_lock:
+                self._initialize_impl()
+        else:
+            self._initialize_impl()
+
+    def _initialize_impl(self):
+        self._activate_backend_context(require_rebind=True)
         if not isinstance(self.grid.Nm, Field) or not isinstance(self.grid.Nr, Field):
             self.makegrids()
 
@@ -443,10 +511,6 @@ class Simulation(Frame):
 
         # GRID QUANTITIES
         self._initializegrid()
-
-        # Bind backend-specific hot kernels once for this run.
-        std.dust.bind_backend_kernels()
-        std.gas.bind_backend_kernels()
 
         # GAS QUANTITIES
         self._initializegas()
@@ -700,8 +764,7 @@ class Simulation(Frame):
             )
         # Set boundary conditions, enforce floor values,
         # and store old surface densities
-        self.dust.boundary.inner.setboundary()
-        self.dust.boundary.outer.setboundary()
+        std.dust.boundary(self)
         std.dust.enforce_floor_value(self)
         self.dust._SigmaOld[...] = self.dust.Sigma
 

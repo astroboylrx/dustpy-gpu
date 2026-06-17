@@ -4,12 +4,13 @@
 import dustpy.constants as c
 import math
 import os
+from types import SimpleNamespace
 from dustpy.std import dust_f
 from dustpy.utils.backend import call_numpy
 from dustpy.utils.backend import bind_sparse_solver
 from dustpy.utils.backend import solve_sparse_linear_system
 from dustpy.utils.backend import to_numpy
-from dustpy.utils.boundary_modes import is_zero_flux_enabled
+from dustpy.utils.boundary_modes import is_dust_inner_outflow_only_enabled, is_zero_flux_enabled
 from simframe.backends.api import get_backend
 from simframe.backends.api import select_backend
 from simframe.backends.api import xp
@@ -54,6 +55,22 @@ def _scatter_add_1d(out, idx, vals):
     """1D scatter-add helper."""
     if int(idx.size) == 0:
         return
+    if _SCATTER_MODE == "rawkernel":
+        kernel = _get_raw_scatter_kernel(out.dtype)
+        if (
+            kernel is not None
+            and getattr(out, "ndim", 0) == 1
+            and getattr(idx, "ndim", 0) == 1
+            and getattr(vals, "ndim", 0) == 1
+        ):
+            n = int(idx.size)
+            threads = 256
+            blocks = (n + threads - 1) // threads
+            if blocks > 0:
+                idx64 = idx if idx.dtype == cp.int64 else idx.astype(cp.int64, copy=False)
+                vals_cast = vals if vals.dtype == out.dtype else vals.astype(out.dtype, copy=False)
+                kernel((blocks,), (threads,), (out, idx64, vals_cast, np.int64(n)))
+                return
     if _SCATTER_MODE == "scatter" and cp_scatter_add is not None:
         cp_scatter_add(out, idx, vals)
     else:
@@ -79,6 +96,7 @@ _K_VREL_TURB = None
 _K_VREL_VERT = None
 _K_COAG_PARAMS = None
 _K_IMPL_1_DIRECT = None
+_K_IMPLICIT_FLOOR_RETRY = None
 _K_JACOBIAN = None
 _K_INTERP_TO_INTERFACES = None
 _KERNEL_LOWER_MASK = None
@@ -112,19 +130,736 @@ _JCOAG_WORK_CACHE_KEY = None
 _JCOAG_WORK_CACHE_VALUE = None
 _DUST_JHB_PATTERN_CACHE_KEY = None
 _DUST_JHB_PATTERN_CACHE_VALUE = None
-_JCOAG_WORKBUF_MODE = "fresh"
+_JCOAG_GEN_MODE = "baseline"
+_S_COAG_MODE = "baseline"
+_F_DIFF_MODE = "baseline"
 _SCATTER_MODE = "addat"
 _CUPY_DUST_SOLVER_MODE = "sparse"
+_VREL_TURB_MODE = "baseline"
+_VREL_TOT_MODE = "baseline"
+_P_FRAG_MODE = "baseline"
+_COLLISION_KERNEL_MODE = "baseline"
+_CUPY_A_BUILD_MODE = "identity_sub"
+_CUPY_DIAG_POS_CACHE_KEY = None
+_CUPY_DIAG_POS_CACHE_VALUE = None
+_JCOAG_CHUNK_SIZE_OVERRIDE = None
+_SANITIZER_CONFIG = {
+    "enabled": False,
+    "mode": "implicit",
+    "tiny_max_ratio": 10000.0,
+    "born_ratio": 1.0,
+    "stop_thresh_mearth": 1.0e-2,
+    "tinymax_report": False,
+    "tinymax_report_cadence": 1,
+}
+_GAS_FLOOR_FREEZE_CONFIG = {
+    "enabled": True,
+    "ratio": 1.0e3,
+}
+_DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG = {
+    "enabled": False,
+    "ratio": 1.0,
+}
+_IMPLICIT_FLOOR_RETRY_CONFIG = {
+    "enabled": True,
+    "threshold_mearth": 1.0e-6,
+    "shrink": 0.5,
+    "max_retries": 4,
+}
+_RUNTIME_STATES = {}
+_ACTIVE_RUNTIME_TOKEN = None
+_RAW_SCATTER_KERNEL_F32 = None
+_RAW_SCATTER_KERNEL_F64 = None
+_F_DIFF_EW_KERNEL_F32 = None
+_F_DIFF_EW_KERNEL_F64 = None
+_VREL_TURB_EW_KERNEL_F32 = None
+_VREL_TURB_EW_KERNEL_F64 = None
+_VREL_TOT_EW_KERNEL_F32 = None
+_VREL_TOT_EW_KERNEL_F64 = None
+_P_FRAG_EW_KERNEL_F32 = None
+_P_FRAG_EW_KERNEL_F64 = None
+_COLLISION_KERNEL_EW_F32 = None
+_COLLISION_KERNEL_EW_F64 = None
+
+_RUNTIME_STATE_VARS = (
+    "_BOUND_BACKEND",
+    "_K_A",
+    "_K_D",
+    "_K_H",
+    "_K_F_ADV",
+    "_K_F_DIFF",
+    "_K_S_COAG",
+    "_K_S_HYD",
+    "_K_KERNEL",
+    "_K_P_FRAG",
+    "_K_ST",
+    "_K_VRAD",
+    "_K_VREL_BROWN",
+    "_K_VREL_AZI",
+    "_K_VREL_RAD",
+    "_K_VREL_TURB",
+    "_K_VREL_VERT",
+    "_K_COAG_PARAMS",
+    "_K_IMPL_1_DIRECT",
+    "_K_IMPLICIT_FLOOR_RETRY",
+    "_K_JACOBIAN",
+    "_K_INTERP_TO_INTERFACES",
+    "_KERNEL_LOWER_MASK",
+    "_COAG_CACHE_KEY",
+    "_COAG_CACHE_VALUE",
+    "_COAG_PAIR_CACHE_KEY",
+    "_COAG_PAIR_CACHE_VALUE",
+    "_SCOAG_PAIRMAP_CACHE_KEY",
+    "_SCOAG_PAIRMAP_CACHE_VALUE",
+    "_SCOAG_PRECOMP_CACHE_KEY",
+    "_SCOAG_PRECOMP_CACHE_VALUE",
+    "_FRAG_P_CACHE_KEY",
+    "_FRAG_P_CACHE_VALUE",
+    "_MGRID_Q_CACHE_KEY",
+    "_MGRID_Q_CACHE_VALUE",
+    "_JCOAG_CONST_CACHE_KEY",
+    "_JCOAG_CONST_CACHE_VALUE",
+    "_JCOAG_PATTERN_CACHE_KEY",
+    "_JCOAG_PATTERN_CACHE_VALUE",
+    "_JCOAG_PATTERN_GPU_CACHE_KEY",
+    "_JCOAG_PATTERN_GPU_CACHE_VALUE",
+    "_JCOAG_PRECOMP_CACHE_KEY",
+    "_JCOAG_PRECOMP_CACHE_VALUE",
+    "_BOUNDARY_BASIS_CACHE_KEY",
+    "_BOUNDARY_BASIS_CACHE_VALUE",
+    "_JSTICK_MAP_CACHE_KEY",
+    "_JSTICK_MAP_CACHE_VALUE",
+    "_JFRAG_MAP_CACHE_KEY",
+    "_JFRAG_MAP_CACHE_VALUE",
+    "_JCOAG_WORK_CACHE_KEY",
+    "_JCOAG_WORK_CACHE_VALUE",
+    "_DUST_JHB_PATTERN_CACHE_KEY",
+    "_DUST_JHB_PATTERN_CACHE_VALUE",
+    "_JCOAG_GEN_MODE",
+    "_S_COAG_MODE",
+    "_F_DIFF_MODE",
+    "_SCATTER_MODE",
+    "_CUPY_DUST_SOLVER_MODE",
+    "_VREL_TURB_MODE",
+    "_VREL_TOT_MODE",
+    "_P_FRAG_MODE",
+    "_COLLISION_KERNEL_MODE",
+    "_CUPY_A_BUILD_MODE",
+    "_CUPY_DIAG_POS_CACHE_KEY",
+    "_CUPY_DIAG_POS_CACHE_VALUE",
+    "_JCOAG_CHUNK_SIZE_OVERRIDE",
+    "_SANITIZER_CONFIG",
+    "_GAS_FLOOR_FREEZE_CONFIG",
+    "_DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG",
+    "_IMPLICIT_FLOOR_RETRY_CONFIG",
+)
+
+
+def _fresh_runtime_state():
+    return {
+        "_BOUND_BACKEND": None,
+        "_K_A": None,
+        "_K_D": None,
+        "_K_H": None,
+        "_K_F_ADV": None,
+        "_K_F_DIFF": None,
+        "_K_S_COAG": None,
+        "_K_S_HYD": None,
+        "_K_KERNEL": None,
+        "_K_P_FRAG": None,
+        "_K_ST": None,
+        "_K_VRAD": None,
+        "_K_VREL_BROWN": None,
+        "_K_VREL_AZI": None,
+        "_K_VREL_RAD": None,
+        "_K_VREL_TURB": None,
+        "_K_VREL_VERT": None,
+        "_K_COAG_PARAMS": None,
+        "_K_IMPL_1_DIRECT": None,
+        "_K_IMPLICIT_FLOOR_RETRY": None,
+        "_K_JACOBIAN": None,
+        "_K_INTERP_TO_INTERFACES": None,
+        "_KERNEL_LOWER_MASK": None,
+        "_COAG_CACHE_KEY": None,
+        "_COAG_CACHE_VALUE": None,
+        "_COAG_PAIR_CACHE_KEY": None,
+        "_COAG_PAIR_CACHE_VALUE": None,
+        "_SCOAG_PAIRMAP_CACHE_KEY": None,
+        "_SCOAG_PAIRMAP_CACHE_VALUE": None,
+        "_SCOAG_PRECOMP_CACHE_KEY": None,
+        "_SCOAG_PRECOMP_CACHE_VALUE": None,
+        "_FRAG_P_CACHE_KEY": None,
+        "_FRAG_P_CACHE_VALUE": None,
+        "_MGRID_Q_CACHE_KEY": None,
+        "_MGRID_Q_CACHE_VALUE": None,
+        "_JCOAG_CONST_CACHE_KEY": None,
+        "_JCOAG_CONST_CACHE_VALUE": None,
+        "_JCOAG_PATTERN_CACHE_KEY": None,
+        "_JCOAG_PATTERN_CACHE_VALUE": None,
+        "_JCOAG_PATTERN_GPU_CACHE_KEY": None,
+        "_JCOAG_PATTERN_GPU_CACHE_VALUE": None,
+        "_JCOAG_PRECOMP_CACHE_KEY": None,
+        "_JCOAG_PRECOMP_CACHE_VALUE": None,
+        "_BOUNDARY_BASIS_CACHE_KEY": None,
+        "_BOUNDARY_BASIS_CACHE_VALUE": None,
+        "_JSTICK_MAP_CACHE_KEY": None,
+        "_JSTICK_MAP_CACHE_VALUE": None,
+        "_JFRAG_MAP_CACHE_KEY": None,
+        "_JFRAG_MAP_CACHE_VALUE": None,
+        "_JCOAG_WORK_CACHE_KEY": None,
+        "_JCOAG_WORK_CACHE_VALUE": None,
+        "_DUST_JHB_PATTERN_CACHE_KEY": None,
+        "_DUST_JHB_PATTERN_CACHE_VALUE": None,
+        "_JCOAG_GEN_MODE": "baseline",
+        "_S_COAG_MODE": "baseline",
+        "_F_DIFF_MODE": "baseline",
+        "_SCATTER_MODE": "addat",
+        "_CUPY_DUST_SOLVER_MODE": "sparse",
+        "_VREL_TURB_MODE": "baseline",
+        "_VREL_TOT_MODE": "baseline",
+        "_P_FRAG_MODE": "baseline",
+        "_COLLISION_KERNEL_MODE": "baseline",
+        "_CUPY_A_BUILD_MODE": "identity_sub",
+        "_CUPY_DIAG_POS_CACHE_KEY": None,
+        "_CUPY_DIAG_POS_CACHE_VALUE": None,
+        "_JCOAG_CHUNK_SIZE_OVERRIDE": None,
+        "_SANITIZER_CONFIG": {
+            "enabled": False,
+            "mode": "implicit",
+            "tiny_max_ratio": 10000.0,
+            "born_ratio": 1.0,
+            "stop_thresh_mearth": 1.0e-2,
+            "tinymax_report": False,
+            "tinymax_report_cadence": 1,
+        },
+        "_GAS_FLOOR_FREEZE_CONFIG": {
+            "enabled": True,
+            "ratio": 1.0e3,
+        },
+        "_DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG": {
+            "enabled": False,
+            "ratio": 1.0,
+        },
+        "_IMPLICIT_FLOOR_RETRY_CONFIG": {
+            "enabled": True,
+            "threshold_mearth": 1.0e-6,
+            "shrink": 0.5,
+            "max_retries": 8,
+        },
+    }
+
+
+def _capture_runtime_state():
+    return {name: globals()[name] for name in _RUNTIME_STATE_VARS}
+
+
+def _restore_runtime_state(state):
+    for name, value in state.items():
+        globals()[name] = value
+
+
+def _switch_runtime_state(runtime_token):
+    global _ACTIVE_RUNTIME_TOKEN
+    if runtime_token is None or runtime_token == _ACTIVE_RUNTIME_TOKEN:
+        return
+    if _ACTIVE_RUNTIME_TOKEN is not None:
+        _RUNTIME_STATES[_ACTIVE_RUNTIME_TOKEN] = _capture_runtime_state()
+    state = _RUNTIME_STATES.get(runtime_token)
+    if state is None:
+        state = _fresh_runtime_state()
+        _RUNTIME_STATES[runtime_token] = state
+    _restore_runtime_state(state)
+    _ACTIVE_RUNTIME_TOKEN = runtime_token
+
+
+def _get_raw_scatter_kernel(dtype):
+    """Return cached raw scatter-add kernel for float32/float64 outputs."""
+    global _RAW_SCATTER_KERNEL_F32, _RAW_SCATTER_KERNEL_F64
+
+    if cp is None:
+        return None
+
+    if dtype == cp.float32:
+        if _RAW_SCATTER_KERNEL_F32 is None:
+            _RAW_SCATTER_KERNEL_F32 = cp.RawKernel(
+                r"""
+                extern "C" __global__
+                void dustpy_scatter_add_f32(float* out, const long long* idx, const float* vals, long long n) {
+                    long long tid = (long long)(blockDim.x * blockIdx.x + threadIdx.x);
+                    if (tid < n) {
+                        atomicAdd(out + idx[tid], vals[tid]);
+                    }
+                }
+                """,
+                "dustpy_scatter_add_f32",
+            )
+        return _RAW_SCATTER_KERNEL_F32
+
+    if dtype == cp.float64:
+        if _RAW_SCATTER_KERNEL_F64 is None:
+            _RAW_SCATTER_KERNEL_F64 = cp.RawKernel(
+                r"""
+                extern "C" __global__
+                void dustpy_scatter_add_f64(double* out, const long long* idx, const double* vals, long long n) {
+                    long long tid = (long long)(blockDim.x * blockIdx.x + threadIdx.x);
+                    if (tid < n) {
+                        atomicAdd(out + idx[tid], vals[tid]);
+                    }
+                }
+                """,
+                "dustpy_scatter_add_f64",
+            )
+        return _RAW_SCATTER_KERNEL_F64
+
+    return None
+
+
+def _get_fdiff_elementwise_kernel(dtype):
+    """Return cached elementwise kernel for diffusive flux interiors."""
+    global _F_DIFF_EW_KERNEL_F32, _F_DIFF_EW_KERNEL_F64
+
+    if cp is None:
+        return None
+
+    if dtype == cp.float32:
+        if _F_DIFF_EW_KERNEL_F32 is None:
+            _F_DIFF_EW_KERNEL_F32 = cp.ElementwiseKernel(
+                "raw float32 D, raw float32 SigmaD, raw float32 SigmaG, raw float32 St, raw float32 u, raw float32 r, raw float32 ri, int64 nm",
+                "float32 out",
+                r"""
+                const long long iface = i / nm + 1;
+                const long long jm = i - (iface - 1) * nm;
+                const long long l = iface - 1;
+                const long long rr = iface;
+                const long long idxL = l * nm + jm;
+                const long long idxR = rr * nm + jm;
+
+                const float eps0 = 1.0e-30f;
+                const float dr = r[rr] - r[l];
+                const float t = (ri[iface] - r[l]) / (dr + eps0);
+
+                const float siggi = SigmaG[l] + t * (SigmaG[rr] - SigmaG[l]);
+                const float ui = u[l] + t * (u[rr] - u[l]);
+                const float di = D[idxL] + t * (D[idxR] - D[idxL]);
+                const float sigdi = SigmaD[idxL] + t * (SigmaD[idxR] - SigmaD[idxL]);
+                const float sti = St[idxL] + t * (St[idxR] - St[idxL]);
+
+                const float epsL = SigmaD[idxL] / (SigmaG[l] + eps0);
+                const float epsR = SigmaD[idxR] / (SigmaG[rr] + eps0);
+                const float gradepsi = (epsR - epsL) / (dr + eps0);
+
+                const float w = ui * sigdi / (1.0f + sti * sti);
+                const float fi0 = -di * siggi * gradepsi;
+
+                if (fabsf(w) > 0.0f) {
+                    const float P = fabsf(fi0 / w);
+                    const float lam = (1.0f + P) / (1.0f + P + P * P);
+                    out = lam * fi0;
+                } else {
+                    out = w;
+                }
+                """,
+                "dustpy_fdiff_elementwise_f32",
+            )
+        return _F_DIFF_EW_KERNEL_F32
+
+    if dtype == cp.float64:
+        if _F_DIFF_EW_KERNEL_F64 is None:
+            _F_DIFF_EW_KERNEL_F64 = cp.ElementwiseKernel(
+                "raw float64 D, raw float64 SigmaD, raw float64 SigmaG, raw float64 St, raw float64 u, raw float64 r, raw float64 ri, int64 nm",
+                "float64 out",
+                r"""
+                const long long iface = i / nm + 1;
+                const long long jm = i - (iface - 1) * nm;
+                const long long l = iface - 1;
+                const long long rr = iface;
+                const long long idxL = l * nm + jm;
+                const long long idxR = rr * nm + jm;
+
+                const double eps0 = 1.0e-300;
+                const double dr = r[rr] - r[l];
+                const double t = (ri[iface] - r[l]) / (dr + eps0);
+
+                const double siggi = SigmaG[l] + t * (SigmaG[rr] - SigmaG[l]);
+                const double ui = u[l] + t * (u[rr] - u[l]);
+                const double di = D[idxL] + t * (D[idxR] - D[idxL]);
+                const double sigdi = SigmaD[idxL] + t * (SigmaD[idxR] - SigmaD[idxL]);
+                const double sti = St[idxL] + t * (St[idxR] - St[idxL]);
+
+                const double epsL = SigmaD[idxL] / (SigmaG[l] + eps0);
+                const double epsR = SigmaD[idxR] / (SigmaG[rr] + eps0);
+                const double gradepsi = (epsR - epsL) / (dr + eps0);
+
+                const double w = ui * sigdi / (1.0 + sti * sti);
+                const double fi0 = -di * siggi * gradepsi;
+
+                if (fabs(w) > 0.0) {
+                    const double P = fabs(fi0 / w);
+                    const double lam = (1.0 + P) / (1.0 + P + P * P);
+                    out = lam * fi0;
+                } else {
+                    out = w;
+                }
+                """,
+                "dustpy_fdiff_elementwise_f64",
+            )
+        return _F_DIFF_EW_KERNEL_F64
+
+    return None
+
+
+def _get_vrel_turbulent_elementwise_kernel(dtype):
+    """Return cached elementwise kernel for turbulent relative velocity."""
+    global _VREL_TURB_EW_KERNEL_F32, _VREL_TURB_EW_KERNEL_F64
+
+    if cp is None:
+        return None
+
+    if dtype == cp.float32:
+        if _VREL_TURB_EW_KERNEL_F32 is None:
+            _VREL_TURB_EW_KERNEL_F32 = cp.ElementwiseKernel(
+                "raw float32 alpha, raw float32 cs, raw float32 mump, raw float32 omegak, raw float32 sigmag, raw float32 st, int64 nm, float32 sigma_h2",
+                "float32 out",
+                r"""
+                const long long plane = nm * nm;
+                const long long ir = i / plane;
+                const long long rem = i - ir * plane;
+                const long long jm = rem / nm;
+                const long long im = rem - jm * nm;
+                const long long base = ir * nm;
+
+                const float eps0 = 1.0e-30f;
+                float Stj = st[base + jm];
+                float Sti = st[base + im];
+                float StL = Stj >= Sti ? Stj : Sti;
+                float StS = Stj >= Sti ? Sti : Stj;
+
+                float OmKinv = 1.0f / (omegak[ir] + eps0);
+                float Re = 0.5f * alpha[ir] * sigmag[ir] * sigma_h2 / (mump[ir] + eps0);
+                float ReInvSqrt = sqrtf(1.0f / (Re + eps0));
+                float vn = sqrtf(alpha[ir]) * cs[ir];
+                float vs = powf(Re + eps0, -0.25f) * vn;
+                float ts = OmKinv * ReInvSqrt;
+                float vg2 = 1.5f * vn * vn;
+
+                const float c0 = 1.6015125f;
+                const float c1 = -0.63119577f;
+                const float c2 = 0.32938936f;
+                const float c3 = -0.29847604f;
+                const float ya = 1.6f;
+                const float yap1inv = 1.0f / (1.0f + ya);
+
+                float eps = StS / (StL + eps0);
+                float tauL = StL * OmKinv;
+                float tauS = StS * OmKinv;
+                float StL2 = StL * StL;
+                float StL3 = StL2 * StL;
+                float StS2 = StS * StS;
+                float eps3 = eps * eps * eps;
+
+                float ys = c0 + c1 * StL + c2 * StL2 + c3 * StL3;
+                float h1 = (StL - StS) / (StL + StS + eps0) * (StL * yap1inv - StS2 / (StS + ya * StL + eps0));
+                float h2 = 2.0f * (ya * StL - ReInvSqrt)
+                    + StL * yap1inv
+                    - StL2 / (StL + ReInvSqrt + eps0)
+                    + StS2 / (ya * StL + StS + eps0)
+                    - StS2 / (StS + ReInvSqrt + eps0);
+
+                float t = vs / (ts + eps0) * (tauL - tauS);
+                float val1 = 1.5f * t * t;
+                float val2 = vg2 * (StL - StS) / (StL + StS + eps0)
+                    * (StL2 / (StL + ReInvSqrt + eps0) - StS2 / (StS + ReInvSqrt + eps0));
+                float val3 = vg2 * (h1 + h2);
+                float val4 = vg2 * StL * (2.0f * ya - 1.0f - eps
+                    + 2.0f / (1.0f + eps + eps0) * (yap1inv + eps3 / (ya + eps + eps0)));
+                float val5 = vg2 * StL * (2.0f * ys - 1.0f - eps
+                    + 2.0f / (1.0f + eps + eps0) * (1.0f / (1.0f + ys + eps0) + eps3 / (ys + eps + eps0)));
+                float val6 = vg2 * (2.0f + StL + StS) / (1.0f + StL + StS + StL * StS + eps0);
+
+                bool cond1 = tauL < 0.2f * ts;
+                bool cond2 = tauL * ya < ts;
+                bool cond3 = tauL < 5.0f * ts;
+                bool cond4 = tauL < 0.2f * OmKinv;
+                bool cond5 = tauL < OmKinv;
+
+                float v2;
+                if (cond1) {
+                    v2 = val1;
+                } else if (cond2) {
+                    v2 = val2;
+                } else if (cond3) {
+                    v2 = val3;
+                } else if (cond4) {
+                    v2 = val4;
+                } else if (cond5) {
+                    v2 = val5;
+                } else {
+                    v2 = val6;
+                }
+                out = sqrtf(v2 > 0.0f ? v2 : 0.0f);
+                """,
+                "dustpy_vrel_turbulent_elementwise_f32",
+            )
+        return _VREL_TURB_EW_KERNEL_F32
+
+    if dtype == cp.float64:
+        if _VREL_TURB_EW_KERNEL_F64 is None:
+            _VREL_TURB_EW_KERNEL_F64 = cp.ElementwiseKernel(
+                "raw float64 alpha, raw float64 cs, raw float64 mump, raw float64 omegak, raw float64 sigmag, raw float64 st, int64 nm, float64 sigma_h2",
+                "float64 out",
+                r"""
+                const long long plane = nm * nm;
+                const long long ir = i / plane;
+                const long long rem = i - ir * plane;
+                const long long jm = rem / nm;
+                const long long im = rem - jm * nm;
+                const long long base = ir * nm;
+
+                const double eps0 = 1.0e-300;
+                double Stj = st[base + jm];
+                double Sti = st[base + im];
+                double StL = Stj >= Sti ? Stj : Sti;
+                double StS = Stj >= Sti ? Sti : Stj;
+
+                double OmKinv = 1.0 / (omegak[ir] + eps0);
+                double Re = 0.5 * alpha[ir] * sigmag[ir] * sigma_h2 / (mump[ir] + eps0);
+                double ReInvSqrt = sqrt(1.0 / (Re + eps0));
+                double vn = sqrt(alpha[ir]) * cs[ir];
+                double vs = pow(Re + eps0, -0.25) * vn;
+                double ts = OmKinv * ReInvSqrt;
+                double vg2 = 1.5 * vn * vn;
+
+                const double c0 = 1.6015125;
+                const double c1 = -0.63119577;
+                const double c2 = 0.32938936;
+                const double c3 = -0.29847604;
+                const double ya = 1.6;
+                const double yap1inv = 1.0 / (1.0 + ya);
+
+                double eps = StS / (StL + eps0);
+                double tauL = StL * OmKinv;
+                double tauS = StS * OmKinv;
+                double StL2 = StL * StL;
+                double StL3 = StL2 * StL;
+                double StS2 = StS * StS;
+                double eps3 = eps * eps * eps;
+
+                double ys = c0 + c1 * StL + c2 * StL2 + c3 * StL3;
+                double h1 = (StL - StS) / (StL + StS + eps0) * (StL * yap1inv - StS2 / (StS + ya * StL + eps0));
+                double h2 = 2.0 * (ya * StL - ReInvSqrt)
+                    + StL * yap1inv
+                    - StL2 / (StL + ReInvSqrt + eps0)
+                    + StS2 / (ya * StL + StS + eps0)
+                    - StS2 / (StS + ReInvSqrt + eps0);
+
+                double t = vs / (ts + eps0) * (tauL - tauS);
+                double val1 = 1.5 * t * t;
+                double val2 = vg2 * (StL - StS) / (StL + StS + eps0)
+                    * (StL2 / (StL + ReInvSqrt + eps0) - StS2 / (StS + ReInvSqrt + eps0));
+                double val3 = vg2 * (h1 + h2);
+                double val4 = vg2 * StL * (2.0 * ya - 1.0 - eps
+                    + 2.0 / (1.0 + eps + eps0) * (yap1inv + eps3 / (ya + eps + eps0)));
+                double val5 = vg2 * StL * (2.0 * ys - 1.0 - eps
+                    + 2.0 / (1.0 + eps + eps0) * (1.0 / (1.0 + ys + eps0) + eps3 / (ys + eps + eps0)));
+                double val6 = vg2 * (2.0 + StL + StS) / (1.0 + StL + StS + StL * StS + eps0);
+
+                bool cond1 = tauL < 0.2 * ts;
+                bool cond2 = tauL * ya < ts;
+                bool cond3 = tauL < 5.0 * ts;
+                bool cond4 = tauL < 0.2 * OmKinv;
+                bool cond5 = tauL < OmKinv;
+
+                double v2;
+                if (cond1) {
+                    v2 = val1;
+                } else if (cond2) {
+                    v2 = val2;
+                } else if (cond3) {
+                    v2 = val3;
+                } else if (cond4) {
+                    v2 = val4;
+                } else if (cond5) {
+                    v2 = val5;
+                } else {
+                    v2 = val6;
+                }
+                out = sqrt(v2 > 0.0 ? v2 : 0.0);
+                """,
+                "dustpy_vrel_turbulent_elementwise_f64",
+            )
+        return _VREL_TURB_EW_KERNEL_F64
+
+    return None
+
+
+def _get_vrel_tot_elementwise_kernel(dtype):
+    """Return cached elementwise kernel for total relative velocity."""
+    global _VREL_TOT_EW_KERNEL_F32, _VREL_TOT_EW_KERNEL_F64
+
+    if cp is None:
+        return None
+
+    if dtype == cp.float32:
+        if _VREL_TOT_EW_KERNEL_F32 is None:
+            _VREL_TOT_EW_KERNEL_F32 = cp.ElementwiseKernel(
+                "float32 az, float32 br, float32 rd, float32 tu, float32 vt",
+                "float32 out",
+                "out = sqrtf(az * az + br * br + rd * rd + tu * tu + vt * vt)",
+                "dustpy_vrel_tot_elementwise_f32",
+            )
+        return _VREL_TOT_EW_KERNEL_F32
+
+    if dtype == cp.float64:
+        if _VREL_TOT_EW_KERNEL_F64 is None:
+            _VREL_TOT_EW_KERNEL_F64 = cp.ElementwiseKernel(
+                "float64 az, float64 br, float64 rd, float64 tu, float64 vt",
+                "float64 out",
+                "out = sqrt(az * az + br * br + rd * rd + tu * tu + vt * vt)",
+                "dustpy_vrel_tot_elementwise_f64",
+            )
+        return _VREL_TOT_EW_KERNEL_F64
+
+    return None
+
+
+def _get_pfrag_elementwise_kernel(dtype):
+    """Return cached elementwise kernel for fragmentation probability."""
+    global _P_FRAG_EW_KERNEL_F32, _P_FRAG_EW_KERNEL_F64
+
+    if cp is None:
+        return None
+
+    if dtype == cp.float32:
+        if _P_FRAG_EW_KERNEL_F32 is None:
+            _P_FRAG_EW_KERNEL_F32 = cp.ElementwiseKernel(
+                "raw float32 vrel, raw float32 vfrag, int64 nm",
+                "float32 out",
+                r"""
+                const long long nm2 = nm * nm;
+                const long long ir_int = i / nm2;
+                const float v = vrel[i];
+                const float vf = vfrag[ir_int];
+                if (v != 0.0f) {
+                    const float dum = (vf / v) * (vf / v);
+                    out = (1.5f * dum + 1.0f) * expf(-1.5f * dum);
+                } else {
+                    out = 0.0f;
+                }
+                """,
+                "dustpy_pfrag_elementwise_f32",
+            )
+        return _P_FRAG_EW_KERNEL_F32
+
+    if dtype == cp.float64:
+        if _P_FRAG_EW_KERNEL_F64 is None:
+            _P_FRAG_EW_KERNEL_F64 = cp.ElementwiseKernel(
+                "raw float64 vrel, raw float64 vfrag, int64 nm",
+                "float64 out",
+                r"""
+                const long long nm2 = nm * nm;
+                const long long ir_int = i / nm2;
+                const double v = vrel[i];
+                const double vf = vfrag[ir_int];
+                if (v != 0.0) {
+                    const double dum = (vf / v) * (vf / v);
+                    out = (1.5 * dum + 1.0) * exp(-1.5 * dum);
+                } else {
+                    out = 0.0;
+                }
+                """,
+                "dustpy_pfrag_elementwise_f64",
+            )
+        return _P_FRAG_EW_KERNEL_F64
+
+    return None
+
+
+def _get_collision_kernel_elementwise_kernel(dtype):
+    """Return cached elementwise kernel for collision-kernel assembly."""
+    global _COLLISION_KERNEL_EW_F32, _COLLISION_KERNEL_EW_F64
+
+    if cp is None:
+        return None
+
+    if dtype == cp.float32:
+        if _COLLISION_KERNEL_EW_F32 is None:
+            _COLLISION_KERNEL_EW_F32 = cp.ElementwiseKernel(
+                "raw float32 a, raw float32 h, raw float32 sigma, raw float32 floor, raw float32 vrel, int64 nm",
+                "float32 out",
+                r"""
+                const long long nm2 = nm * nm;
+                const long long ir_int = i / nm2;
+                const long long rem = i - ir_int * nm2;
+                const long long jm = rem / nm;
+                const long long im = rem - jm * nm;
+
+                if (jm > im) {
+                    out = 0.0f;
+                    return;
+                }
+
+                const long long base = ir_int * nm;
+                if (sigma[base + jm] <= floor[base + jm] || sigma[base + im] <= floor[base + im]) {
+                    out = 0.0f;
+                    return;
+                }
+
+                const float pi = 3.14159265358979323846f;
+                const float sum_a = a[base + jm] + a[base + im];
+                const float cross = pi * sum_a * sum_a;
+                const float hj = h[base + jm];
+                const float hi = h[base + im];
+                const float sh = sqrtf(2.0f * pi * (hj * hj + hi * hi));
+                const float diag_fac = (jm == im) ? 0.5f : 1.0f;
+                out = diag_fac * cross * vrel[i] / sh;
+                """,
+                "dustpy_collision_kernel_elementwise_f32",
+            )
+        return _COLLISION_KERNEL_EW_F32
+
+    if dtype == cp.float64:
+        if _COLLISION_KERNEL_EW_F64 is None:
+            _COLLISION_KERNEL_EW_F64 = cp.ElementwiseKernel(
+                "raw float64 a, raw float64 h, raw float64 sigma, raw float64 floor, raw float64 vrel, int64 nm",
+                "float64 out",
+                r"""
+                const long long nm2 = nm * nm;
+                const long long ir_int = i / nm2;
+                const long long rem = i - ir_int * nm2;
+                const long long jm = rem / nm;
+                const long long im = rem - jm * nm;
+
+                if (jm > im) {
+                    out = 0.0;
+                    return;
+                }
+
+                const long long base = ir_int * nm;
+                if (sigma[base + jm] <= floor[base + jm] || sigma[base + im] <= floor[base + im]) {
+                    out = 0.0;
+                    return;
+                }
+
+                const double pi = 3.14159265358979323846;
+                const double sum_a = a[base + jm] + a[base + im];
+                const double cross = pi * sum_a * sum_a;
+                const double hj = h[base + jm];
+                const double hi = h[base + im];
+                const double sh = sqrt(2.0 * pi * (hj * hj + hi * hi));
+                const double diag_fac = (jm == im) ? 0.5 : 1.0;
+                out = diag_fac * cross * vrel[i] / sh;
+                """,
+                "dustpy_collision_kernel_elementwise_f64",
+            )
+        return _COLLISION_KERNEL_EW_F64
+
+    return None
 
 
 def _get_jcoag_chunk_size(Nr_int, Nm):
     """Return chunk size for CuPy Jacobian radius batching."""
-    val = os.getenv("DUSTPY_JCOAG_CHUNK_SIZE", "auto").strip().lower()
-    if val and val != "auto":
-        try:
-            return max(1, min(int(val), int(Nr_int)))
-        except Exception:
-            pass
+    if _JCOAG_CHUNK_SIZE_OVERRIDE is not None:
+        return max(1, min(int(_JCOAG_CHUNK_SIZE_OVERRIDE), int(Nr_int)))
 
     # Auto heuristic tuned for production-like grids:
     # use one wide batch when grids are moderate, otherwise cap temporary size.
@@ -134,6 +869,325 @@ def _get_jcoag_chunk_size(Nr_int, Nm):
     if int(Nr_int) > 384:
         base = 96 if int(Nm) >= 96 else 48
     return max(1, min(int(base), int(Nr_int)))
+
+
+def _env_bool(name, default=False):
+    raw = os.getenv(name, "1" if default else "0").strip().lower()
+    return raw in ("1", "true", "yes", "on")
+
+
+def _env_float(name, default):
+    raw = os.getenv(name)
+    if raw is None:
+        return float(default)
+    try:
+        return float(raw)
+    except Exception:
+        return float(default)
+
+
+def _load_sanitizer_config():
+    mode = os.getenv("DUSTPY_SANITIZER_MODE", "implicit").strip().lower()
+    if mode not in ("implicit", "both"):
+        mode = "implicit"
+    return {
+        "enabled": _env_bool("DUSTPY_SANITIZER_ENABLE", default=False),
+        "mode": mode,
+        "tiny_max_ratio": _env_float("DUSTPY_SANITIZER_TINY_MAX_RATIO", 10000.0),
+        "born_ratio": _env_float("DUSTPY_SANITIZER_BORN_RATIO", 1.0),
+        "stop_thresh_mearth": _env_float("DUSTPY_SANITIZER_STOP_THRESH_MEARTH", 1.0e-2),
+        "tinymax_report": _env_bool("DUSTPY_SANITIZER_TINYMAX_REPORT", default=False),
+        "tinymax_report_cadence": max(
+            1,
+            int(_env_float("DUSTPY_SANITIZER_TINYMAX_REPORT_CADENCE", 1.0)),
+        ),
+    }
+
+
+def _load_gas_floor_freeze_config():
+    ratio = _env_float("DUSTPY_GAS_FLOOR_FREEZE_RATIO", 0.0)
+    if not np.isfinite(ratio):
+        ratio = 0.0
+    ratio = max(float(ratio), 0.0)
+    return {
+        "enabled": ratio > 0.0,
+        "ratio": ratio,
+    }
+
+
+def _load_dust_transport_inactive_floor_config():
+    ratio = _env_float("DUSTPY_DUST_TRANSPORT_INACTIVE_FLOOR_RATIO", 1.0)
+    if not np.isfinite(ratio):
+        ratio = 1.0
+    ratio = max(float(ratio), 0.0)
+    enabled = _env_bool("DUSTPY_DUST_TRANSPORT_INACTIVE_FLOOR_ENABLE", default=False) and ratio > 0.0
+    return {
+        "enabled": enabled,
+        "ratio": ratio,
+    }
+
+
+def _load_implicit_floor_retry_config():
+    shrink = _env_float("DUSTPY_IMPLICIT_FLOOR_RETRY_SHRINK", 0.5)
+    if not np.isfinite(shrink):
+        shrink = 0.5
+    shrink = min(max(float(shrink), 1.0e-6), 0.99)
+    threshold = _env_float("DUSTPY_IMPLICIT_FLOOR_RETRY_THRESH_MEARTH", 1.0e-6)
+    if not np.isfinite(threshold):
+        threshold = 1.0e-6
+    threshold = max(float(threshold), 0.0)
+    max_retries = _env_float("DUSTPY_IMPLICIT_FLOOR_RETRY_MAX_RETRIES", 4.0)
+    if not np.isfinite(max_retries):
+        max_retries = 4.0
+    max_retries = max(0, int(max_retries))
+    enabled = _env_bool("DUSTPY_IMPLICIT_FLOOR_RETRY_ENABLE", default=False) and threshold > 0.0
+    return {
+        "enabled": enabled,
+        "threshold_mearth": threshold,
+        "shrink": shrink,
+        "max_retries": max_retries,
+    }
+
+
+def _gas_floor_freeze_mask_from_arrays(SigmaGas, SigmaGasFloor):
+    cfg = _GAS_FLOOR_FREEZE_CONFIG
+    if not cfg.get("enabled", True):
+        return xp.zeros(SigmaGas.shape, dtype=bool)
+    ratio = float(cfg.get("ratio", 0.0))
+    if ratio <= 0.0:
+        return xp.zeros(SigmaGas.shape, dtype=bool)
+    return xp.asarray(SigmaGas <= ratio * SigmaGasFloor, dtype=bool)
+
+
+def _gas_floor_freeze_mask(sim, SigmaGas=None):
+    SigmaGas = _field_data(sim.gas.Sigma if SigmaGas is None else SigmaGas)
+    SigmaGasFloor = _field_data(sim.gas.SigmaFloor)
+    return _gas_floor_freeze_mask_from_arrays(SigmaGas, SigmaGasFloor)
+
+
+def _gas_floor_freeze_interface_mask(sim, SigmaGas=None):
+    radial_mask = _gas_floor_freeze_mask(sim, SigmaGas=SigmaGas)
+    iface_mask = xp.zeros((int(radial_mask.shape[0]) + 1,), dtype=bool)
+    iface_mask[:-1] = iface_mask[:-1] | radial_mask
+    iface_mask[1:] = iface_mask[1:] | radial_mask
+    return iface_mask
+
+
+def _dust_transport_inactive_mask_from_arrays(SigmaDust, SigmaDustFloor):
+    cfg = _DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG
+    if not cfg.get("enabled", False):
+        return xp.zeros(SigmaDust.shape, dtype=bool)
+    ratio = float(cfg.get("ratio", 0.0))
+    if ratio <= 0.0:
+        return xp.zeros(SigmaDust.shape, dtype=bool)
+    return xp.asarray(SigmaDust <= ratio * SigmaDustFloor, dtype=bool)
+
+
+def _dust_transport_inactive_mask(sim, SigmaDust=None):
+    SigmaDust = _field_data(sim.dust.Sigma if SigmaDust is None else SigmaDust)
+    SigmaDustFloor = _field_data(sim.dust.SigmaFloor)
+    return _dust_transport_inactive_mask_from_arrays(SigmaDust, SigmaDustFloor)
+
+
+def _interface_drain_mask_from_flux(Fi, inactive):
+    Fi = _field_data(Fi)
+    inactive = xp.asarray(inactive, dtype=bool)
+    iface_mask = xp.zeros(Fi.shape, dtype=bool)
+    if Fi.shape[0] != inactive.shape[0] + 1 or Fi.shape[1] != inactive.shape[1]:
+        return iface_mask
+    iface_mask[1:-1, :] = (
+        ((Fi[1:-1, :] > 0.0) & inactive[:-1, :])
+        | ((Fi[1:-1, :] < 0.0) & inactive[1:, :])
+    )
+    iface_mask[0, :] = (Fi[0, :] < 0.0) & inactive[0, :]
+    iface_mask[-1, :] = (Fi[-1, :] > 0.0) & inactive[-1, :]
+    return iface_mask
+
+
+def _dust_transport_drain_interface_mask(sim, SigmaDust=None, Fi_adv=None, Fi_diff=None):
+    inactive = _dust_transport_inactive_mask(sim, SigmaDust=SigmaDust)
+    if int(to_numpy(inactive.sum())) == 0:
+        nr = int(inactive.shape[0]) + 1
+        nm = int(inactive.shape[1])
+        return xp.zeros((nr, nm), dtype=bool)
+    iface_mask = xp.zeros((int(inactive.shape[0]) + 1, int(inactive.shape[1])), dtype=bool)
+    if Fi_adv is not None:
+        iface_mask |= _interface_drain_mask_from_flux(Fi_adv, inactive)
+    if Fi_diff is not None:
+        iface_mask |= _interface_drain_mask_from_flux(Fi_diff, inactive)
+    return iface_mask
+
+
+def _transport_velocity_freeze_interface_mask(sim, SigmaDust=None, SigmaGas=None, Fi_adv=None):
+    gas_mask = _gas_floor_freeze_interface_mask(sim, SigmaGas=SigmaGas)[:, None]
+    dust_mask = _dust_transport_drain_interface_mask(
+        sim,
+        SigmaDust=SigmaDust,
+        Fi_adv=Fi_adv,
+        Fi_diff=None,
+    )
+    return gas_mask | dust_mask
+
+
+def _transport_diffusion_freeze_interface_mask(sim, SigmaDust=None, SigmaGas=None):
+    gas_mask = _gas_floor_freeze_interface_mask(sim, SigmaGas=SigmaGas)[:, None]
+    return gas_mask
+
+
+def _inner_boundary_advective_drain_mask(sim, SigmaDust=None, Fi_adv=None):
+    inactive = _dust_transport_inactive_mask(sim, SigmaDust=SigmaDust)
+    if inactive.ndim != 2 or inactive.shape[0] == 0:
+        return None
+    inner_inactive = xp.asarray(inactive[0, :], dtype=bool)
+    if int(to_numpy(inner_inactive.sum())) == 0:
+        return None
+    if Fi_adv is not None:
+        fi_adv = _field_data(Fi_adv)
+        if fi_adv.shape[0] > 1:
+            adv_mask = inner_inactive & xp.asarray(fi_adv[1, :] > 0.0, dtype=bool)
+            if int(to_numpy(adv_mask.sum())) > 0:
+                return adv_mask
+    return None
+
+
+def _apply_gas_floor_freeze_to_radial_field(sim, arr, SigmaGas=None):
+    mask = _gas_floor_freeze_mask(sim, SigmaGas=SigmaGas)
+    if int(to_numpy(mask.sum())) == 0:
+        return arr
+    arr = _field_data(arr)
+    arr[mask, ...] = 0.0
+    return arr
+
+
+def _apply_gas_floor_freeze_to_flux(sim, Fi, SigmaGas=None):
+    iface_mask = _gas_floor_freeze_interface_mask(sim, SigmaGas=SigmaGas)
+    if int(to_numpy(iface_mask.sum())) == 0:
+        return Fi
+    Fi = _field_data(Fi)
+    Fi[iface_mask, ...] = 0.0
+    return Fi
+
+
+def _record_implicit_floor_retry(owner, added_mearth):
+    state = _ensure_dust_floor_retry_state(owner.dust)
+    state.total_mearth += float(added_mearth)
+    state.last_mearth = float(added_mearth)
+    state.count += 1
+    state.step_count += 1
+
+
+def _record_implicit_floor_retry_exhausted(owner, added_mearth):
+    state = _ensure_dust_floor_retry_state(owner.dust)
+    state.giveup_count += 1
+    state.giveup_last_mearth = float(added_mearth)
+
+
+def _ensure_dust_san_state(dust):
+    state = getattr(dust, "san", None)
+    if state is None:
+        state = SimpleNamespace(
+            enabled=bool(_SANITIZER_CONFIG.get("enabled", False)),
+            mode=str(_SANITIZER_CONFIG.get("mode", "implicit")),
+            stop_thresh_mearth=float(_SANITIZER_CONFIG.get("stop_thresh_mearth", 1.0e-2)),
+            prev_ratio=None,
+            Mdust0_mearth=None,
+            dM_total_mearth=0.0,
+            last_n_clipped=0,
+            active_cycles=0,
+            clip_cycles=0,
+            sum_clipped_cells=0,
+            max_cells_per_cycle=0,
+            first_clip_cycle=None,
+            first_clip_t_years=None,
+            first_clip_cells=None,
+            tinymax_block_cycles=0,
+            tinymax_block_cells=0,
+            tinymax_block_max_ratio=0.0,
+            half_idx=None,
+        )
+        dust.san = state
+    else:
+        state.enabled = bool(_SANITIZER_CONFIG.get("enabled", False))
+        state.mode = str(_SANITIZER_CONFIG.get("mode", "implicit"))
+        state.stop_thresh_mearth = float(_SANITIZER_CONFIG.get("stop_thresh_mearth", 1.0e-2))
+    return state
+
+
+def _ensure_dust_floor_topup_state(dust):
+    state = getattr(dust, "floor_topup", None)
+    if state is None:
+        state = SimpleNamespace(
+            total_mearth=0.0,
+            last_mearth=0.0,
+            count=0,
+        )
+        dust.floor_topup = state
+    return state
+
+
+def _ensure_dust_floor_retry_state(dust):
+    state = getattr(dust, "floor_retry", None)
+    if state is None:
+        state = SimpleNamespace(
+            total_mearth=0.0,
+            last_mearth=0.0,
+            count=0,
+            step_count=0,
+            giveup_count=0,
+            giveup_last_mearth=0.0,
+        )
+        dust.floor_retry = state
+    return state
+
+
+def _maybe_retry_implicit_floor_injection_numpy(x0, Y0, dx, sigma1):
+    cfg = _IMPLICIT_FLOOR_RETRY_CONFIG
+    if not cfg.get("enabled", True):
+        return False
+    sigma1_np = np.asarray(_field_data(sigma1), dtype=np.float64)
+    floor_np = np.asarray(_field_data(Y0._owner.dust.SigmaFloor), dtype=np.float64)
+    area_np = np.asarray(_field_data(Y0._owner.grid.A), dtype=np.float64)
+    delta_np = np.maximum(0.1 * floor_np - sigma1_np, 0.0)
+    added_mearth = float(np.sum(delta_np * area_np[:, None] / c.M_earth))
+    if added_mearth <= float(cfg.get("threshold_mearth", 0.0)):
+        return False
+    retry = _ensure_dust_floor_retry_state(Y0._owner.dust)
+    if retry.step_count >= int(cfg.get("max_retries", 0)):
+        _record_implicit_floor_retry_exhausted(Y0._owner, added_mearth)
+        return False
+    _record_implicit_floor_retry(Y0._owner, added_mearth)
+    dx_host = float(dx)
+    shrink = float(cfg.get("shrink", 0.5))
+    x0.suggest(max(dx_host * shrink, 1.0e-300), reset=True)
+    return True
+
+
+def _maybe_retry_implicit_floor_injection_cupy(x0, Y0, dx, sigma1):
+    cfg = _IMPLICIT_FLOOR_RETRY_CONFIG
+    if not cfg.get("enabled", True):
+        return False
+    if cp is None:
+        return _maybe_retry_implicit_floor_injection_numpy(x0, Y0, dx, sigma1)
+    sigma1_cp = cp.asarray(_field_data(sigma1))
+    floor_cp = cp.asarray(_field_data(Y0._owner.dust.SigmaFloor))
+    area_cp = cp.asarray(_field_data(Y0._owner.grid.A))
+    delta_cp = cp.maximum(0.1 * floor_cp - sigma1_cp, 0.0)
+    added_mearth = float(to_numpy(cp.sum(delta_cp * area_cp[:, None] / c.M_earth)))
+    if added_mearth <= float(cfg.get("threshold_mearth", 0.0)):
+        return False
+    retry = _ensure_dust_floor_retry_state(Y0._owner.dust)
+    if retry.step_count >= int(cfg.get("max_retries", 0)):
+        _record_implicit_floor_retry_exhausted(Y0._owner, added_mearth)
+        return False
+    _record_implicit_floor_retry(Y0._owner, added_mearth)
+    dx_host = float(dx)
+    shrink = float(cfg.get("shrink", 0.5))
+    x0.suggest(max(dx_host * shrink, 1.0e-300), reset=True)
+    return True
+
+
+def _maybe_retry_implicit_floor_injection(x0, Y0, dx, sigma1):
+    return _K_IMPLICIT_FLOOR_RETRY(x0, Y0, dx, sigma1)
 
 
 def _get_cupy_dust_solver_mode():
@@ -147,6 +1201,47 @@ def _get_cupy_dust_solver_mode():
         "dense_gpu": "dense_gpu",
     }
     return aliases.get(raw, "sparse")
+
+
+def _get_cupy_diag_positions_csr(matrix):
+    """Return cached CSR data positions for diagonal entries, or None if absent."""
+    global _CUPY_DIAG_POS_CACHE_KEY, _CUPY_DIAG_POS_CACHE_VALUE
+    if cp is None or cp_sparse is None:
+        return None
+    if not isinstance(matrix, cp_sparse.spmatrix):
+        return None
+    if getattr(matrix, "format", None) != "csr":
+        return None
+
+    key = (int(matrix.shape[0]), int(matrix.shape[1]), int(matrix.nnz), str(matrix.dtype))
+    if _CUPY_DIAG_POS_CACHE_KEY == key and _CUPY_DIAG_POS_CACHE_VALUE is not None:
+        return _CUPY_DIAG_POS_CACHE_VALUE
+
+    n = int(matrix.shape[0])
+    indptr = np.asarray(cp.asnumpy(matrix.indptr), dtype=np.int64)
+    indices = np.asarray(cp.asnumpy(matrix.indices), dtype=np.int64)
+    pos = np.full((n,), -1, dtype=np.int64)
+
+    ok = True
+    for i in range(n):
+        s = int(indptr[i])
+        e = int(indptr[i + 1])
+        row_cols = indices[s:e]
+        j = int(np.searchsorted(row_cols, i))
+        if j >= (e - s) or int(row_cols[j]) != i:
+            ok = False
+            break
+        pos[i] = s + j
+
+    if not ok:
+        _CUPY_DIAG_POS_CACHE_KEY = key
+        _CUPY_DIAG_POS_CACHE_VALUE = None
+        return None
+
+    out = cp.asarray(pos)
+    _CUPY_DIAG_POS_CACHE_KEY = key
+    _CUPY_DIAG_POS_CACHE_VALUE = out
+    return out
 
 
 def _a_fortran(sim):
@@ -165,6 +1260,7 @@ def _D_fortran(sim):
     Diff = _dust_f_call(dust_f.d, v2, sim.grid.OmegaK, sim.dust.St)
     Diff[:2, ...] = 0.
     Diff[-2:, ...] = 0.
+    _apply_gas_floor_freeze_to_radial_field(sim, Diff)
     return Diff
 
 
@@ -173,6 +1269,7 @@ def _D_cupy(sim):
     Diff = v2[:, None] / (sim.grid.OmegaK[:, None] * (1.0 + sim.dust.St**2))
     Diff[:2, ...] = 0.
     Diff[-2:, ...] = 0.
+    _apply_gas_floor_freeze_to_radial_field(sim, Diff)
     return Diff
 
 
@@ -188,7 +1285,9 @@ def _H_cupy(sim):
 
 def _F_adv_fortran(sim, Sigma=None):
     Sigma = Sigma if Sigma is not None else sim.dust.Sigma
-    return _dust_f_call(dust_f.fi_adv, Sigma, sim.dust.v.rad, sim.grid.r, sim.grid.ri)
+    Fi = _dust_f_call(dust_f.fi_adv, Sigma, sim.dust.v.rad, sim.grid.r, sim.grid.ri)
+    _apply_gas_floor_freeze_to_flux(sim, Fi)
+    return Fi
 
 
 def _F_adv_cupy(sim, Sigma=None):
@@ -214,6 +1313,7 @@ def _F_adv_cupy(sim, Sigma=None):
     if is_zero_flux_enabled(sim):
         Fi[0, :] = 0.0
         Fi[-1, :] = 0.0
+    _apply_gas_floor_freeze_to_flux(sim, Fi)
     return Fi
 
 
@@ -279,6 +1379,38 @@ def _F_diff_fortran(sim, Sigma=None):
     )
     Fi[:1, :] = 0.
     Fi[-1:, :] = 0.
+    _apply_gas_floor_freeze_to_flux(sim, Fi)
+    return Fi
+
+
+def _F_diff_cupy_elementwise(D, SigmaD, SigmaG, St, u, r, ri):
+    """Elementwise-kernel variant to reduce temporary interface arrays."""
+    dtype = cp.result_type(D.dtype, SigmaD.dtype, SigmaG.dtype, St.dtype, u.dtype, r.dtype, ri.dtype)
+    if dtype not in (cp.float32, cp.float64):
+        return None
+
+    Nr = int(SigmaD.shape[0])
+    Nm = int(SigmaD.shape[1])
+    if Nr < 2 or Nm < 1:
+        return cp.zeros((Nr + 1, Nm), dtype=dtype)
+
+    kernel = _get_fdiff_elementwise_kernel(dtype)
+    if kernel is None:
+        return None
+
+    Dv = cp.asarray(D, dtype=dtype).reshape(-1)
+    SDv = cp.asarray(SigmaD, dtype=dtype).reshape(-1)
+    SGv = cp.asarray(SigmaG, dtype=dtype).reshape(-1)
+    Stv = cp.asarray(St, dtype=dtype).reshape(-1)
+    uv = cp.asarray(u, dtype=dtype).reshape(-1)
+    rv = cp.asarray(r, dtype=dtype).reshape(-1)
+    riv = cp.asarray(ri, dtype=dtype).reshape(-1)
+
+    size = int((Nr - 1) * Nm)
+    Fi = cp.zeros((Nr + 1, Nm), dtype=dtype)
+    Fi[1:-1, :] = kernel(Dv, SDv, SGv, Stv, uv, rv, riv, np.int64(Nm), size=size).reshape(Nr - 1, Nm)
+    Fi[0, :] = 0.0
+    Fi[-1, :] = 0.0
     return Fi
 
 
@@ -293,6 +1425,12 @@ def _F_diff_cupy(sim, Sigma=None):
     u = _field_data(xp.sqrt(sim.dust.delta.rad * sim.gas.cs**2))
     r = _field_data(sim.grid.r)
     ri = _field_data(sim.grid.ri)
+
+    if _F_DIFF_MODE == "elementwise":
+        Fi = _F_diff_cupy_elementwise(D, SigmaD, SigmaG, St, u, r, ri)
+        if Fi is not None:
+            _apply_gas_floor_freeze_to_flux(sim, Fi)
+            return Fi
 
     SigGi = _interp_to_interfaces(SigmaG, r, ri)
     ui = _interp_to_interfaces(u, r, ri)
@@ -324,6 +1462,7 @@ def _F_diff_cupy(sim, Sigma=None):
     # Preserve current dust.py behavior at boundaries.
     Fi[:1, :] = 0.
     Fi[-1:, :] = 0.
+    _apply_gas_floor_freeze_to_flux(sim, Fi)
     return Fi
 
 
@@ -355,7 +1494,7 @@ def _S_hyd_cupy(sim, Sigma=None):
 def _S_coag_fortran(sim, Sigma=None):
     if Sigma is None:
         Sigma = sim.dust.Sigma
-    return _dust_f_call(
+    S = _dust_f_call(
         dust_f.s_coag,
         sim.dust.coagulation.stick,
         sim.dust.coagulation.stick_ind,
@@ -370,6 +1509,8 @@ def _S_coag_fortran(sim, Sigma=None):
         Sigma,
         sim.dust.SigmaFloor,
     )
+    _apply_gas_floor_freeze_to_radial_field(sim, S)
+    return S
 
 
 def _get_coag_pair_indices(Nm):
@@ -452,9 +1593,9 @@ def _get_mass_grid_q(m, Nm):
 def _get_scoag_precomp(cstick, cstick_ind, A, eps, klf, krm, phi, m, Nm):
     """Cache static pair/mask maps for _S_coag_cupy."""
     global _SCOAG_PRECOMP_CACHE_KEY, _SCOAG_PRECOMP_CACHE_VALUE
-    disable_cache = os.getenv("DUSTPY_DISABLE_SCOAG_PRECOMP", "0").strip() == "1"
     key = (
         int(Nm),
+        _S_COAG_MODE,
         id(cstick),
         id(cstick_ind),
         id(A),
@@ -464,7 +1605,7 @@ def _get_scoag_precomp(cstick, cstick_ind, A, eps, klf, krm, phi, m, Nm):
         id(phi),
         id(m),
     )
-    if (not disable_cache) and _SCOAG_PRECOMP_CACHE_KEY == key and _SCOAG_PRECOMP_CACHE_VALUE is not None:
+    if _SCOAG_PRECOMP_CACHE_KEY == key and _SCOAG_PRECOMP_CACHE_VALUE is not None:
         return _SCOAG_PRECOMP_CACHE_VALUE
 
     i_idx, j_idx = _get_coag_pair_indices(Nm)
@@ -506,6 +1647,84 @@ def _get_scoag_precomp(cstick, cstick_ind, A, eps, klf, krm, phi, m, Nm):
     c2 = cp.where(ero_case2)[0]
     ff = cp.where(fullfrag_p)[0]
 
+    stick_sel_mat_gpu = None
+    frag_a_sel_mat_gpu = None
+    frag_sink_sel_mat_gpu = None
+    if _S_COAG_MODE == "fused_spmm":
+        i_idx_np = cp.asnumpy(i_idx).astype(np.int64, copy=False)
+        j_idx_np = cp.asnumpy(j_idx).astype(np.int64, copy=False)
+        n_pairs = int(i_idx_np.size)
+        pair_idx = np.arange(n_pairs, dtype=np.int64)
+
+        cstick_ind_np = cp.asnumpy(cstick_ind)
+        cstick_np = cp.asnumpy(cstick)
+        A_p_np = cp.asnumpy(A_p)
+        klf_p_np = cp.asnumpy(klf_p)
+        krm_p_np = cp.asnumpy(krm_p)
+        eps_p_np = cp.asnumpy(eps_p)
+        p_val_i = int(p_val)
+
+        stick_rows = []
+        stick_cols = []
+        stick_vals = []
+        for nz in range(4):
+            k_np = cstick_ind_np[nz, j_idx_np, i_idx_np].astype(np.int64, copy=False)
+            valid = k_np >= 0
+            if np.any(valid):
+                stick_rows.append(k_np[valid])
+                stick_cols.append(pair_idx[valid])
+                stick_vals.append(cstick_np[nz, j_idx_np[valid], i_idx_np[valid]])
+        if len(stick_rows) > 0:
+            stick_rows_np = np.concatenate(stick_rows)
+            stick_cols_np = np.concatenate(stick_cols)
+            stick_vals_np = np.concatenate(stick_vals)
+            stick_mat_cpu = sp.coo_matrix(
+                (stick_vals_np, (stick_rows_np, stick_cols_np)),
+                shape=(int(Nm), n_pairs),
+            ).tocsr()
+            stick_sel_mat_gpu = cp_sparse.csr_matrix(stick_mat_cpu)
+
+        frag_valid_np = np.where(klf_p_np >= 0)[0].astype(np.int64, copy=False)
+        if int(frag_valid_np.size) > 0:
+            klf_v_np = klf_p_np[frag_valid_np].astype(np.int64, copy=False)
+            A_v_np = A_p_np[frag_valid_np]
+            frag_a_mat_cpu = sp.coo_matrix(
+                (A_v_np, (klf_v_np, np.arange(int(frag_valid_np.size), dtype=np.int64))),
+                shape=(int(Nm), int(frag_valid_np.size)),
+            ).tocsr()
+            frag_a_sel_mat_gpu = cp_sparse.csr_matrix(frag_a_mat_cpu)
+
+        sink_rows = []
+        sink_cols = []
+        sink_vals = []
+        for pidx in range(n_pairs):
+            i_p = int(i_idx_np[pidx])
+            j_p = int(j_idx_np[pidx])
+            k_p = int(krm_p_np[pidx])
+            e_p = float(eps_p_np[pidx])
+            if j_p <= i_p - p_val_i - 1:
+                if k_p == i_p - 1:
+                    sink_rows.extend((k_p, k_p + 1, j_p))
+                    sink_cols.extend((pidx, pidx, pidx))
+                    sink_vals.extend((e_p, -e_p, -1.0))
+                else:
+                    sink_rows.extend((k_p, k_p + 1, i_p, j_p))
+                    sink_cols.extend((pidx, pidx, pidx, pidx))
+                    sink_vals.extend((e_p, 1.0 - e_p, -1.0, -1.0))
+            else:
+                sink_rows.extend((i_p, j_p))
+                sink_cols.extend((pidx, pidx))
+                sink_vals.extend((-1.0, -1.0))
+        if len(sink_rows) > 0:
+            sink_mat_cpu = sp.coo_matrix(
+                (
+                    np.asarray(sink_vals, dtype=np.float64),
+                    (np.asarray(sink_rows, dtype=np.int64), np.asarray(sink_cols, dtype=np.int64)),
+                ),
+                shape=(int(Nm), n_pairs),
+            ).tocsr()
+            frag_sink_sel_mat_gpu = cp_sparse.csr_matrix(sink_mat_cpu)
+
     pre = {
         "i_idx": i_idx,
         "j_idx": j_idx,
@@ -519,10 +1738,12 @@ def _get_scoag_precomp(cstick, cstick_ind, A, eps, klf, krm, phi, m, Nm):
         "c2": c2,
         "ff": ff,
         "phi_lower": cp.tril(phi),
+        "stick_sel_mat_gpu": stick_sel_mat_gpu,
+        "frag_a_sel_mat_gpu": frag_a_sel_mat_gpu,
+        "frag_sink_sel_mat_gpu": frag_sink_sel_mat_gpu,
     }
-    if not disable_cache:
-        _SCOAG_PRECOMP_CACHE_KEY = key
-        _SCOAG_PRECOMP_CACHE_VALUE = pre
+    _SCOAG_PRECOMP_CACHE_KEY = key
+    _SCOAG_PRECOMP_CACHE_VALUE = pre
     return pre
 
 
@@ -603,6 +1824,39 @@ def _S_coag_cupy(sim, Sigma=None):
     Rs_all = Rs_all * p_active
     Rf_all = Rf_all * p_active
 
+    if _S_COAG_MODE == "fused_spmm":
+        S_mid = cp.zeros((Nr_int, Nm), dtype=SigmaArr.dtype)
+        stick_mat = pre.get("stick_sel_mat_gpu")
+        frag_a_mat = pre.get("frag_a_sel_mat_gpu")
+        sink_mat = pre.get("frag_sink_sel_mat_gpu")
+        frag_valid = pre["frag_valid"]
+        phi_lower = pre["phi_lower"]
+        chunk_size = _get_jcoag_chunk_size(Nr_int, Nm)
+        for start in range(0, Nr_int, chunk_size):
+            stop = min(start + chunk_size, Nr_int)
+            S_chunk = S_mid[start:stop]
+            Rs_chunk = Rs_all[start:stop]
+            Rf_chunk = Rf_all[start:stop]
+
+            if stick_mat is not None:
+                S_chunk += stick_mat.dot(Rs_chunk.T).T
+
+            if frag_a_mat is not None and int(frag_valid.size) > 0:
+                ratef_v = Rf_chunk[:, frag_valid]
+                As_chunk = frag_a_mat.dot(ratef_v.T).T
+                S_chunk += (As_chunk @ phi_lower) / m[None, :]
+
+            if sink_mat is not None:
+                S_chunk += sink_mat.dot(Rf_chunk.T).T
+
+        S = cp.zeros_like(SigmaArr)
+        S[1:-1] = S_mid * m[None, :]
+        freeze_mask = _gas_floor_freeze_mask(sim)[1:-1]
+        if int(to_numpy(freeze_mask.sum())) > 0:
+            freeze_rows = cp.where(freeze_mask)[0] + 1
+            S[freeze_rows, :] = 0.0
+        return S
+
     # Sticking contribution.
     for k_v, c_v, valid in pre["stick_maps"]:
         if k_v is None:
@@ -658,6 +1912,10 @@ def _S_coag_cupy(sim, Sigma=None):
 
     S = cp.zeros_like(SigmaArr)
     S[1:-1] = S_flat.reshape(Nr_int, Nm) * m[None, :]
+    freeze_mask = _gas_floor_freeze_mask(sim)[1:-1]
+    if int(to_numpy(freeze_mask.sum())) > 0:
+        freeze_rows = cp.where(freeze_mask)[0] + 1
+        S[freeze_rows, :] = 0.0
     return S
 
 
@@ -817,7 +2075,12 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
         stick_idx_count = int(stick_rows.size)
     else:
         stick_sel_mat_gpu = None
+        stick_mat_cpu = None
         stick_idx_count = 0
+
+    frag_rows_parts = []
+    frag_cols_parts = []
+    frag_vals_parts = []
 
     # Precompute fragmentation redistribution once in packed (flat) form.
     klf_vals = iLF_cpu[j_all, i_all]
@@ -835,11 +2098,16 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
         frag_rows = (k_range[:, None] * Nm + i_frag[None, :]).ravel()
         frag_cols = np.broadcast_to(np.arange(n_frag, dtype=np.int64)[None, :], (Nm, n_frag)).ravel()
         frag_vals = frag_dist_cpu.T.ravel()
+        frag_pair_idx = np.where(frag_valid)[0].astype(np.int64, copy=False)
+        frag_cols_full = np.broadcast_to(frag_pair_idx[None, :], (Nm, n_frag)).ravel()
         frag_mat_cpu = sp.coo_matrix(
             (frag_vals, (frag_rows, frag_cols)),
             shape=(int(Nm * Nm), n_frag),
         ).tocsr()
         frag_sel_mat_gpu = cp_sparse.csr_matrix(frag_mat_cpu[flat_sel, :])
+        frag_rows_parts.append(frag_rows.astype(np.int64, copy=False))
+        frag_cols_parts.append(frag_cols_full.astype(np.int64, copy=False))
+        frag_vals_parts.append(frag_vals)
         frag_idx_count = int(frag_rows.size)
     else:
         frag_sel_mat_gpu = None
@@ -885,6 +2153,10 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
         ).tocsr()
         c1_sel_mat_gpu = cp_sparse.csr_matrix(c1_mat_cpu[flat_sel, :])
         c1_pair_idx_gpu = cp.asarray(c1_pair_idx.astype(np.int64, copy=False))
+        c1_cols_full = np.concatenate((c1_pair_idx, c1_pair_idx, c1_pair_idx)).astype(np.int64, copy=False)
+        frag_rows_parts.append(c1_rows.astype(np.int64, copy=False))
+        frag_cols_parts.append(c1_cols_full)
+        frag_vals_parts.append(c1_vals)
         c1_idx_count = int(c1_rows.size)
     else:
         c1_sel_mat_gpu = None
@@ -922,6 +2194,10 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
         ).tocsr()
         c2_sel_mat_gpu = cp_sparse.csr_matrix(c2_mat_cpu[flat_sel, :])
         c2_pair_idx_gpu = cp.asarray(c2_pair_idx.astype(np.int64, copy=False))
+        c2_cols_full = np.concatenate((c2_pair_idx, c2_pair_idx, c2_pair_idx, c2_pair_idx)).astype(np.int64, copy=False)
+        frag_rows_parts.append(c2_rows.astype(np.int64, copy=False))
+        frag_cols_parts.append(c2_cols_full)
+        frag_vals_parts.append(c2_vals)
         c2_idx_count = int(c2_rows.size)
     else:
         c2_sel_mat_gpu = None
@@ -953,11 +2229,32 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
         ).tocsr()
         ff_sel_mat_gpu = cp_sparse.csr_matrix(ff_mat_cpu[flat_sel, :])
         ff_pair_idx_gpu = cp.asarray(ff_idx.astype(np.int64, copy=False))
+        ff_cols_full = np.concatenate((ff_idx, ff_idx)).astype(np.int64, copy=False)
+        frag_rows_parts.append(ff_rows.astype(np.int64, copy=False))
+        frag_cols_parts.append(ff_cols_full)
+        frag_vals_parts.append(ff_vals)
         ff_idx_count = int(ff_rows.size)
     else:
         ff_sel_mat_gpu = None
         ff_pair_idx_gpu = None
         ff_idx_count = 0
+
+    if len(frag_rows_parts) > 0:
+        frag_all_rows = np.concatenate(frag_rows_parts)
+        frag_all_cols = np.concatenate(frag_cols_parts)
+        frag_all_vals = np.concatenate(frag_vals_parts)
+        frag_all_mat_cpu = sp.coo_matrix(
+            (frag_all_vals, (frag_all_rows, frag_all_cols)),
+            shape=(int(Nm * Nm), n_pairs),
+        ).tocsr()
+        frag_all_sel_mat_gpu = cp_sparse.csr_matrix(frag_all_mat_cpu[flat_sel, :])
+    else:
+        frag_all_sel_mat_gpu = None
+
+    if stick_sel_mat_gpu is not None and frag_all_sel_mat_gpu is not None:
+        jcoag_fused_sel_mat_gpu = cp_sparse.hstack([stick_sel_mat_gpu, frag_all_sel_mat_gpu], format="csr")
+    else:
+        jcoag_fused_sel_mat_gpu = None
 
     pre = {
         "q": q,
@@ -979,6 +2276,8 @@ def _get_jcoag_precomp_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi):
         "ff_sel_mat_gpu": ff_sel_mat_gpu,
         "ff_pair_idx_gpu": ff_pair_idx_gpu,
         "ff_idx_count": ff_idx_count,
+        "frag_all_sel_mat_gpu": frag_all_sel_mat_gpu,
+        "jcoag_fused_sel_mat_gpu": jcoag_fused_sel_mat_gpu,
     }
     _JCOAG_PRECOMP_CACHE_KEY = key
     _JCOAG_PRECOMP_CACHE_VALUE = pre
@@ -1182,27 +2481,32 @@ def _jacobian_coagulation_generator_cupy(
         rates_s = n_mid[start:stop, j_gpu] * Rs_mid[start:stop, j_gpu, i_gpu]
         ratef = n_mid[start:stop, j_gpu] * Rf_mid[start:stop, j_gpu, i_gpu]
 
-        if pre["stick_sel_mat_gpu"] is not None:
-            # Sticking contribution from all pair-rates in one sparse matmul.
-            dat_chunk += pre["stick_sel_mat_gpu"].dot(rates_s.T).T
+        if _JCOAG_GEN_MODE == "fused_spmm" and pre["jcoag_fused_sel_mat_gpu"] is not None:
+            # Fused path: one SpMM over concatenated sticking and fragmentation rates.
+            rates_fused = cp.concatenate((rates_s, ratef), axis=1)
+            dat_chunk += pre["jcoag_fused_sel_mat_gpu"].dot(rates_fused.T).T
+        else:
+            if pre["stick_sel_mat_gpu"] is not None:
+                # Sticking contribution from all pair-rates in one sparse matmul.
+                dat_chunk += pre["stick_sel_mat_gpu"].dot(rates_s.T).T
 
-        if pre["n_frag"] > 0:
-            # Apply fragmentation via sparse operator to avoid building massive
-            # per-step flat index tensors for (k, pair) redistribution.
-            ratef_v = ratef[:, pre["frag_valid_gpu"]]
-            dat_chunk += pre["frag_sel_mat_gpu"].dot(ratef_v.T).T
+            if pre["n_frag"] > 0:
+                # Apply fragmentation via sparse operator to avoid building massive
+                # per-step flat index tensors for (k, pair) redistribution.
+                ratef_v = ratef[:, pre["frag_valid_gpu"]]
+                dat_chunk += pre["frag_sel_mat_gpu"].dot(ratef_v.T).T
 
-        if pre["c1_sel_mat_gpu"] is not None:
-            ratef_c1 = ratef[:, pre["c1_pair_idx_gpu"]]
-            dat_chunk += pre["c1_sel_mat_gpu"].dot(ratef_c1.T).T
+            if pre["c1_sel_mat_gpu"] is not None:
+                ratef_c1 = ratef[:, pre["c1_pair_idx_gpu"]]
+                dat_chunk += pre["c1_sel_mat_gpu"].dot(ratef_c1.T).T
 
-        if pre["c2_sel_mat_gpu"] is not None:
-            ratef_c2 = ratef[:, pre["c2_pair_idx_gpu"]]
-            dat_chunk += pre["c2_sel_mat_gpu"].dot(ratef_c2.T).T
+            if pre["c2_sel_mat_gpu"] is not None:
+                ratef_c2 = ratef[:, pre["c2_pair_idx_gpu"]]
+                dat_chunk += pre["c2_sel_mat_gpu"].dot(ratef_c2.T).T
 
-        if pre["ff_sel_mat_gpu"] is not None:
-            ratef_ff = ratef[:, pre["ff_pair_idx_gpu"]]
-            dat_chunk += pre["ff_sel_mat_gpu"].dot(ratef_ff.T).T
+            if pre["ff_sel_mat_gpu"] is not None:
+                ratef_ff = ratef[:, pre["ff_pair_idx_gpu"]]
+                dat_chunk += pre["ff_sel_mat_gpu"].dot(ratef_ff.T).T
 
     # Apply active-mass masking directly on packed sparse data values.
     active = Sigma[1:-1] > SigmaFloor[1:-1]
@@ -1213,7 +2517,84 @@ def _jacobian_coagulation_generator_cupy(
     return dat_gpu, row, col
 
 
-def _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v):
+def _jacobian_hydrodynamic_generator_numpy(
+    area,
+    D,
+    r,
+    ri,
+    SigmaGas,
+    v,
+    freeze_velocity_mask=None,
+    freeze_diffusion_mask=None,
+):
+    """NumPy equivalent of dust_f.jacobian_hydrodynamic_generator with optional interface freeze."""
+    area = np.asarray(_field_data(area))
+    D = np.asarray(_field_data(D))
+    r = np.asarray(_field_data(r))
+    ri = np.asarray(_field_data(ri))
+    SigmaGas = np.asarray(_field_data(SigmaGas))
+    v = np.asarray(_field_data(v))
+
+    Nr = int(r.shape[0])
+    Nm = int(D.shape[1])
+
+    h = SigmaGas * r
+    hi = np.asarray(_interp_to_interfaces_numpy(h, r, ri))
+    vi = np.asarray(_interp_to_interfaces_numpy(v, r, ri))
+    Di = np.asarray(_interp_to_interfaces_numpy(D, r, ri))
+
+    if freeze_velocity_mask is not None:
+        freeze_velocity_mask = np.asarray(to_numpy(freeze_velocity_mask), dtype=bool)
+        if freeze_velocity_mask.ndim == 1 and freeze_velocity_mask.size == vi.shape[0] and np.any(freeze_velocity_mask):
+            vi[freeze_velocity_mask, :] = 0.0
+        elif freeze_velocity_mask.shape == vi.shape and np.any(freeze_velocity_mask):
+            vi[freeze_velocity_mask] = 0.0
+    if freeze_diffusion_mask is not None:
+        freeze_diffusion_mask = np.asarray(to_numpy(freeze_diffusion_mask), dtype=bool)
+        if freeze_diffusion_mask.ndim == 1 and freeze_diffusion_mask.size == Di.shape[0] and np.any(freeze_diffusion_mask):
+            Di[freeze_diffusion_mask, :] = 0.0
+        elif freeze_diffusion_mask.shape == Di.shape and np.any(freeze_diffusion_mask):
+            Di[freeze_diffusion_mask] = 0.0
+
+    vim = np.minimum(vi, 0.0)
+    vip = np.maximum(vi, 0.0)
+
+    A = np.zeros((Nr, Nm))
+    B = np.zeros((Nr, Nm))
+    C = np.zeros((Nr, Nm))
+
+    Vinv = np.zeros((Nr,))
+    Vinv[:-1] = (2.0 * c.pi) / area[:-1]
+
+    w = np.ones((Nr,))
+    w[:-1] = r[1:] - r[:-1]
+
+    A[1:-1, :] += vip[1:-2, :] * r[:-2, None]
+    B[1:-1, :] += -vip[2:-1, :] * r[1:-1, None] + vim[1:-2, :] * r[1:-1, None]
+    C[1:-1, :] += -vim[2:-1, :] * r[2:, None]
+
+    A[1:-1, :] += Di[1:-2, :] * hi[1:-2, None] / (w[:-2, None] * h[:-2, None]) * r[:-2, None]
+    B[1:-1, :] += -Di[1:-2, :] * hi[1:-2, None] / (w[:-2, None] * h[1:-1, None]) * r[1:-1, None]
+    B[1:-1, :] += -Di[2:-1, :] * hi[2:-1, None] / (w[1:-1, None] * h[1:-1, None]) * r[1:-1, None]
+    C[1:-1, :] += Di[2:-1, :] * hi[2:-1, None] / (w[1:-1, None] * h[2:, None]) * r[2:, None]
+
+    A = A * Vinv[:, None]
+    B = B * Vinv[:, None]
+    C = C * Vinv[:, None]
+
+    return A, B, C
+
+
+def _jacobian_hydrodynamic_generator_cupy(
+    area,
+    D,
+    r,
+    ri,
+    SigmaGas,
+    v,
+    freeze_velocity_mask=None,
+    freeze_diffusion_mask=None,
+):
     """CuPy-native equivalent of dust_f.jacobian_hydrodynamic_generator."""
     area = _field_data(area)
     D = _field_data(D)
@@ -1229,6 +2610,21 @@ def _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v):
     hi = _interp_to_interfaces(h, r, ri)
     vi = _interp_to_interfaces(v, r, ri)
     Di = _interp_to_interfaces(D, r, ri)
+
+    if freeze_velocity_mask is not None:
+        freeze_velocity_mask = xp.asarray(freeze_velocity_mask, dtype=bool)
+        if int(to_numpy(freeze_velocity_mask.sum())) > 0:
+            if freeze_velocity_mask.ndim == 1 and int(freeze_velocity_mask.shape[0]) == int(vi.shape[0]):
+                vi[freeze_velocity_mask, :] = 0.0
+            elif freeze_velocity_mask.shape == vi.shape:
+                vi[freeze_velocity_mask] = 0.0
+    if freeze_diffusion_mask is not None:
+        freeze_diffusion_mask = xp.asarray(freeze_diffusion_mask, dtype=bool)
+        if int(to_numpy(freeze_diffusion_mask.sum())) > 0:
+            if freeze_diffusion_mask.ndim == 1 and int(freeze_diffusion_mask.shape[0]) == int(Di.shape[0]):
+                Di[freeze_diffusion_mask, :] = 0.0
+            elif freeze_diffusion_mask.shape == Di.shape:
+                Di[freeze_diffusion_mask] = 0.0
 
     vim = xp.minimum(vi, 0.0)
     vip = xp.maximum(vi, 0.0)
@@ -1310,6 +2706,73 @@ def _apply_zero_flux_dust_hyd_edges_numpy(A, B, C, area, D, r, ri, SigmaGas, v):
     return A, B, C
 
 
+def _apply_inner_zero_flux_dust_hyd_edge_numpy(
+    A,
+    B,
+    C,
+    area,
+    D,
+    r,
+    ri,
+    SigmaGas,
+    v,
+    block_mask,
+    adv_drain_mask=None,
+    diff_drain_mask=None,
+):
+    """Inject conservative zero-flux row at the inner edge only for selected mass bins."""
+    Nr = int(A.shape[0])
+    if Nr < 2:
+        return A, B, C
+
+    area = np.asarray(area)
+    D = np.asarray(D)
+    r = np.asarray(r)
+    ri = np.asarray(ri)
+    SigmaGas = np.asarray(SigmaGas)
+    v = np.asarray(v)
+
+    h = SigmaGas * r
+    hi = np.asarray(_interp_to_interfaces_numpy(h, r, ri))
+    Di = np.asarray(_interp_to_interfaces_numpy(D, r, ri))
+    vi = np.asarray(_interp_to_interfaces_numpy(v, r, ri))
+    vip = np.maximum(vi, 0.0)
+    vim = np.minimum(vi, 0.0)
+    Vinv = (2.0 * c.pi) / area
+    w_in = r[1] - r[0]
+
+    h0 = h[0] + 1.0e-300
+    h1 = h[1] + 1.0e-300
+
+    block_mask = np.asarray(to_numpy(block_mask), dtype=bool)
+    if block_mask.ndim != 1 or block_mask.size != B.shape[1] or not np.any(block_mask):
+        return A, B, C
+
+    vip1 = vip[1, :].copy()
+    di1 = Di[1, :].copy()
+    if adv_drain_mask is not None:
+        adv_drain_mask = np.asarray(to_numpy(adv_drain_mask), dtype=bool)
+        if adv_drain_mask.ndim == 1 and adv_drain_mask.size == B.shape[1]:
+            vip1[adv_drain_mask] = 0.0
+    if diff_drain_mask is not None:
+        diff_drain_mask = np.asarray(to_numpy(diff_drain_mask), dtype=bool)
+        if diff_drain_mask.ndim == 1 and diff_drain_mask.size == B.shape[1]:
+            di1[diff_drain_mask] = 0.0
+
+    b0 = (
+        -vip1 * r[0]
+        - di1 * hi[1] / (w_in * h0) * r[0]
+    ) * Vinv[0]
+    c0 = (
+        -vim[1, :] * r[1]
+        + di1 * hi[1] / (w_in * h1) * r[1]
+    ) * Vinv[0]
+    A[0, block_mask] = 0.0
+    B[0, block_mask] = b0[block_mask]
+    C[0, block_mask] = c0[block_mask]
+    return A, B, C
+
+
 def _apply_zero_flux_dust_hyd_edges_cupy(A, B, C, area, D, r, ri, SigmaGas, v):
     """Inject conservative zero-flux boundary rows into dust hydrodynamic Jacobian."""
     Nr = int(A.shape[0])
@@ -1360,6 +2823,154 @@ def _apply_zero_flux_dust_hyd_edges_cupy(A, B, C, area, D, r, ri, SigmaGas, v):
     return A, B, C
 
 
+def _apply_inner_zero_flux_dust_hyd_edge_cupy(
+    A,
+    B,
+    C,
+    area,
+    D,
+    r,
+    ri,
+    SigmaGas,
+    v,
+    block_mask,
+    adv_drain_mask=None,
+    diff_drain_mask=None,
+):
+    """Inject conservative zero-flux row at the inner edge only for selected mass bins."""
+    Nr = int(A.shape[0])
+    if Nr < 2:
+        return A, B, C
+
+    area = _field_data(area)
+    D = _field_data(D)
+    r = _field_data(r)
+    ri = _field_data(ri)
+    SigmaGas = _field_data(SigmaGas)
+    v = _field_data(v)
+
+    h = SigmaGas * r
+    hi = _interp_to_interfaces(h, r, ri)
+    Di = _interp_to_interfaces(D, r, ri)
+    vi = _interp_to_interfaces(v, r, ri)
+    vip = xp.maximum(vi, 0.0)
+    vim = xp.minimum(vi, 0.0)
+    Vinv = (2.0 * c.pi) / area
+    w_in = r[1] - r[0]
+
+    h0 = h[0] + 1.0e-300
+    h1 = h[1] + 1.0e-300
+
+    if block_mask is None:
+        return A, B, C
+    block_mask = xp.asarray(block_mask, dtype=bool)
+    if int(to_numpy(block_mask.sum())) == 0:
+        return A, B, C
+
+    vip1 = vip[1, :].copy()
+    di1 = Di[1, :].copy()
+    if adv_drain_mask is not None:
+        adv_drain_mask = xp.asarray(adv_drain_mask, dtype=bool)
+        if int(to_numpy(adv_drain_mask.sum())) > 0:
+            vip1[adv_drain_mask] = 0.0
+    if diff_drain_mask is not None:
+        diff_drain_mask = xp.asarray(diff_drain_mask, dtype=bool)
+        if int(to_numpy(diff_drain_mask.sum())) > 0:
+            di1[diff_drain_mask] = 0.0
+
+    b0 = (
+        -vip1 * r[0]
+        - di1 * hi[1] / (w_in * h0) * r[0]
+    ) * Vinv[0]
+    c0 = (
+        -vim[1, :] * r[1]
+        + di1 * hi[1] / (w_in * h1) * r[1]
+    ) * Vinv[0]
+    A0 = A[0, :]
+    B0 = B[0, :]
+    C0 = C[0, :]
+    A0[block_mask] = 0.0
+    B0[block_mask] = b0[block_mask]
+    C0[block_mask] = c0[block_mask]
+    return A, B, C
+
+
+def _inner_diode_block_mask(sim):
+    """Return per-mass-bin mask for inner-edge outward drift (potential artificial feed)."""
+    if not is_dust_inner_outflow_only_enabled(sim):
+        return None
+    block = None
+    try:
+        v0 = _field_data(sim.dust.v.rad)[0, :]
+        block = xp.asarray(v0 > 0.0, dtype=bool)
+    except Exception:
+        block = None
+    inactive = None
+    try:
+        inactive = _dust_transport_inactive_mask(sim)[0, :]
+        inactive = xp.asarray(inactive, dtype=bool)
+    except Exception:
+        inactive = None
+    floor_mask = None
+    negative_vb_mask = None
+    try:
+        _refresh_dust_boundary_views(sim)
+        inner = getattr(sim.dust.boundary, "inner", None)
+        if inner is not None:
+            vb = inner._getboundary()
+            if vb is not None:
+                negative_vb_mask = xp.asarray(vb < 0.0, dtype=bool)
+    except Exception:
+        negative_vb_mask = None
+    merged = None
+    for mask in (block, inactive, floor_mask, negative_vb_mask):
+        if mask is None:
+            continue
+        merged = mask if merged is None else (merged | mask)
+    return merged
+
+
+def _refresh_dust_boundary_views(sim):
+    """Refresh boundary helper views so boundary formulas use the current dust field."""
+    inner = getattr(sim.dust.boundary, "inner", None)
+    if inner is not None:
+        inner._r = sim.grid.r[:3]
+        inner._ri = sim.grid.ri[:3]
+        inner._S = sim.dust.Sigma[:3]
+
+    outer = getattr(sim.dust.boundary, "outer", None)
+    if outer is not None:
+        outer._r = sim.grid.r[::-1][:3]
+        outer._ri = sim.grid.ri[::-1][:3]
+        outer._S = sim.dust.Sigma[::-1][:3]
+
+
+def _apply_inner_boundary_selective(sim, block_mask=None):
+    """Apply the configured inner boundary condition only for bins not blocked by the diode."""
+    _refresh_dust_boundary_views(sim)
+    boundary = getattr(sim.dust.boundary, "inner", None)
+    if boundary is None:
+        return
+
+    vb = boundary._getboundary()
+    if vb is None:
+        return
+
+    sigma0 = sim.dust.Sigma[0]
+    if block_mask is None:
+        sigma0[...] = vb
+        return
+
+    mask = xp.asarray(block_mask, dtype=bool)
+    if sigma0.ndim != 1 or mask.ndim != 1 or sigma0.shape[0] != mask.shape[0]:
+        sigma0[...] = vb
+        return
+
+    open_mask = ~mask
+    if bool(to_numpy(xp.any(open_mask))):
+        sigma0[open_mask] = vb[open_mask]
+
+
 def _kernel_fortran(sim):
     return _dust_f_call(
         dust_f.kernel,
@@ -1371,6 +2982,44 @@ def _kernel_fortran(sim):
     )
 
 
+def _kernel_cupy_elementwise(a, H, Sigma, SigmaFloor, vrel):
+    """Elementwise-kernel variant for collision-kernel assembly."""
+    dtype = cp.result_type(a.dtype, H.dtype, Sigma.dtype, SigmaFloor.dtype, vrel.dtype)
+    if dtype not in (cp.float32, cp.float64):
+        return None
+
+    kernel = _get_collision_kernel_elementwise_kernel(dtype)
+    if kernel is None:
+        return None
+
+    Nr = int(a.shape[0])
+    Nm = int(a.shape[1])
+    Nr_int = Nr - 2
+    size = int(Nr_int * Nm * Nm)
+    if size <= 0:
+        return cp.zeros((Nr, Nm, Nm), dtype=dtype)
+
+    a_int = cp.asarray(a[1:-1], dtype=dtype).reshape(-1)
+    h_int = cp.asarray(H[1:-1], dtype=dtype).reshape(-1)
+    sigma_int = cp.asarray(Sigma[1:-1], dtype=dtype).reshape(-1)
+    floor_int = cp.asarray(SigmaFloor[1:-1], dtype=dtype).reshape(-1)
+    vrel_int = cp.asarray(vrel[1:-1], dtype=dtype).reshape(-1)
+
+    out_int = kernel(
+        a_int,
+        h_int,
+        sigma_int,
+        floor_int,
+        vrel_int,
+        np.int64(Nm),
+        size=size,
+    )
+
+    K = cp.zeros((Nr, Nm, Nm), dtype=dtype)
+    K[1:-1, :, :] = out_int.reshape(Nr_int, Nm, Nm)
+    return K
+
+
 def _kernel_cupy(sim):
     global _KERNEL_LOWER_MASK
     a = _field_data(sim.dust.a)
@@ -1379,6 +3028,11 @@ def _kernel_cupy(sim):
     SigmaFloor = _field_data(sim.dust.SigmaFloor)
     vrel = _field_data(sim.dust.v.rel.tot)
     Nm = int(sim.grid.Nm)
+
+    if _COLLISION_KERNEL_MODE == "elementwise" and cp is not None:
+        K = _kernel_cupy_elementwise(a, H, Sigma, SigmaFloor, vrel)
+        if K is not None:
+            return K
 
     if _KERNEL_LOWER_MASK is None or int(_KERNEL_LOWER_MASK.shape[0]) != Nm:
         # Fortran kernels are stored/accessed as K(ir, j, i) with j <= i active.
@@ -1418,12 +3072,16 @@ def _St_Epstein_StokesI_cupy(sim):
 
 
 def _vrad_fortran(sim):
-    return _dust_f_call(dust_f.vrad, sim.dust.St, sim.dust.v.driftmax, sim.gas.v.rad)
+    vr = _dust_f_call(dust_f.vrad, sim.dust.St, sim.dust.v.driftmax, sim.gas.v.rad)
+    _apply_gas_floor_freeze_to_radial_field(sim, vr)
+    return vr
 
 
 def _vrad_cupy(sim):
     St = sim.dust.St
-    return (sim.gas.v.rad[:, None] + 2.0 * sim.dust.v.driftmax[:, None] * St) / (St**2 + 1.0)
+    vr = (sim.gas.v.rad[:, None] + 2.0 * sim.dust.v.driftmax[:, None] * St) / (St**2 + 1.0)
+    _apply_gas_floor_freeze_to_radial_field(sim, vr)
+    return vr
 
 
 def _vrel_brownian_motion_fortran(sim):
@@ -1482,6 +3140,43 @@ def _vrel_turbulent_motion_fortran(sim):
     )
 
 
+def _vrel_turbulent_motion_cupy_elementwise(alpha, cs, mump, OmegaK, SigmaGas, St):
+    """Elementwise-kernel variant to reduce temporary 3D allocations."""
+    dtype = cp.result_type(alpha.dtype, cs.dtype, mump.dtype, OmegaK.dtype, SigmaGas.dtype, St.dtype)
+    if dtype not in (cp.float32, cp.float64):
+        return None
+
+    kernel = _get_vrel_turbulent_elementwise_kernel(dtype)
+    if kernel is None:
+        return None
+
+    Nr = int(St.shape[0])
+    Nm = int(St.shape[1])
+    size = int(Nr * Nm * Nm)
+    if size <= 0:
+        return cp.zeros((Nr, Nm, Nm), dtype=dtype)
+
+    alpha_arr = cp.asarray(alpha, dtype=dtype)
+    cs_arr = cp.asarray(cs, dtype=dtype)
+    mump_arr = cp.asarray(mump, dtype=dtype)
+    omk_arr = cp.asarray(OmegaK, dtype=dtype)
+    sig_arr = cp.asarray(SigmaGas, dtype=dtype)
+    st_arr = cp.asarray(St, dtype=dtype).reshape(-1)
+
+    out = kernel(
+        alpha_arr,
+        cs_arr,
+        mump_arr,
+        omk_arr,
+        sig_arr,
+        st_arr,
+        np.int64(Nm),
+        dtype.type(c.sigma_H2),
+        size=size,
+    )
+    return out.reshape(Nr, Nm, Nm)
+
+
 def _vrel_turbulent_motion_cupy(sim):
     alpha = _field_data(sim.dust.delta.turb)
     cs = _field_data(sim.gas.cs)
@@ -1489,6 +3184,11 @@ def _vrel_turbulent_motion_cupy(sim):
     OmegaK = _field_data(sim.grid.OmegaK)
     SigmaGas = _field_data(sim.gas.Sigma)
     St = _field_data(sim.dust.St)
+
+    if _VREL_TURB_MODE == "elementwise":
+        vrel = _vrel_turbulent_motion_cupy_elementwise(alpha, cs, mump, OmegaK, SigmaGas, St)
+        if vrel is not None:
+            return vrel
 
     c0 = 1.6015125
     c1 = -0.63119577
@@ -1574,12 +3274,45 @@ def _p_frag_fortran(sim):
     return _dust_f_call(dust_f.pfrag, sim.dust.v.rel.tot, sim.dust.v.frag)
 
 
+def _p_frag_cupy_elementwise(vrel, vfrag):
+    """Elementwise-kernel variant of fragmentation probability."""
+    dtype = cp.result_type(vrel.dtype, vfrag.dtype)
+    if dtype not in (cp.float32, cp.float64):
+        return None
+
+    kernel = _get_pfrag_elementwise_kernel(dtype)
+    if kernel is None:
+        return None
+
+    Nr = int(vrel.shape[0])
+    Nm = int(vrel.shape[1])
+    Nr_int = Nr - 2
+    size = int(Nr_int * Nm * Nm)
+    if size <= 0:
+        return cp.zeros_like(vrel, dtype=dtype)
+
+    vrel_int = cp.asarray(vrel[1:-1], dtype=dtype).reshape(-1)
+    vfrag_int = cp.asarray(vfrag[1:-1], dtype=dtype)
+    out_int = kernel(vrel_int, vfrag_int, np.int64(Nm), size=size)
+
+    pf = cp.zeros_like(vrel, dtype=dtype)
+    pf[1:-1, :, :] = out_int.reshape(Nr_int, Nm, Nm)
+    return pf
+
+
 def _p_frag_cupy(sim):
     vrel = _field_data(sim.dust.v.rel.tot)
-    vfrag = _field_data(sim.dust.v.frag)[:, None, None]
+    vfrag = _field_data(sim.dust.v.frag)
+
+    if _P_FRAG_MODE == "elementwise" and cp is not None:
+        pf = _p_frag_cupy_elementwise(vrel, vfrag)
+        if pf is not None:
+            return pf
+
+    vfrag3 = vfrag[:, None, None]
     mask = vrel != 0.0
     denom = xp.where(mask, vrel, 1.0)
-    dum = (vfrag / denom) ** 2
+    dum = (vfrag3 / denom) ** 2
     pf = xp.where(mask, (1.5 * dum + 1.0) * xp.exp(-1.5 * dum), 0.0)
     pf[0, :, :] = 0.0
     pf[-1, :, :] = 0.0
@@ -1727,11 +3460,11 @@ def _coagulation_parameters_python(sim):
     return cstick, cstick_ind, AFrag, epsFrag, klf, krm, phiFrag
 
 
-def bind_backend_kernels(backend=None):
+def bind_backend_kernels(backend=None, force=False, runtime_token=None):
     """Bind hot dust kernels to backend-specific implementations once."""
     global _BOUND_BACKEND, _K_A, _K_D, _K_H, _K_F_ADV, _K_F_DIFF, _K_S_COAG, _K_S_HYD
     global _K_KERNEL, _K_P_FRAG, _K_ST, _K_VRAD, _K_VREL_BROWN, _K_VREL_AZI, _K_VREL_RAD, _K_VREL_TURB, _K_VREL_VERT
-    global _K_COAG_PARAMS, _K_IMPL_1_DIRECT, _K_JACOBIAN, _K_INTERP_TO_INTERFACES
+    global _K_COAG_PARAMS, _K_IMPL_1_DIRECT, _K_IMPLICIT_FLOOR_RETRY, _K_JACOBIAN, _K_INTERP_TO_INTERFACES
     global _KERNEL_LOWER_MASK, _COAG_CACHE_KEY, _COAG_CACHE_VALUE
     global _COAG_PAIR_CACHE_KEY, _COAG_PAIR_CACHE_VALUE, _SCOAG_PAIRMAP_CACHE_KEY, _SCOAG_PAIRMAP_CACHE_VALUE
     global _FRAG_P_CACHE_KEY, _FRAG_P_CACHE_VALUE, _MGRID_Q_CACHE_KEY, _MGRID_Q_CACHE_VALUE
@@ -1742,23 +3475,83 @@ def bind_backend_kernels(backend=None):
     global _JSTICK_MAP_CACHE_KEY, _JSTICK_MAP_CACHE_VALUE
     global _JFRAG_MAP_CACHE_KEY, _JFRAG_MAP_CACHE_VALUE, _JCOAG_WORK_CACHE_KEY, _JCOAG_WORK_CACHE_VALUE
     global _DUST_JHB_PATTERN_CACHE_KEY, _DUST_JHB_PATTERN_CACHE_VALUE
-    global _JCOAG_WORKBUF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE
+    global _JCOAG_GEN_MODE, _S_COAG_MODE, _F_DIFF_MODE, _SCATTER_MODE, _CUPY_DUST_SOLVER_MODE
+    global _VREL_TURB_MODE, _VREL_TOT_MODE, _P_FRAG_MODE, _COLLISION_KERNEL_MODE
+    global _CUPY_A_BUILD_MODE, _CUPY_DIAG_POS_CACHE_KEY, _CUPY_DIAG_POS_CACHE_VALUE
+    global _JCOAG_CHUNK_SIZE_OVERRIDE, _SANITIZER_CONFIG, _GAS_FLOOR_FREEZE_CONFIG, _DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG, _IMPLICIT_FLOOR_RETRY_CONFIG
 
+    _switch_runtime_state(runtime_token)
     backend = get_backend() if backend is None else backend
-    bind_sparse_solver(backend=backend)
-    mode = os.getenv("DUSTPY_JCOAG_WORKBUF_MODE", "fresh").strip().lower()
-    if mode not in ("fresh", "reuse"):
-        mode = "reuse"
+    bind_sparse_solver(backend=backend, force=force, runtime_token=runtime_token)
+    cupy_kernel_optimized = _env_bool("DUSTPY_CUPY_KERNEL_OPTIMIZED", default=True) if backend == "cupy" else False
+    cupy_solver_optimized = _env_bool("DUSTPY_CUPY_SOLVER_OPTIMIZED", default=True) if backend == "cupy" else False
+    default_jcoag_gen_mode = "fused_spmm" if cupy_kernel_optimized else "baseline"
+    default_scoag_mode = "fused_spmm" if cupy_kernel_optimized else "baseline"
+    default_fdiff_mode = "elementwise" if cupy_kernel_optimized else "baseline"
+    default_vrel_turb_mode = "elementwise" if cupy_kernel_optimized else "baseline"
+    default_vrel_tot_mode = "elementwise" if cupy_kernel_optimized else "baseline"
+    default_p_frag_mode = "elementwise" if cupy_kernel_optimized else "baseline"
+    default_collision_kernel_mode = "elementwise" if cupy_kernel_optimized else "baseline"
+    default_cupy_a_build_mode = "diag_inplace" if cupy_solver_optimized else "identity_sub"
+
+    jcoag_gen_mode = os.getenv("DUSTPY_JCOAG_GEN_MODE", default_jcoag_gen_mode).strip().lower()
+    if jcoag_gen_mode not in ("baseline", "fused_spmm"):
+        jcoag_gen_mode = default_jcoag_gen_mode
+    scoag_mode = os.getenv("DUSTPY_S_COAG_MODE", default_scoag_mode).strip().lower()
+    if scoag_mode not in ("baseline", "fused_spmm"):
+        scoag_mode = default_scoag_mode
+    fdiff_mode = os.getenv("DUSTPY_F_DIFF_MODE", default_fdiff_mode).strip().lower()
+    if fdiff_mode not in ("baseline", "elementwise"):
+        fdiff_mode = default_fdiff_mode
     scatter_mode = os.getenv("DUSTPY_SCATTER_MODE", "addat").strip().lower()
-    if scatter_mode not in ("addat", "scatter"):
+    if scatter_mode not in ("addat", "scatter", "rawkernel"):
         scatter_mode = "addat"
+    vrel_turb_mode = os.getenv("DUSTPY_VREL_TURB_MODE", default_vrel_turb_mode).strip().lower()
+    if vrel_turb_mode not in ("baseline", "elementwise"):
+        vrel_turb_mode = default_vrel_turb_mode
+    vrel_tot_mode = os.getenv("DUSTPY_VREL_TOT_MODE", default_vrel_tot_mode).strip().lower()
+    if vrel_tot_mode not in ("baseline", "elementwise"):
+        vrel_tot_mode = default_vrel_tot_mode
+    p_frag_mode = os.getenv("DUSTPY_P_FRAG_MODE", default_p_frag_mode).strip().lower()
+    if p_frag_mode not in ("baseline", "elementwise"):
+        p_frag_mode = default_p_frag_mode
+    collision_kernel_mode = os.getenv("DUSTPY_COLLISION_KERNEL_MODE", default_collision_kernel_mode).strip().lower()
+    if collision_kernel_mode not in ("baseline", "elementwise"):
+        collision_kernel_mode = default_collision_kernel_mode
+    cupy_a_build_mode = os.getenv("DUSTPY_CUPY_A_BUILD_MODE", default_cupy_a_build_mode).strip().lower()
+    if cupy_a_build_mode not in ("identity_sub", "diag_inplace"):
+        cupy_a_build_mode = default_cupy_a_build_mode
+    jcoag_chunk_size_raw = os.getenv("DUSTPY_JCOAG_CHUNK_SIZE", "auto").strip().lower()
+    jcoag_chunk_size_override = None
+    if jcoag_chunk_size_raw and jcoag_chunk_size_raw != "auto":
+        try:
+            jcoag_chunk_size_override = max(1, int(jcoag_chunk_size_raw))
+        except Exception:
+            jcoag_chunk_size_override = None
     cupy_dust_solver_mode = _get_cupy_dust_solver_mode() if backend == "cupy" else "sparse"
+    sanitizer_cfg = _load_sanitizer_config()
+    gas_floor_freeze_cfg = _load_gas_floor_freeze_config()
+    dust_transport_inactive_floor_cfg = _load_dust_transport_inactive_floor_config()
+    implicit_floor_retry_cfg = _load_implicit_floor_retry_config()
     if (
-        backend == _BOUND_BACKEND
+        (not force)
+        and backend == _BOUND_BACKEND
         and _K_A is not None
-        and mode == _JCOAG_WORKBUF_MODE
+        and jcoag_gen_mode == _JCOAG_GEN_MODE
+        and scoag_mode == _S_COAG_MODE
+        and fdiff_mode == _F_DIFF_MODE
         and scatter_mode == _SCATTER_MODE
         and cupy_dust_solver_mode == _CUPY_DUST_SOLVER_MODE
+        and vrel_turb_mode == _VREL_TURB_MODE
+        and vrel_tot_mode == _VREL_TOT_MODE
+        and p_frag_mode == _P_FRAG_MODE
+        and collision_kernel_mode == _COLLISION_KERNEL_MODE
+        and cupy_a_build_mode == _CUPY_A_BUILD_MODE
+        and jcoag_chunk_size_override == _JCOAG_CHUNK_SIZE_OVERRIDE
+        and sanitizer_cfg == _SANITIZER_CONFIG
+        and gas_floor_freeze_cfg == _GAS_FLOOR_FREEZE_CONFIG
+        and dust_transport_inactive_floor_cfg == _DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG
+        and implicit_floor_retry_cfg == _IMPLICIT_FLOOR_RETRY_CONFIG
     ):
         return
 
@@ -1785,11 +3578,28 @@ def bind_backend_kernels(backend=None):
     else:
         _K_IMPL_1_DIRECT = select_backend({"cupy": _f_impl_1_direct_cupy}, backend=backend, default=_f_impl_1_direct_numpy)
         _K_JACOBIAN = select_backend({"cupy": _jacobian_cupy}, backend=backend, default=_jacobian_numpy)
+    _K_IMPLICIT_FLOOR_RETRY = select_backend(
+        {"cupy": _maybe_retry_implicit_floor_injection_cupy},
+        backend=backend,
+        default=_maybe_retry_implicit_floor_injection_numpy,
+    )
     _K_INTERP_TO_INTERFACES = select_backend({"cupy": _interp_to_interfaces_cupy}, backend=backend, default=_interp_to_interfaces_numpy)
 
-    _JCOAG_WORKBUF_MODE = mode
+    _JCOAG_GEN_MODE = jcoag_gen_mode
+    _S_COAG_MODE = scoag_mode
+    _F_DIFF_MODE = fdiff_mode
     _SCATTER_MODE = scatter_mode
     _CUPY_DUST_SOLVER_MODE = cupy_dust_solver_mode
+    _VREL_TURB_MODE = vrel_turb_mode
+    _VREL_TOT_MODE = vrel_tot_mode
+    _P_FRAG_MODE = p_frag_mode
+    _COLLISION_KERNEL_MODE = collision_kernel_mode
+    _CUPY_A_BUILD_MODE = cupy_a_build_mode
+    _JCOAG_CHUNK_SIZE_OVERRIDE = jcoag_chunk_size_override
+    _SANITIZER_CONFIG = sanitizer_cfg
+    _GAS_FLOOR_FREEZE_CONFIG = gas_floor_freeze_cfg
+    _DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG = dust_transport_inactive_floor_cfg
+    _IMPLICIT_FLOOR_RETRY_CONFIG = implicit_floor_retry_cfg
 
     _KERNEL_LOWER_MASK = None
     _COAG_CACHE_KEY = None
@@ -1820,8 +3630,12 @@ def bind_backend_kernels(backend=None):
     _JCOAG_WORK_CACHE_VALUE = None
     _DUST_JHB_PATTERN_CACHE_KEY = None
     _DUST_JHB_PATTERN_CACHE_VALUE = None
+    _CUPY_DIAG_POS_CACHE_KEY = None
+    _CUPY_DIAG_POS_CACHE_VALUE = None
 
     _BOUND_BACKEND = backend
+    if runtime_token is not None:
+        _RUNTIME_STATES[runtime_token] = _capture_runtime_state()
 
 
 # Initialize default bindings at import time.
@@ -1835,7 +3649,11 @@ def boundary(sim):
     ----------
     sim : Frame
         Parent simulation frame"""
-    sim.dust.boundary.inner.setboundary()
+    _refresh_dust_boundary_views(sim)
+    if is_dust_inner_outflow_only_enabled(sim):
+        _apply_inner_boundary_selective(sim, _inner_diode_block_mask(sim))
+    else:
+        sim.dust.boundary.inner.setboundary()
     sim.dust.boundary.outer.setboundary()
 
 
@@ -1846,11 +3664,197 @@ def enforce_floor_value(sim):
     ----------
     sim : Frame
         Parent simulation frame"""
-    sim.dust.Sigma = xp.where(
-        sim.dust.Sigma > sim.dust.SigmaFloor,
-        sim.dust.Sigma,
-        0.1*sim.dust.SigmaFloor)
+    sigma = _field_data(sim.dust.Sigma)
+    floor = _field_data(sim.dust.SigmaFloor)
+    target = xp.where(sigma > floor, sigma, 0.1 * floor)
+    delta = xp.maximum(target - sigma, 0.0)
+    added_mearth = float(to_numpy(xp.sum(delta * _field_data(sim.grid.A)[:, None] / c.M_earth)))
+    if added_mearth > 0.0:
+        topup = _ensure_dust_floor_topup_state(sim.dust)
+        topup.total_mearth += added_mearth
+        topup.last_mearth = added_mearth
+        topup.count += 1
+    sim.dust.Sigma = target
 
+
+def _sanitize_floorborn_islands(sim):
+    """Optionally clip floor-born tiny islands after implicit/explicit floor enforcement."""
+    cfg = _SANITIZER_CONFIG
+    dust = sim.dust
+    san = _ensure_dust_san_state(dust)
+    san.last_n_clipped = 0
+
+    if not cfg.get("enabled", False):
+        return
+
+    backend = get_backend()
+    if backend == "cupy" and cp is not None:
+        amod = cp
+    else:
+        amod = np
+
+    sigma = _field_data(dust.Sigma)
+    sigma_floor = _field_data(dust.SigmaFloor)
+
+    if sigma.shape != sigma_floor.shape:
+        return
+
+    ratio_now = amod.where(sigma_floor > 0.0, sigma / sigma_floor, 0.0)
+
+    prev_ratio = san.prev_ratio
+    if prev_ratio is None or prev_ratio.shape != ratio_now.shape:
+        san.prev_ratio = ratio_now.copy()
+        return
+
+    t_years = float(sim.t) / c.year
+
+    if san.Mdust0_mearth is None:
+        area = _field_data(sim.grid.A)
+        mdust0 = amod.sum(sigma * area[:, None]) / c.M_earth
+        mdust0 = float(to_numpy(mdust0))
+        san.Mdust0_mearth = max(mdust0, 1e-300)
+
+    if not hasattr(dust, "dM_sanitizer"):
+        dust.addfield(
+            "dM_sanitizer",
+            xp.zeros_like(dust.Sigma),
+            description="Cumulative sanitizer-removed dust mass [M_earth] per cell",
+        )
+    dM_sanitizer = _field_data(dust.dM_sanitizer)
+
+    _, nm = sigma.shape
+    tiny_max = float(cfg["tiny_max_ratio"])
+    born_ratio = float(cfg["born_ratio"])
+    prev_floor_max = 0.11
+    nrad = 1
+
+    prev_floor = prev_ratio <= prev_floor_max
+    prev_floor_i8 = prev_floor.astype(np.int8 if amod is np else cp.int8, copy=False)
+    suffix_ok = amod.flip(
+        amod.cumprod(amod.flip(prev_floor_i8, axis=1), axis=1),
+        axis=1,
+    ).astype(bool)
+
+    half_idx = san.half_idx
+    if half_idx is None or int(getattr(half_idx, "size", -1)) != int(nm):
+        # Map each mass bin m_j to the closest bin to m_j / 2 on the actual grid.
+        m_np = to_numpy(_field_data(sim.grid.m)).astype(np.float64, copy=False)
+        m_half = 0.5 * m_np
+        idx_hi = np.searchsorted(m_np, m_half, side="left")
+        idx_hi = np.clip(idx_hi, 0, nm - 1)
+        idx_lo = np.clip(idx_hi - 1, 0, nm - 1)
+        use_lo = np.abs(m_np[idx_lo] - m_half) <= np.abs(m_np[idx_hi] - m_half)
+        half_idx_np = np.where(use_lo, idx_lo, idx_hi).astype(np.int64, copy=False)
+        if amod is np:
+            half_idx = half_idx_np
+        else:
+            half_idx = cp.asarray(half_idx_np, dtype=cp.int64)
+        san.half_idx = half_idx
+    row_ok = suffix_ok[:, half_idx]
+
+    radial_ok = amod.ones_like(row_ok, dtype=bool)
+    for dr in range(-nrad, nrad + 1):
+        shifted = amod.zeros_like(row_ok, dtype=bool)
+        if dr == 0:
+            shifted[...] = row_ok
+        elif dr > 0:
+            shifted[:-dr, :] = row_ok[dr:, :]
+        else:
+            k = -dr
+            shifted[k:, :] = row_ok[:-k, :]
+        radial_ok &= shifted
+
+    candidate = (
+        (ratio_now > born_ratio)
+        & (ratio_now <= tiny_max)
+        & radial_ok
+    )
+    candidate[0, :] = False
+    candidate[-1, :] = False
+
+    tinymax_blocked = (
+        (ratio_now > born_ratio)
+        & (ratio_now > tiny_max)
+        & radial_ok
+    )
+    tinymax_blocked[0, :] = False
+    tinymax_blocked[-1, :] = False
+    n_tinymax_blocked = int(to_numpy(tinymax_blocked.sum()))
+    if n_tinymax_blocked > 0:
+        san.tinymax_block_cycles += 1
+        san.tinymax_block_cells += n_tinymax_blocked
+        max_ratio_blocked = float(to_numpy(amod.max(amod.where(tinymax_blocked, ratio_now, 0.0))))
+        if max_ratio_blocked > san.tinymax_block_max_ratio:
+            san.tinymax_block_max_ratio = max_ratio_blocked
+        if cfg.get("tinymax_report", False):
+            cadence = max(1, int(cfg.get("tinymax_report_cadence", 1)))
+            cycle_now = int(sim.RL_count_cycle)
+            if cycle_now % cadence == 0:
+                print(
+                    "[SAN_TINYMAX_BLOCK] "
+                    f"cycle={cycle_now}, t={t_years:.3f}yr, "
+                    f"n_cells={n_tinymax_blocked}, "
+                    f"tiny_max_ratio={tiny_max:.6e}, "
+                    f"max_ratio={max_ratio_blocked:.6e}"
+                )
+
+    target = 0.1 * sigma_floor
+    delta = amod.where(candidate, sigma - target, 0.0)
+    to_clip = delta > 0.0
+    n_clipped = int(to_numpy(to_clip.sum()))
+
+    san.active_cycles += 1
+    san.last_n_clipped = n_clipped
+    if n_clipped == 0:
+        san.prev_ratio = ratio_now.copy()
+        return
+
+    sigma[to_clip] = target[to_clip]
+    area = _field_data(sim.grid.A)
+    dM_inc = delta * to_clip * (area[:, None] / c.M_earth)
+    dM_sanitizer[...] = dM_sanitizer + dM_inc
+    dM_cycle = float(to_numpy(dM_inc.sum()))
+    san.dM_total_mearth += dM_cycle
+    san.clip_cycles += 1
+    san.sum_clipped_cells += n_clipped
+    if n_clipped > san.max_cells_per_cycle:
+        san.max_cells_per_cycle = n_clipped
+    if san.first_clip_cycle is None:
+        san.first_clip_cycle = int(sim.RL_count_cycle)
+        san.first_clip_t_years = t_years
+        san.first_clip_cells = n_clipped
+
+    ratio_after = amod.where(sigma_floor > 0.0, sigma / sigma_floor, 0.0)
+    san.prev_ratio = ratio_after.copy()
+
+    stop_thresh_mearth = float(cfg["stop_thresh_mearth"])
+    if stop_thresh_mearth > 0.0:
+        if san.dM_total_mearth > stop_thresh_mearth:
+            print(
+                "[SANITIZER_STOP] "
+                f"cycle={int(sim.RL_count_cycle)}, t={t_years:.3f}yr, "
+                f"dM_san={san.dM_total_mearth:.6e} Mearth, "
+                f"stop_thresh_mearth={stop_thresh_mearth:.6e}"
+            )
+            if sim.writer is not None:
+                datadir = sim.writer.datadir
+                try:
+                    sim.writer.write(
+                        sim,
+                        int(sim.RL_count_cycle),
+                        True,
+                        filename=os.path.join(str(datadir), "sanitizer_stop.hdf5"),
+                    )
+                except Exception:
+                    pass
+                try:
+                    sim.writer.writedump(
+                        sim,
+                        filename=os.path.join(str(datadir), "frame_sanitizer_stop.dmp"),
+                    )
+                except Exception:
+                    pass
+            raise SystemExit("DustPy sanitizer stop threshold exceeded.")
 
 def prepare(sim):
     """Function prepares implicit dust integration step.
@@ -1865,6 +3869,7 @@ def prepare(sim):
     sim.dust.S.ext[-1] = 0.
     # Storing current surface density
     sim.dust._SigmaOld[...] = sim.dust.Sigma[...]
+    _ensure_dust_floor_retry_state(sim.dust).step_count = 0
 
 
 def finalize_explicit(sim):
@@ -1878,6 +3883,8 @@ def finalize_explicit(sim):
     if not is_zero_flux_enabled(sim):
         boundary(sim)
     enforce_floor_value(sim)
+    if _SANITIZER_CONFIG.get("enabled", False) and _SANITIZER_CONFIG.get("mode", "implicit") == "both":
+        _sanitize_floorborn_islands(sim)
 
 
 def finalize_implicit(sim):
@@ -1891,6 +3898,8 @@ def finalize_implicit(sim):
     if not is_zero_flux_enabled(sim):
         boundary(sim)
     enforce_floor_value(sim)
+    if _SANITIZER_CONFIG.get("enabled", False):
+        _sanitize_floorborn_islands(sim)
     sim.dust.v.rad.update()
     sim.dust.Fi.update()
     sim.dust.S.hyd.update()
@@ -1910,6 +3919,7 @@ def set_implicit_boundaries(sim):
                          sim.dust._SigmaOld[0])/(sim.t.prevstepsize+1.e-100)
     sim.dust.S.tot[-1] = (sim.dust.Sigma[-1] -
                           sim.dust._SigmaOld[-1])/(sim.t.prevstepsize+1.e-100)
+    diode_block_mask = _inner_diode_block_mask(sim)
     if is_zero_flux_enabled(sim):
         sim.dust.Fi.adv[0] = 0.0
         sim.dust.Fi.adv[-1] = 0.0
@@ -1924,8 +3934,14 @@ def set_implicit_boundaries(sim):
                                                      sim.grid.ri[0]**2) + sim.grid.ri[1]*sim.dust.Fi.adv[1])/sim.grid.ri[0]
         sim.dust.Fi.adv[-1] = (sim.dust.Fi.adv[-2]*sim.grid.ri[-2] - 0.5*sim.dust.S.hyd[-1]
                                * (sim.grid.ri[-1]**2-sim.grid.ri[-2]**2))/sim.grid.ri[-1]
+        if is_dust_inner_outflow_only_enabled(sim):
+            sim.dust.Fi.adv[0] = xp.minimum(sim.dust.Fi.adv[0], 0.0)
+            if diode_block_mask is not None:
+                sim.dust.Fi.adv[0][diode_block_mask] = 0.0
         sim.dust.Fi.tot[0] = sim.dust.Fi.adv[0]
         sim.dust.Fi.tot[-1] = sim.dust.Fi.adv[-1]
+    _apply_gas_floor_freeze_to_flux(sim, sim.dust.Fi.adv)
+    _apply_gas_floor_freeze_to_flux(sim, sim.dust.Fi.tot)
 
 
 def dt_adaptive(sim):
@@ -2037,12 +4053,20 @@ def F_adv(sim, Sigma=None):
     if is_zero_flux_enabled(sim):
         Fi[0, :] = 0.0
         Fi[-1, :] = 0.0
+    elif is_dust_inner_outflow_only_enabled(sim):
+        # Inner diode BC: allow only outflow to the star, block inward supply.
+        Fi[0, :] = xp.minimum(Fi[0, :], 0.0)
+        diode_block_mask = _inner_diode_block_mask(sim)
+        if diode_block_mask is not None:
+            Fi[0, diode_block_mask] = 0.0
     return Fi
 
 
 def F_diff(sim, Sigma=None):
     '''Function calculates the diffusive flux at the cell interfaces'''
-    return _K_F_DIFF(sim, Sigma=Sigma)
+    Fi = _K_F_DIFF(sim, Sigma=Sigma)
+    _apply_gas_floor_freeze_to_flux(sim, Fi)
+    return Fi
 
 
 def F_tot(sim, Sigma=None):
@@ -2073,6 +4097,13 @@ def F_tot(sim, Sigma=None):
     if is_zero_flux_enabled(sim):
         Fi[0, :] = 0.0
         Fi[-1, :] = 0.0
+    elif is_dust_inner_outflow_only_enabled(sim):
+        # Inner diode BC: allow only outflow to the star, block inward supply.
+        Fi[0, :] = xp.minimum(Fi[0, :], 0.0)
+        diode_block_mask = _inner_diode_block_mask(sim)
+        if diode_block_mask is not None:
+            Fi[0, diode_block_mask] = 0.0
+    _apply_gas_floor_freeze_to_flux(sim, Fi)
     return Fi
 
 
@@ -2148,6 +4179,35 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
     Nr = int(sim.grid.Nr)
     Nm = int(sim.grid.Nm)
     zero_flux = is_zero_flux_enabled(sim)
+    inner_outflow_only = is_dust_inner_outflow_only_enabled(sim)
+    diode_block_mask = _inner_diode_block_mask(sim) if inner_outflow_only else None
+    inner_adv_drain_mask = None
+    if inner_outflow_only:
+        inner_adv_drain_mask = _inner_boundary_advective_drain_mask(
+            sim,
+            SigmaDust=sim.dust.Sigma,
+            Fi_adv=sim.dust.Fi.adv,
+        )
+    freeze_mask = np.asarray(to_numpy(_gas_floor_freeze_mask(sim)), dtype=bool)
+    freeze_velocity_mask = np.asarray(
+        to_numpy(
+            _transport_velocity_freeze_interface_mask(
+                sim,
+                SigmaDust=sim.dust.Sigma,
+                Fi_adv=sim.dust.Fi.adv,
+            )
+        ),
+        dtype=bool,
+    )
+    freeze_diffusion_mask = np.asarray(
+        to_numpy(
+            _transport_diffusion_freeze_interface_mask(
+                sim,
+                SigmaDust=sim.dust.Sigma,
+            )
+        ),
+        dtype=bool,
+    )
 
     # Building coagulation Jacobian
 
@@ -2159,24 +4219,56 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
         to_backend_result=False,
     )
     gen = (dat, (row, col))
+    if np.any(freeze_mask[1:-1]):
+        freeze_rows = freeze_mask[row // Nm]
+        if np.any(freeze_rows):
+            dat = np.array(dat, copy=True)
+            dat[freeze_rows] = 0.0
+            gen = (dat, (row, col))
     J_coag = sp.csc_matrix(
         gen,
         shape=(Ntot, Ntot)
     )
 
-    A_h, B_h, C_h = _dust_f_call(
-        dust_f.jacobian_hydrodynamic_generator,
-        area,
-        sim.dust.D,
-        r,
-        ri,
-        sim.gas.Sigma,
-        sim.dust.v.rad,
-        to_backend_result=False,
-    )
+    if np.any(freeze_velocity_mask) or np.any(freeze_diffusion_mask):
+        A_h, B_h, C_h = _jacobian_hydrodynamic_generator_numpy(
+            area,
+            sim.dust.D,
+            r,
+            ri,
+            sim.gas.Sigma,
+            sim.dust.v.rad,
+            freeze_velocity_mask=freeze_velocity_mask,
+            freeze_diffusion_mask=freeze_diffusion_mask,
+        )
+    else:
+        A_h, B_h, C_h = _dust_f_call(
+            dust_f.jacobian_hydrodynamic_generator,
+            area,
+            sim.dust.D,
+            r,
+            ri,
+            sim.gas.Sigma,
+            sim.dust.v.rad,
+            to_backend_result=False,
+        )
     if zero_flux:
         A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_numpy(
             A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
+        )
+    elif diode_block_mask is not None and np.any(to_numpy(diode_block_mask)):
+        A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_numpy(
+            A_h,
+            B_h,
+            C_h,
+            area,
+            sim.dust.D,
+            r,
+            ri,
+            sim.gas.Sigma,
+            sim.dust.v.rad,
+            diode_block_mask,
+            adv_drain_mask=inner_adv_drain_mask,
         )
     J_hyd = sp.diags(
         (A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]),
@@ -2202,40 +4294,49 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
     col = np.concatenate((col0, col1, col2))
 
     # Filling data vector depending on boundary condition
+    inner_bc_mask = None
     if (not zero_flux) and sim.dust.boundary.inner is not None:
+        if inner_outflow_only and diode_block_mask is not None:
+            inner_bc_mask = ~np.asarray(to_numpy(diode_block_mask), dtype=bool)
+            if not np.any(inner_bc_mask):
+                inner_bc_mask = None
+        else:
+            inner_bc_mask = np.ones((Nm,), dtype=bool)
+    if inner_bc_mask is not None:
         # Given value
         if sim.dust.boundary.inner.condition == "val":
-            sim.dust._rhs[:Nm] = sim.dust.boundary.inner.value
+            sim.dust._rhs[:Nm][inner_bc_mask] = sim.dust.boundary.inner.value[inner_bc_mask]
         # Constant value
         elif sim.dust.boundary.inner.condition == "const_val":
-            dat[Nm:2*Nm] = 1./dt
-            sim.dust._rhs[:Nm] = 0.
+            dat[Nm:2*Nm][inner_bc_mask] = 1./dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
         # Given gradient
         elif sim.dust.boundary.inner.condition == "grad":
             K1 = - r_np[1]/r_np[0]
-            dat[Nm:2*Nm] = -K1/dt
-            sim.dust._rhs[:Nm] = - ri_np[1]/r_np[0] * \
-                (r_np[1]-r_np[0])*sim.dust.boundary.inner.value
+            dat[Nm:2*Nm][inner_bc_mask] = -K1/dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = (
+                - ri_np[1]/r_np[0] * (r_np[1]-r_np[0]) * sim.dust.boundary.inner.value[inner_bc_mask]
+            )
         # Constant gradient
         elif sim.dust.boundary.inner.condition == "const_grad":
             Di = ri_np[1]/ri_np[2] * (r_np[1]-r_np[0]) / (r_np[2]-r_np[0])
             K1 = - r_np[1]/r_np[0] * (1. + Di)
             K2 = r_np[2]/r_np[0] * Di
-            dat[:Nm] = 0.
-            dat[Nm:2*Nm] = -K1/dt
-            dat[2*Nm:] = -K2/dt
-            sim.dust._rhs[:Nm] = 0.
+            dat[:Nm][inner_bc_mask] = 0.
+            dat[Nm:2*Nm][inner_bc_mask] = -K1/dt
+            dat[2*Nm:][inner_bc_mask] = -K2/dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
         # Given power law
         elif sim.dust.boundary.inner.condition == "pow":
             p = sim.dust.boundary.inner.value
-            sim.dust._rhs[:Nm] = sim.dust.Sigma[1] * (r_np[0]/r_np[1])**p
+            sim.dust._rhs[:Nm][inner_bc_mask] = sim.dust.Sigma[1][inner_bc_mask] * (r_np[0]/r_np[1])**p
         # Constant power law
         elif sim.dust.boundary.inner.condition == "const_pow":
             p = np.log(Sigma_np[2] /
                        Sigma_np[1]) / np.log(r_np[2]/r_np[1])
             K1 = - (r_np[0]/r_np[1])**p
-            dat[Nm:2*Nm] = -K1/dt
-            sim.dust._rhs[:Nm] = 0.
+            dat[Nm:2*Nm][inner_bc_mask] = -K1[inner_bc_mask]/dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
 
     # Creating sparce matrix for inner boundary
     gen = (dat, (row, col))
@@ -2333,60 +4434,111 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     Nm = int(sim.grid.Nm)
     Ntot = int((Nr * Nm))
     zero_flux = is_zero_flux_enabled(sim)
+    inner_outflow_only = is_dust_inner_outflow_only_enabled(sim)
+    diode_block_mask = _inner_diode_block_mask(sim) if inner_outflow_only else None
+    inner_adv_drain_mask = None
+    if inner_outflow_only:
+        inner_adv_drain_mask = _inner_boundary_advective_drain_mask(
+            sim,
+            SigmaDust=sim.dust.Sigma,
+            Fi_adv=sim.dust.Fi.adv,
+        )
+    freeze_mask = _gas_floor_freeze_mask(sim)
+    freeze_velocity_mask = _transport_velocity_freeze_interface_mask(
+        sim,
+        SigmaDust=sim.dust.Sigma,
+        Fi_adv=sim.dust.Fi.adv,
+    )
+    freeze_diffusion_mask = _transport_diffusion_freeze_interface_mask(
+        sim,
+        SigmaDust=sim.dust.Sigma,
+    )
     q = _get_mass_grid_q(cp.asarray(_field_data(m)), Nm)
     _, _, _, _, _, jcoag_indices, jcoag_indptr, jcoag_perm = _get_jcoag_pattern_cupy(Nr, Nm, q)
 
     dat, _, _ = _jacobian_coagulation_generator_cupy(
         A, cstick, eps, ilf, irm, istick, m, phi, Rf, Rs, SigD, SigDfloor
     )
+    if int(to_numpy(freeze_mask[1:-1].sum())) > 0:
+        dat_mid = dat.reshape(Nr - 2, -1)
+        dat_mid[freeze_mask[1:-1], :] = 0.0
     dat_csr = dat if jcoag_perm is None else dat[jcoag_perm]
     J_coag = cp_sparse.csr_matrix((dat_csr, jcoag_indices, jcoag_indptr), shape=(Ntot, Ntot))
 
     A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(
-        area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
+        area,
+        sim.dust.D,
+        r,
+        ri,
+        sim.gas.Sigma,
+        sim.dust.v.rad,
+        freeze_velocity_mask=freeze_velocity_mask,
+        freeze_diffusion_mask=freeze_diffusion_mask,
     )
     if zero_flux:
         A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(
             A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
+        )
+    elif diode_block_mask is not None and int(to_numpy(diode_block_mask.sum())) > 0:
+        A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_cupy(
+            A_h,
+            B_h,
+            C_h,
+            area,
+            sim.dust.D,
+            r,
+            ri,
+            sim.gas.Sigma,
+            sim.dust.v.rad,
+            diode_block_mask,
+            adv_drain_mask=inner_adv_drain_mask,
         )
     n_hyd, jhb_map, jhb_indices, jhb_indptr = _get_dust_hyd_boundary_pattern_cupy(Nr, Nm)
     dat_hyd = cp.concatenate((A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]))
 
     # Right-hand side defaults to the current state for all rows.
     sim.dust._rhs[:] = sim.dust.Sigma.ravel()
-    c_in0 = 0.0
-    c_in1 = 0.0
-    c_in2 = 0.0
+    c_in0 = cp.zeros((Nm,), dtype=dat_hyd.dtype)
+    c_in1 = cp.zeros((Nm,), dtype=dat_hyd.dtype)
+    c_in2 = cp.zeros((Nm,), dtype=dat_hyd.dtype)
 
+    inner_bc_mask = None
     if (not zero_flux) and sim.dust.boundary.inner is not None:
+        if inner_outflow_only and diode_block_mask is not None:
+            inner_bc_mask = ~cp.asarray(diode_block_mask, dtype=bool)
+            if int(to_numpy(inner_bc_mask.sum())) == 0:
+                inner_bc_mask = None
+        else:
+            inner_bc_mask = cp.ones((Nm,), dtype=bool)
+    if inner_bc_mask is not None:
         if sim.dust.boundary.inner.condition == "val":
-            sim.dust._rhs[:Nm] = sim.dust.boundary.inner.value
+            sim.dust._rhs[:Nm][inner_bc_mask] = sim.dust.boundary.inner.value[inner_bc_mask]
         elif sim.dust.boundary.inner.condition == "const_val":
-            c_in1 = 1. / dt
-            sim.dust._rhs[:Nm] = 0.
+            c_in1[inner_bc_mask] = 1. / dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
         elif sim.dust.boundary.inner.condition == "grad":
             K1 = - (r[1] / r[0])
-            c_in1 = -K1 / dt
+            c_in1[inner_bc_mask] = -K1 / dt
             fac = - (ri[1] / r[0] * (r[1] - r[0]))
-            sim.dust._rhs[:Nm] = fac * sim.dust.boundary.inner.value
+            sim.dust._rhs[:Nm][inner_bc_mask] = fac * sim.dust.boundary.inner.value[inner_bc_mask]
         elif sim.dust.boundary.inner.condition == "const_grad":
             Di = (ri[1] / ri[2] * (r[1] - r[0]) / (r[2] - r[0]))
             K1 = - (r[1] / r[0]) * (1. + Di)
             K2 = (r[2] / r[0]) * Di
-            c_in0 = 0.0
-            c_in1 = -K1 / dt
-            c_in2 = -K2 / dt
-            sim.dust._rhs[:Nm] = 0.
+            c_in0[inner_bc_mask] = 0.0
+            c_in1[inner_bc_mask] = -K1 / dt
+            c_in2[inner_bc_mask] = -K2 / dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
         elif sim.dust.boundary.inner.condition == "pow":
             p = sim.dust.boundary.inner.value
             ratio = (r[0] / r[1])
-            sim.dust._rhs[:Nm] = SigmaArr[1] * ratio**p
+            sim.dust._rhs[:Nm][inner_bc_mask] = SigmaArr[1][inner_bc_mask] * ratio**p
         elif sim.dust.boundary.inner.condition == "const_pow":
             logr = cp.log(r[2] / r[1])
             p = cp.log(SigmaArr[2] / SigmaArr[1]) / logr
             K1 = - (r[0] / r[1])**p
-            c_in1 = -K1 / dt
-            sim.dust._rhs[:Nm] = 0.
+            c_in1[inner_bc_mask] = -K1[inner_bc_mask] / dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
 
     c_out0 = 0.0
     c_out1 = 0.0
@@ -2469,23 +4621,66 @@ def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
     Nm = int(sim.grid.Nm)
     Ntot = int(Nr * Nm)
     zero_flux = is_zero_flux_enabled(sim)
+    inner_outflow_only = is_dust_inner_outflow_only_enabled(sim)
+    diode_block_mask = _inner_diode_block_mask(sim) if inner_outflow_only else None
+    inner_adv_drain_mask = None
+    if inner_outflow_only:
+        inner_adv_drain_mask = _inner_boundary_advective_drain_mask(
+            sim,
+            SigmaDust=sim.dust.Sigma,
+            Fi_adv=sim.dust.Fi.adv,
+        )
+    freeze_mask = _gas_floor_freeze_mask(sim)
+    freeze_velocity_mask = _transport_velocity_freeze_interface_mask(
+        sim,
+        SigmaDust=sim.dust.Sigma,
+        Fi_adv=sim.dust.Fi.adv,
+    )
+    freeze_diffusion_mask = _transport_diffusion_freeze_interface_mask(
+        sim,
+        SigmaDust=sim.dust.Sigma,
+    )
 
     q = _get_mass_grid_q(cp.asarray(_field_data(m)), Nm)
     _, _, row, col, _, _, _, _ = _get_jcoag_pattern_cupy(Nr, Nm, q)
     dat_coag, _, _ = _jacobian_coagulation_generator_cupy(
         A, cstick, eps, ilf, irm, istick, m, phi, Rf, Rs, SigD, SigDfloor
     )
+    if int(to_numpy(freeze_mask[1:-1].sum())) > 0:
+        dat_coag_mid = dat_coag.reshape(Nr - 2, -1)
+        dat_coag_mid[freeze_mask[1:-1], :] = 0.0
     dtype = dat_coag.dtype
     J = cp.zeros((Ntot, Ntot), dtype=dtype)
     J_flat = J.ravel()
     _scatter_add_1d(J_flat, row * Ntot + col, dat_coag)
 
     A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(
-        area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
+        area,
+        sim.dust.D,
+        r,
+        ri,
+        sim.gas.Sigma,
+        sim.dust.v.rad,
+        freeze_velocity_mask=freeze_velocity_mask,
+        freeze_diffusion_mask=freeze_diffusion_mask,
     )
     if zero_flux:
         A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(
             A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad
+        )
+    elif diode_block_mask is not None and int(to_numpy(diode_block_mask.sum())) > 0:
+        A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_cupy(
+            A_h,
+            B_h,
+            C_h,
+            area,
+            sim.dust.D,
+            r,
+            ri,
+            sim.gas.Sigma,
+            sim.dust.v.rad,
+            diode_block_mask,
+            adv_drain_mask=inner_adv_drain_mask,
         )
 
     idx = cp.arange(Ntot, dtype=cp.int64)
@@ -2498,39 +4693,47 @@ def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
 
     # Right-hand side defaults to the current state for all rows.
     sim.dust._rhs[:] = sim.dust.Sigma.ravel()
-    c_in0 = 0.0
-    c_in1 = 0.0
-    c_in2 = 0.0
+    c_in0 = cp.zeros((Nm,), dtype=dtype)
+    c_in1 = cp.zeros((Nm,), dtype=dtype)
+    c_in2 = cp.zeros((Nm,), dtype=dtype)
 
+    inner_bc_mask = None
     if (not zero_flux) and sim.dust.boundary.inner is not None:
+        if inner_outflow_only and diode_block_mask is not None:
+            inner_bc_mask = ~cp.asarray(diode_block_mask, dtype=bool)
+            if int(to_numpy(inner_bc_mask.sum())) == 0:
+                inner_bc_mask = None
+        else:
+            inner_bc_mask = cp.ones((Nm,), dtype=bool)
+    if inner_bc_mask is not None:
         if sim.dust.boundary.inner.condition == "val":
-            sim.dust._rhs[:Nm] = sim.dust.boundary.inner.value
+            sim.dust._rhs[:Nm][inner_bc_mask] = sim.dust.boundary.inner.value[inner_bc_mask]
         elif sim.dust.boundary.inner.condition == "const_val":
-            c_in1 = 1. / dt
-            sim.dust._rhs[:Nm] = 0.
+            c_in1[inner_bc_mask] = 1. / dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
         elif sim.dust.boundary.inner.condition == "grad":
             K1 = - (r[1] / r[0])
-            c_in1 = -K1 / dt
+            c_in1[inner_bc_mask] = -K1 / dt
             fac = - (ri[1] / r[0] * (r[1] - r[0]))
-            sim.dust._rhs[:Nm] = fac * sim.dust.boundary.inner.value
+            sim.dust._rhs[:Nm][inner_bc_mask] = fac * sim.dust.boundary.inner.value[inner_bc_mask]
         elif sim.dust.boundary.inner.condition == "const_grad":
             Di = (ri[1] / ri[2] * (r[1] - r[0]) / (r[2] - r[0]))
             K1 = - (r[1] / r[0]) * (1. + Di)
             K2 = (r[2] / r[0]) * Di
-            c_in0 = 0.0
-            c_in1 = -K1 / dt
-            c_in2 = -K2 / dt
-            sim.dust._rhs[:Nm] = 0.
+            c_in0[inner_bc_mask] = 0.0
+            c_in1[inner_bc_mask] = -K1 / dt
+            c_in2[inner_bc_mask] = -K2 / dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
         elif sim.dust.boundary.inner.condition == "pow":
             p = sim.dust.boundary.inner.value
             ratio = (r[0] / r[1])
-            sim.dust._rhs[:Nm] = SigmaArr[1] * ratio**p
+            sim.dust._rhs[:Nm][inner_bc_mask] = SigmaArr[1][inner_bc_mask] * ratio**p
         elif sim.dust.boundary.inner.condition == "const_pow":
             logr = cp.log(r[2] / r[1])
             p = cp.log(SigmaArr[2] / SigmaArr[1]) / logr
             K1 = - (r[0] / r[1])**p
-            c_in1 = -K1 / dt
-            sim.dust._rhs[:Nm] = 0.
+            c_in1[inner_bc_mask] = -K1[inner_bc_mask] / dt
+            sim.dust._rhs[:Nm][inner_bc_mask] = 0.
 
     c_out0 = 0.0
     c_out1 = 0.0
@@ -2925,6 +5128,25 @@ def vrel_radial_drift(sim):
     return _K_VREL_RAD(sim)
 
 
+def _vrel_tot_cupy_elementwise(azi, brown, rad, turb, vert):
+    """Elementwise-kernel variant for total relative velocity."""
+    dtype = cp.result_type(azi.dtype, brown.dtype, rad.dtype, turb.dtype, vert.dtype)
+    if dtype not in (cp.float32, cp.float64):
+        return None
+
+    kernel = _get_vrel_tot_elementwise_kernel(dtype)
+    if kernel is None:
+        return None
+
+    return kernel(
+        cp.asarray(azi, dtype=dtype),
+        cp.asarray(brown, dtype=dtype),
+        cp.asarray(rad, dtype=dtype),
+        cp.asarray(turb, dtype=dtype),
+        cp.asarray(vert, dtype=dtype),
+    )
+
+
 def vrel_tot(sim):
     """Function calculates the total relative vparticle velocities by taking the root mean square
     of all individual sources.
@@ -2938,6 +5160,17 @@ def vrel_tot(sim):
     -------
     vrel : Field
         Relative velocities"""
+    if _VREL_TOT_MODE == "elementwise" and cp is not None and getattr(xp, "name", "") == "cupy":
+        vrel = _vrel_tot_cupy_elementwise(
+            _field_data(sim.dust.v.rel.azi),
+            _field_data(sim.dust.v.rel.brown),
+            _field_data(sim.dust.v.rel.rad),
+            _field_data(sim.dust.v.rel.turb),
+            _field_data(sim.dust.v.rel.vert),
+        )
+        if vrel is not None:
+            return vrel
+
     return xp.sqrt(
         sim.dust.v.rel.azi**2
         + sim.dust.v.rel.brown**2
@@ -3028,6 +5261,8 @@ def _f_impl_1_direct_numpy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
     Y1_ravel = solve_sparse_linear_system(A, rhs)
 
     Y1 = Y1_ravel.reshape(Y0.shape)
+    if _maybe_retry_implicit_floor_injection(x0, Y0, dx, Y1):
+        return False
 
     return Y1 - Y0
 
@@ -3047,10 +5282,21 @@ def _f_impl_1_direct_cupy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
         rhs[Nm:-Nm] += dx * _field_data(Y0._owner.dust.S.ext[1:-1, ...]).ravel()
 
     jac_gpu = jac.tocsr() if isinstance(jac, cp_sparse.spmatrix) else cp_sparse.csr_matrix(jac)
-    A = cp_sparse.identity(jac_gpu.shape[0], format="csr", dtype=jac_gpu.dtype) - dx * jac_gpu
+    if _CUPY_A_BUILD_MODE == "diag_inplace":
+        A = jac_gpu.copy()
+        A.data *= -dx
+        diag_pos = _get_cupy_diag_positions_csr(A)
+        if diag_pos is not None:
+            A.data[diag_pos] += 1.0
+        else:
+            A = cp_sparse.identity(jac_gpu.shape[0], format="csr", dtype=jac_gpu.dtype) - dx * jac_gpu
+    else:
+        A = cp_sparse.identity(jac_gpu.shape[0], format="csr", dtype=jac_gpu.dtype) - dx * jac_gpu
 
     Y1_ravel = solve_sparse_linear_system(A, rhs)
     Y1 = Y1_ravel.reshape(Y0.shape)
+    if _maybe_retry_implicit_floor_injection(x0, Y0, dx, Y1):
+        return False
     return Y1 - Y0
 
 
@@ -3074,6 +5320,8 @@ def _f_impl_1_direct_cupy_dense(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs)
     A = cp.eye(int(jac_dense.shape[0]), dtype=jac_dense.dtype) - dx * jac_dense
     Y1_ravel = cp.linalg.solve(A, rhs)
     Y1 = Y1_ravel.reshape(Y0.shape)
+    if _maybe_retry_implicit_floor_injection(x0, Y0, dx, Y1):
+        return False
     return Y1 - Y0
 
 

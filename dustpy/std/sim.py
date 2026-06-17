@@ -1,7 +1,111 @@
 '''Module containing standard functions for the main simulation object.'''
 
+import os
+import numpy as np
+import time
+
 from dustpy import std
 from simframe.backends.api import xp
+
+
+def _field_data(value):
+    return value._data if hasattr(value, "_data") else value
+
+
+def _to_numpy(value):
+    if hasattr(value, "get"):
+        return value.get()
+    if hasattr(xp, "to_numpy"):
+        return xp.to_numpy(value)
+    return np.asarray(value)
+
+
+def _env_bool(name, default=False):
+    raw = os.getenv(name)
+    if raw is None:
+        return bool(default)
+    raw = raw.strip().lower()
+    if raw in ("1", "true", "on", "yes"):
+        return True
+    if raw in ("0", "false", "off", "no"):
+        return False
+    return bool(default)
+
+
+_DT_GAS_REFRESH_ENABLED = _env_bool("DUSTPY_DT_GAS_REFRESH_ENABLE", default=False)
+
+
+def is_dt_gas_refresh_enabled():
+    return _DT_GAS_REFRESH_ENABLED
+
+
+def _ensure_rl_debug_state(sim):
+    if not hasattr(sim, "RL_recent_dts"):
+        sim.RL_recent_dts = np.zeros(100)
+    if not hasattr(sim, "RL_recent_wts"):
+        sim.RL_recent_wts = np.zeros(100)
+    if not hasattr(sim, "RL_count_accepted"):
+        sim.RL_count_accepted = 0
+    if not hasattr(sim, "RL_last_wall_s"):
+        sim.RL_last_wall_s = None
+
+
+def _rl_debug_stats(sim, dt_step):
+    _ensure_rl_debug_state(sim)
+    cycle_now = int(getattr(sim, "RL_count_accepted", getattr(sim, "RL_count_cycle", 0)))
+    median_dt = float(np.median(sim.RL_recent_dts))
+    mean_dt = float(np.mean(sim.RL_recent_dts))
+    wt_100 = float(np.sum(sim.RL_recent_wts))
+    dust = getattr(sim, "dust", None)
+    nfloor_retry = 0
+    dM_floor_mearth = 0.0
+    dM_san_mearth = 0.0
+    if dust is not None and hasattr(dust, "floor_retry"):
+        nfloor_retry = int(dust.floor_retry.count)
+    if dust is not None and hasattr(dust, "floor_topup"):
+        dM_floor_mearth = float(dust.floor_topup.total_mearth)
+    if dust is not None and hasattr(dust, "san"):
+        dM_san_mearth = float(dust.san.dM_total_mearth)
+    return {
+        "cycle_now": cycle_now,
+        "mean_dt": mean_dt,
+        "median_dt": median_dt,
+        "wt_100": wt_100,
+        "nfloor_retry": nfloor_retry,
+        "dM_floor_mearth": dM_floor_mearth,
+        "dM_san_mearth": dM_san_mearth,
+        "dt_step": float(dt_step),
+    }
+
+
+def _rl_debug_line(sim, dt_step):
+    stats = _rl_debug_stats(sim, dt_step)
+    return (
+        f"[RL_debug]: cycle={stats['cycle_now']:9d}, t={sim.t/31557600.0:12.3f}yr, "
+        f"dt={stats['dt_step']/31557600.0:.4e}/{stats['mean_dt']/31557600.0:.4e}/{stats['median_dt']/31557600.0:.4e}yr, "
+        f"n_dt↘={stats['nfloor_retry']:6d}, "
+        f"dM_M⊕={stats['dM_floor_mearth']:.4e}/{stats['dM_san_mearth']:.4e}, "
+        f"wt={stats['wt_100']:.4e}"
+    )
+
+
+def _record_accepted_step(sim):
+    _ensure_rl_debug_state(sim)
+    dt_step = float(sim.t.prevstepsize)
+    if not np.isfinite(dt_step) or dt_step <= 0.0:
+        return
+    idx = int(sim.RL_count_accepted) % 100
+    sim.RL_recent_dts[idx] = dt_step
+    wall_now = time.perf_counter()
+    wall_prev = getattr(sim, "RL_last_wall_s", None)
+    if wall_prev is not None:
+        sim.RL_recent_wts[idx] = wall_now - wall_prev
+    sim.RL_last_wall_s = wall_now
+    sim.RL_count_accepted += 1
+    if sim.RL_count_accepted == 1 or sim.RL_count_accepted % sim.RL_ncycle_out == 0:
+        line_builder = getattr(sim, "_rl_debug_line_builder", None)
+        line = line_builder(sim, dt_step) if callable(line_builder) else _rl_debug_line(sim, dt_step)
+        print(line)
 
 
 def dt_adaptive(sim):
@@ -34,16 +138,24 @@ def dt(sim):
     dt : float
         Time step"""
 
-    dt_gas = std.gas.dt(sim) or 1.e100
-    dt_dust = std.dust.dt(sim) or 1.e100
-    dt = xp.minimum(dt_gas, dt_dust)
-    #print(f"[RL_debug]: dt={dt/31557600.0:.6f} yr")
-    if sim.RL_count_cycle % sim.RL_ncycle_out == 0:
-        median_dt = xp.median(sim.RL_recent_dts)
-        print(f"[RL_debug]: cycle={sim.RL_count_cycle:9d}, t={sim.t/31557600.0:12.3f}yr, dt={dt/31557600.0:12.6f}yr, <dt>={sim.RL_recent_dts.mean()/31557600.0:12.6f}yr, median_dt={float(median_dt)/31557600.0:12.6f}yr")  #, M_pl={sim.planetesimals.M/5.972e27:12.4f}M_e")
-    sim.RL_recent_dts[sim.RL_count_cycle % 100] = sim.t.cfl * dt
+    # Gas dt relies on retrospective operator diagnostics. Refresh them from the
+    # current coupled gas+dust state so the limiter does not read stale fields.
+    if _DT_GAS_REFRESH_ENABLED:
+        _refresh_coupled_gas_state(sim)
+
+    dt_gas = std.gas.dt(sim)
+    if dt_gas is None:
+        dt_gas = 1.e100
+    dt_dust = std.dust.dt(sim)
+    if dt_dust is None:
+        dt_dust = 1.e100
+
+    # Compute once on backend, convert once to host scalar for control/debug paths.
+    dt_host = float(xp.minimum(dt_gas, dt_dust))
+    dt_step = sim.t.cfl * dt_host
+
     sim.RL_count_cycle += 1
-    return sim.t.cfl * dt
+    return dt_step
 
 
 def prepare_explicit_dust(sim):
@@ -69,6 +181,18 @@ def prepare_implicit_dust(sim):
     std.dust.prepare(sim)
 
 
+def _refresh_coupled_gas_state(sim):
+    """Refresh dust-coupled gas operator fields after dust state changes."""
+    sim.dust.rho.update()
+    sim.dust.eps.update()
+    sim.dust.backreaction.update()
+    sim.gas.v.update()
+    sim.gas.Fi.update()
+    sim.gas.S.hyd.update()
+    sim.gas.S.tot.update()
+    std.gas.set_implicit_boundaries(sim)
+
+
 def finalize_explicit_dust(sim):
     """This function is the finalization function that is called
     after every integration step. It is managing the boundary
@@ -80,6 +204,7 @@ def finalize_explicit_dust(sim):
         Parent simulation frame"""
     std.gas.finalize(sim)
     std.dust.finalize_explicit(sim)
+    _record_accepted_step(sim)
 
 
 def finalize_implicit_dust(sim):
@@ -93,3 +218,4 @@ def finalize_implicit_dust(sim):
         Parent simulation frame"""
     std.gas.finalize(sim)
     std.dust.finalize_implicit(sim)
+    _record_accepted_step(sim)
