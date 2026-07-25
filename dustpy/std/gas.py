@@ -146,9 +146,7 @@ def _masked_interface_values_1d(values, r, ri, mask, zero_both_masked=False, zer
 
 
 def _one_sided_interface_velocity_1d(values, r, ri, mask):
-    return _masked_interface_values_1d(
-        values, r, ri, mask, zero_both_masked=True, zero_masked_boundaries=True
-    )
+    return _masked_interface_values_1d(values, r, ri, mask, zero_both_masked=True, zero_masked_boundaries=True)
 
 
 def _jac_abc_cupy(area, nu, r, ri, v, freeze_mask=None):

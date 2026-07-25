@@ -1,5 +1,9 @@
 python_sources = [
   '__init__.py',
+  '_dust_common.py',
+  '_dust_cupy.py',
+  '_dust_cupy_kernels.py',
+  '_dust_numpy.py',
   'dust.py',
   'gas.py',
   'grid.py',

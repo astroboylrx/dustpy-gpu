@@ -362,13 +362,7 @@ def _dump_fallback_system(matrix_cpu, rhs_cpu, *, fallback_id, tier1_info, tier2
     stem = os.path.join(dump_dir, f"fallback_{fallback_id:05d}")
     matrix_csr = matrix_cpu.tocsr() if sp.issparse(matrix_cpu) else sp.csr_matrix(np.asarray(matrix_cpu))
     sp.save_npz(stem + "_A.npz", matrix_csr)
-    np.savez(
-        stem + "_rhs_meta.npz",
-        rhs=np.asarray(rhs_cpu),
-        tier1_info=str(tier1_info),
-        tier2_info=str(tier2_info),
-        cause=str(cause),
-    )
+    np.savez(stem + "_rhs_meta.npz", rhs=np.asarray(rhs_cpu), tier1_info=str(tier1_info), tier2_info=str(tier2_info), cause=str(cause))
 
 
 def _cupy_matrix_to_cpu_csr(matrix_gpu):
@@ -376,14 +370,7 @@ def _cupy_matrix_to_cpu_csr(matrix_gpu):
         if hasattr(matrix_gpu, "get"):
             matrix_cpu = matrix_gpu.get()
         else:
-            matrix_cpu = sp.csr_matrix(
-                (
-                    cp.asnumpy(matrix_gpu.data),
-                    cp.asnumpy(matrix_gpu.indices),
-                    cp.asnumpy(matrix_gpu.indptr),
-                ),
-                shape=matrix_gpu.shape,
-            )
+            matrix_cpu = sp.csr_matrix((cp.asnumpy(matrix_gpu.data), cp.asnumpy(matrix_gpu.indices), cp.asnumpy(matrix_gpu.indptr)), shape=matrix_gpu.shape)
     else:
         matrix_cpu = sp.csr_matrix(cp.asnumpy(matrix_gpu))
     if not sp.issparse(matrix_cpu):
@@ -543,11 +530,7 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
             sol3_eq, tier3_info = cp_splinalg.gmres(A_eq_gpu, rhs_eq_gpu, **tier3_kwargs)
             if tier3_info == 0:
                 sol3 = cp.asarray(col_scale) * sol3_eq
-                ok, res_norm, tol = _gmres_true_residual_ok(
-                    sol3,
-                    rtol=cfg["tier2_rtol"],
-                    atol=cfg["tier2_atol"],
-                )
+                ok, res_norm, tol = _gmres_true_residual_ok(sol3, rtol=cfg["tier2_rtol"], atol=cfg["tier2_atol"])
                 if ok:
                     _record_gmres_stat("tier3_equilibrate_success", always=True)
                     return sol3
@@ -559,11 +542,7 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
             tier3_cause = f"exception:{type(exc).__name__}"
             _record_gmres_stat("tier3_exception", always=True)
         _record_gmres_stat("tier3_failed", always=True)
-        return _solve_cpu_fallback(
-            tier1_info=tier1_info,
-            tier2_info=f"{tier2_info};tier3={tier3_info}",
-            cause=f"tier3_equilibrate:{tier3_cause}",
-        )
+        return _solve_cpu_fallback(tier1_info=tier1_info, tier2_info=f"{tier2_info};tier3={tier3_info}", cause=f"tier3_equilibrate:{tier3_cause}")
 
     def _solve_cpu_fallback(*, tier1_info, tier2_info, cause):
         cfg_local = _CUPY_GMRES_CONFIG
@@ -587,21 +566,9 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
                     f"rhs_abs_max={summary['rhs_abs_max']:.6e}",
                     flush=True,
                 )
-            _dump_fallback_system(
-                matrix_cpu,
-                rhs_cpu,
-                fallback_id=n_fallback,
-                tier1_info=tier1_info,
-                tier2_info=tier2_info,
-                cause=cause,
-            )
+            _dump_fallback_system(matrix_cpu, rhs_cpu, fallback_id=n_fallback, tier1_info=tier1_info, tier2_info=tier2_info, cause=cause)
 
-            matrix_lu = sp.linalg.splu(
-                matrix_cpu.tocsc(),
-                permc_spec="MMD_AT_PLUS_A",
-                diag_pivot_thresh=0.0,
-                options=dict(SymmetricMode=True),
-            )
+            matrix_lu = sp.linalg.splu(matrix_cpu.tocsc(), permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0, options=dict(SymmetricMode=True))
             sol_cpu = matrix_lu.solve(rhs_cpu)
             sol_fallback = cp.asarray(sol_cpu)
             max_allowed = int(cfg_local.get("cpu_fallback_max", 0))
@@ -670,11 +637,7 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
         try:
             tier1_sol, tier1_info = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier1_kwargs)
             if tier1_info == 0:
-                ok, res_norm, tol = _gmres_true_residual_ok(
-                    tier1_sol,
-                    rtol=cfg["tier1_rtol"],
-                    atol=cfg["tier1_atol"],
-                )
+                ok, res_norm, tol = _gmres_true_residual_ok(tier1_sol, rtol=cfg["tier1_rtol"], atol=cfg["tier1_atol"])
                 if not ok:
                     tier1_info = f"postcheck:{res_norm:.6e}>{tol:.6e}"
                     tier1_cause = "postcheck_failed"
@@ -703,11 +666,7 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
         try:
             sol2, tier2_info = cp_splinalg.gmres(matrix_gpu, rhs_gpu, **tier2_kwargs)
             if tier2_info == 0:
-                ok, res_norm, tol = _gmres_true_residual_ok(
-                    sol2,
-                    rtol=cfg["tier2_rtol"],
-                    atol=cfg["tier2_atol"],
-                )
+                ok, res_norm, tol = _gmres_true_residual_ok(sol2, rtol=cfg["tier2_rtol"], atol=cfg["tier2_atol"])
                 if not ok:
                     tier2_info = f"postcheck:{res_norm:.6e}>{tol:.6e}"
                     tier2_cause = "postcheck_failed"
@@ -722,10 +681,7 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
             _record_gmres_stat("tier2_exception", always=True)
 
         _record_gmres_stat("tier2_failed", always=True)
-        sol_fallback = _solve_equilibrated_retry(
-            tier1_info=tier1_info,
-            tier2_info=tier2_info,
-        )
+        sol_fallback = _solve_equilibrated_retry(tier1_info=tier1_info, tier2_info=tier2_info)
         _GMRES_PREV_SOL = sol_fallback
         return sol_fallback
 
@@ -745,21 +701,10 @@ def _solve_sparse_linear_system_torch(matrix, rhs):
     can_try_torch_sparse = rhs_t.device.type != "cpu"
     if sp.issparse(matrix) and can_try_torch_sparse and hasattr(torch.sparse, "spsolve"):
         matrix_csr = matrix.tocsr()
-        crow_indices = torch.from_numpy(
-            matrix_csr.indptr.astype(np.int64, copy=False)
-        ).to(device=device)
-        col_indices = torch.from_numpy(
-            matrix_csr.indices.astype(np.int64, copy=False)
-        ).to(device=device)
+        crow_indices = torch.from_numpy(matrix_csr.indptr.astype(np.int64, copy=False)).to(device=device)
+        col_indices = torch.from_numpy(matrix_csr.indices.astype(np.int64, copy=False)).to(device=device)
         values = torch.from_numpy(matrix_csr.data).to(device=device, dtype=dtype)
-        matrix_t = torch.sparse_csr_tensor(
-            crow_indices,
-            col_indices,
-            values,
-            size=matrix_csr.shape,
-            device=device,
-            dtype=dtype,
-        )
+        matrix_t = torch.sparse_csr_tensor(crow_indices, col_indices, values, size=matrix_csr.shape, device=device, dtype=dtype)
         try:
             return torch.sparse.spsolve(matrix_t, rhs_t)
         except Exception:
@@ -767,12 +712,7 @@ def _solve_sparse_linear_system_torch(matrix, rhs):
 
     if sp.issparse(matrix):
         matrix_cpu = matrix if sp.isspmatrix_csc(matrix) else matrix.tocsc()
-        matrix_lu = sp.linalg.splu(
-            matrix_cpu,
-            permc_spec="MMD_AT_PLUS_A",
-            diag_pivot_thresh=0.0,
-            options=dict(SymmetricMode=True),
-        )
+        matrix_lu = sp.linalg.splu(matrix_cpu, permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0, options=dict(SymmetricMode=True))
         return xp.asarray(matrix_lu.solve(to_numpy(rhs_t)))
 
     dense = xp.asarray(matrix)
@@ -783,12 +723,7 @@ def _solve_sparse_linear_system_torch(matrix, rhs):
 
 def _solve_sparse_linear_system_numpy(matrix, rhs):
     matrix_cpu = matrix if sp.isspmatrix_csc(matrix) else matrix.tocsc()
-    matrix_lu = sp.linalg.splu(
-        matrix_cpu,
-        permc_spec="MMD_AT_PLUS_A",
-        diag_pivot_thresh=0.0,
-        options=dict(SymmetricMode=True),
-    )
+    matrix_lu = sp.linalg.splu(matrix_cpu, permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0, options=dict(SymmetricMode=True))
     return matrix_lu.solve(np.asarray(to_numpy(rhs)))
 
 
@@ -805,12 +740,7 @@ def _solve_sparse_linear_system_cupy_cpu_direct(matrix, rhs):
     matrix_cpu = matrix_cpu if sp.isspmatrix_csc(matrix_cpu) else matrix_cpu.tocsc()
     rhs_cpu = np.asarray(to_numpy(rhs))
 
-    matrix_lu = sp.linalg.splu(
-        matrix_cpu,
-        permc_spec="MMD_AT_PLUS_A",
-        diag_pivot_thresh=0.0,
-        options=dict(SymmetricMode=True),
-    )
+    matrix_lu = sp.linalg.splu(matrix_cpu, permc_spec="MMD_AT_PLUS_A", diag_pivot_thresh=0.0, options=dict(SymmetricMode=True))
     sol_cpu = matrix_lu.solve(rhs_cpu)
     _record_transfer("host_to_device:gas_cpu_direct")
     return cp.asarray(sol_cpu)
