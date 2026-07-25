@@ -20,6 +20,7 @@ from simframe.integration import Scheme
 from simframe.backends.api import get_backend
 from simframe.backends.api import select_backend
 from simframe.backends.api import xp
+from simframe.frame import field_data as _field_data
 from dustpy.std import gas_f
 from dustpy.utils.backend import bind_gas_sparse_solver
 from dustpy.utils.backend import call_numpy
@@ -33,10 +34,6 @@ import dustpy.constants as c
 def _gas_f_call(func, *args, to_backend_result=True, **kwargs):
     """Call NumPy/F2PY gas kernels with backend-safe conversions."""
     return call_numpy(func, *args, to_backend_result=to_backend_result, **kwargs)
-
-
-def _field_data(value):
-    return value._data if hasattr(value, "_data") else value
 
 
 def _env_float(name, default):

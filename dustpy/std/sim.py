@@ -8,10 +8,6 @@ from dustpy import std
 from simframe.backends.api import xp
 
 
-def _field_data(value):
-    return value._data if hasattr(value, "_data") else value
-
-
 def _to_numpy(value):
     if hasattr(value, "get"):
         return value.get()

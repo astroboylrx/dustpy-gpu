@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from dustpy.utils.backend import to_numpy
 from dustpy.utils.boundary_modes import is_dust_inner_outflow_only_enabled
 from simframe.backends.api import xp
+from simframe.frame import field_data as _field_data
 
 
 _GAS_FLOOR_FREEZE_CONFIG = {
@@ -22,11 +23,6 @@ _RUNTIME_STATE_VARS = (
     "_GAS_FLOOR_FREEZE_CONFIG",
     "_DUST_TRANSPORT_INACTIVE_FLOOR_CONFIG",
 )
-
-
-def _field_data(value):
-    """Unwrap simframe Field-like containers to backend array data."""
-    return value._data if hasattr(value, "_data") else value
 
 
 def _fresh_runtime_state():
