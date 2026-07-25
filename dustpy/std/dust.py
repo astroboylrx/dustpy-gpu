@@ -1,9 +1,22 @@
 '''Module containing standard functions for the dust.'''
 
-
-import dustpy.constants as c
 import os
 from types import SimpleNamespace
+
+import numpy as np
+import scipy.sparse as sp
+
+try:
+    import cupy as cp
+except Exception:  # pragma: no cover - optional dependency
+    cp = None
+
+try:
+    import cupyx.scipy.sparse as cp_sparse
+except Exception:  # pragma: no cover - optional dependency
+    cp_sparse = None
+
+import dustpy.constants as c
 
 # Re-export legacy private attributes so existing dumps and direct imports keep resolving through dustpy.std.dust.
 import dustpy.std._dust_common as _dust_common_impl
@@ -112,27 +125,17 @@ from dustpy.std._dust_numpy import (
     _vrel_vertical_settling_fortran,
 )
 from dustpy.std import dust_f
-from dustpy.utils.backend import bind_sparse_solver
-from dustpy.utils.backend import solve_sparse_linear_system
-from dustpy.utils.backend import to_numpy
+from dustpy.utils.backend import (
+    bind_sparse_solver,
+    solve_sparse_linear_system,
+    to_numpy,
+)
 from dustpy.utils.boundary_modes import is_dust_inner_outflow_only_enabled, is_zero_flux_enabled
-from simframe.backends.api import get_backend
-from simframe.backends.api import select_backend
-from simframe.backends.api import xp
-
-import numpy as np
-import scipy.sparse as sp
-
-try:
-    import cupy as cp
-except Exception:  # pragma: no cover - optional dependency
-    cp = None
-
-try:
-    import cupyx.scipy.sparse as cp_sparse
-except Exception:  # pragma: no cover - optional dependency
-    cp_sparse = None
-
+from simframe.backends.api import (
+    get_backend,
+    select_backend,
+    xp,
+)
 from simframe.integration import Scheme
 
 

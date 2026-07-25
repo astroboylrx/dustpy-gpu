@@ -1,25 +1,10 @@
 """Private CuPy implementations for dust evolution."""
 
-import dustpy.constants as c
 import math
 import os
 
 import numpy as np
 import scipy.sparse as sp
-
-from dustpy.std._dust_common import _apply_gas_floor_freeze_to_flux
-from dustpy.std._dust_common import _apply_gas_floor_freeze_to_radial_field
-from dustpy.std._dust_common import _field_data
-from dustpy.std._dust_common import _gas_floor_freeze_mask
-from dustpy.std._dust_cupy_kernels import _F_diff_cupy_elementwise
-from dustpy.std._dust_cupy_kernels import _kernel_cupy_elementwise
-from dustpy.std._dust_cupy_kernels import _p_frag_cupy_elementwise
-from dustpy.std._dust_cupy_kernels import _get_raw_scatter_kernel
-from dustpy.std._dust_cupy_kernels import _vrel_turbulent_motion_cupy_elementwise
-from dustpy.std._dust_numpy import _get_jcoag_pattern
-from dustpy.utils.boundary_modes import is_zero_flux_enabled
-from dustpy.utils.backend import to_numpy
-from simframe.backends.api import xp
 
 try:
     import cupy as cp
@@ -40,6 +25,25 @@ try:
     from cupyx import scatter_add as cp_scatter_add
 except Exception:  # pragma: no cover - optional dependency
     cp_scatter_add = None
+
+import dustpy.constants as c
+from dustpy.std._dust_common import (
+    _apply_gas_floor_freeze_to_flux,
+    _apply_gas_floor_freeze_to_radial_field,
+    _field_data,
+    _gas_floor_freeze_mask,
+)
+from dustpy.std._dust_cupy_kernels import (
+    _F_diff_cupy_elementwise,
+    _get_raw_scatter_kernel,
+    _kernel_cupy_elementwise,
+    _p_frag_cupy_elementwise,
+    _vrel_turbulent_motion_cupy_elementwise,
+)
+from dustpy.std._dust_numpy import _get_jcoag_pattern
+from dustpy.utils.backend import to_numpy
+from dustpy.utils.boundary_modes import is_zero_flux_enabled
+from simframe.backends.api import xp
 
 
 _COAG_PAIR_CACHE_KEY = None

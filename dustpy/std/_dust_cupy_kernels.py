@@ -1,12 +1,13 @@
 """CuPy kernel source templates and lazy kernel caches for dust evolution."""
 
-import dustpy.constants as c
 import numpy as np
 
 try:
     import cupy as cp
 except Exception:  # pragma: no cover - optional dependency
     cp = None
+
+import dustpy.constants as c
 
 
 _FP_REPLACEMENTS = {

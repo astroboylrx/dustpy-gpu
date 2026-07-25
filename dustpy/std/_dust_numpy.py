@@ -1,21 +1,27 @@
 """Private NumPy/Fortran implementations for dust evolution."""
 
-import dustpy.constants as c
 import numpy as np
-from simframe.backends.api import xp
-from simframe.backends.api import get_backend
-
-from dustpy.std import dust_f
-from dustpy.std._dust_common import _apply_gas_floor_freeze_to_flux
-from dustpy.std._dust_common import _apply_gas_floor_freeze_to_radial_field
-from dustpy.std._dust_common import _field_data
-from dustpy.utils.backend import call_numpy
-from dustpy.utils.backend import to_numpy
 
 try:
     import cupy as cp
 except Exception:  # pragma: no cover - optional dependency
     cp = None
+
+import dustpy.constants as c
+from dustpy.std import dust_f
+from dustpy.std._dust_common import (
+    _apply_gas_floor_freeze_to_flux,
+    _apply_gas_floor_freeze_to_radial_field,
+    _field_data,
+)
+from dustpy.utils.backend import (
+    call_numpy,
+    to_numpy,
+)
+from simframe.backends.api import (
+    get_backend,
+    xp,
+)
 
 
 _JCOAG_CONST_CACHE_KEY = None

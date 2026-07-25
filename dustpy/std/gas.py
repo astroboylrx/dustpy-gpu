@@ -1,34 +1,43 @@
 """Module containing standard functions for the gas."""
 
 import os
+
 import numpy as np
 import scipy.sparse as sp
-from dustpy import std
+
 try:
     import cupy as cp
 except Exception:  # pragma: no cover - optional dependency
     cp = None
+
 try:
     import cupyx.scipy.sparse as cp_sparse
 except Exception:  # pragma: no cover - optional dependency
     cp_sparse = None
+
 try:
     from cupyx.scipy.interpolate import interp1d as cp_interp1d
 except Exception:  # pragma: no cover - optional dependency
     cp_interp1d = None
-from simframe.integration import Scheme
-from simframe.backends.api import get_backend
-from simframe.backends.api import select_backend
-from simframe.backends.api import xp
-from simframe.frame import field_data as _field_data
-from dustpy.std import gas_f
-from dustpy.utils.backend import bind_gas_sparse_solver
-from dustpy.utils.backend import call_numpy
-from dustpy.utils.backend import solve_gas_sparse_linear_system
-from dustpy.utils.backend import to_backend
-from dustpy.utils.backend import to_numpy
-from dustpy.utils.boundary_modes import is_zero_flux_enabled
+
 import dustpy.constants as c
+from dustpy import std
+from dustpy.std import gas_f
+from dustpy.utils.backend import (
+    bind_gas_sparse_solver,
+    call_numpy,
+    solve_gas_sparse_linear_system,
+    to_backend,
+    to_numpy,
+)
+from dustpy.utils.boundary_modes import is_zero_flux_enabled
+from simframe.backends.api import (
+    get_backend,
+    select_backend,
+    xp,
+)
+from simframe.frame import field_data as _field_data
+from simframe.integration import Scheme
 
 
 def _gas_f_call(func, *args, to_backend_result=True, **kwargs):
