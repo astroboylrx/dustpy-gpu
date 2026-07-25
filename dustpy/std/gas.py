@@ -67,7 +67,7 @@ def _interp_to_interfaces_1d_cupy(values, r, ri):
     values = _field_data(values)
     r = _field_data(r)
     ri = _field_data(ri)
-    if cp is None or cp_interp1d is None:
+    if cp_interp1d is None:
         return _interp_to_interfaces_1d_numpy(values, r, ri)
     f = cp_interp1d(
         cp.asarray(r),

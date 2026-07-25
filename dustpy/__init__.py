@@ -21,7 +21,7 @@ from simframe.io.dump import readdump
 from importlib import metadata as _md
 
 __name__ = "dustpy"
-__version__ = _md.version("dustpy")
+__version__ = _md.version("dustpy-gpu")
 
 Simulation.__version__ = __version__
 plot.__version__ = __version__

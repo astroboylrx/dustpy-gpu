@@ -248,8 +248,6 @@ def _render_elementwise_args(kind, precision):
 
 
 def _precision_for_dtype(dtype):
-    if cp is None:
-        return None
     if dtype == cp.float32:
         return "f32"
     if dtype == cp.float64:

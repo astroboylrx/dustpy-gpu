@@ -117,9 +117,12 @@ import scipy.sparse as sp
 
 try:
     import cupy as cp
-    import cupyx.scipy.sparse as cp_sparse
 except Exception:  # pragma: no cover - optional dependency
     cp = None
+
+try:
+    import cupyx.scipy.sparse as cp_sparse
+except Exception:  # pragma: no cover - optional dependency
     cp_sparse = None
 
 from simframe.integration import Scheme
@@ -422,9 +425,9 @@ def _maybe_retry_implicit_floor_injection_numpy(x0, Y0, dx, sigma1):
     cfg = _IMPLICIT_FLOOR_RETRY_CONFIG
     if not cfg.get("enabled", True):
         return False
-    sigma1_np = np.asarray(_field_data(sigma1), dtype=np.float64)
-    floor_np = np.asarray(_field_data(Y0._owner.dust.SigmaFloor), dtype=np.float64)
-    area_np = np.asarray(_field_data(Y0._owner.grid.A), dtype=np.float64)
+    sigma1_np = _field_data(sigma1)
+    floor_np = _field_data(Y0._owner.dust.SigmaFloor)
+    area_np = _field_data(Y0._owner.grid.A)
     delta_np = np.maximum(0.1 * floor_np - sigma1_np, 0.0)
     added_mearth = float(np.sum(delta_np * area_np[:, None] / c.M_earth))
     if added_mearth <= float(cfg.get("threshold_mearth", 0.0)):
@@ -444,11 +447,9 @@ def _maybe_retry_implicit_floor_injection_cupy(x0, Y0, dx, sigma1):
     cfg = _IMPLICIT_FLOOR_RETRY_CONFIG
     if not cfg.get("enabled", True):
         return False
-    if cp is None:
-        return _maybe_retry_implicit_floor_injection_numpy(x0, Y0, dx, sigma1)
-    sigma1_cp = cp.asarray(_field_data(sigma1))
-    floor_cp = cp.asarray(_field_data(Y0._owner.dust.SigmaFloor))
-    area_cp = cp.asarray(_field_data(Y0._owner.grid.A))
+    sigma1_cp = _field_data(sigma1)
+    floor_cp = _field_data(Y0._owner.dust.SigmaFloor)
+    area_cp = _field_data(Y0._owner.grid.A)
     delta_cp = cp.maximum(0.1 * floor_cp - sigma1_cp, 0.0)
     added_mearth = float(to_numpy(cp.sum(delta_cp * area_cp[:, None] / c.M_earth)))
     if added_mearth <= float(cfg.get("threshold_mearth", 0.0)):
@@ -469,7 +470,7 @@ def _maybe_retry_implicit_floor_injection(x0, Y0, dx, sigma1):
 
 
 def _interp_to_interfaces(values, r, ri):
-    return _K_INTERP_TO_INTERFACES(values, r, ri)
+    return _K_INTERP_TO_INTERFACES(_field_data(values), _field_data(r), _field_data(ri))
 
 
 def bind_backend_kernels(backend=None, force=False, runtime_token=None):
@@ -1095,18 +1096,18 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
     sparse matrix."""
 
     # Parameters for function call
-    A = sim.dust.coagulation.A
-    cstick = sim.dust.coagulation.stick
-    eps = sim.dust.coagulation.eps
-    ilf = sim.dust.coagulation.lf_ind
-    irm = sim.dust.coagulation.rm_ind
-    istick = sim.dust.coagulation.stick_ind
-    m = sim.grid.m
-    phi = sim.dust.coagulation.phi
-    Rf = sim.dust.kernel * sim.dust.p.frag
-    Rs = sim.dust.kernel * sim.dust.p.stick
-    SigD = sim.dust.Sigma
-    SigDfloor = sim.dust.SigmaFloor
+    A = _field_data(sim.dust.coagulation.A)
+    cstick = _field_data(sim.dust.coagulation.stick)
+    eps = _field_data(sim.dust.coagulation.eps)
+    ilf = _field_data(sim.dust.coagulation.lf_ind)
+    irm = _field_data(sim.dust.coagulation.rm_ind)
+    istick = _field_data(sim.dust.coagulation.stick_ind)
+    m = _field_data(sim.grid.m)
+    phi = _field_data(sim.dust.coagulation.phi)
+    Rf = _field_data(sim.dust.kernel * sim.dust.p.frag)
+    Rs = _field_data(sim.dust.kernel * sim.dust.p.stick)
+    SigD = _field_data(sim.dust.Sigma)
+    SigDfloor = _field_data(sim.dust.SigmaFloor)
 
     # Helper variables for convenience
     if dx is None:
@@ -1117,12 +1118,15 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
         dt = float(dt)
     except Exception:
         dt = float(to_numpy(dt))
-    r = sim.grid.r
-    ri = sim.grid.ri
-    r_np = to_numpy(r)
-    ri_np = to_numpy(ri)
-    Sigma_np = to_numpy(sim.dust.Sigma)
-    area = sim.grid.A
+    r = _field_data(sim.grid.r)
+    ri = _field_data(sim.grid.ri)
+    r_np = r
+    ri_np = ri
+    Sigma_np = SigD
+    area = _field_data(sim.grid.A)
+    D = _field_data(sim.dust.D)
+    SigmaGas = _field_data(sim.gas.Sigma)
+    v = _field_data(sim.dust.v.rad)
     Nr = int(sim.grid.Nr)
     Nm = int(sim.grid.Nm)
     zero_flux = is_zero_flux_enabled(sim)
@@ -1150,13 +1154,13 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
     J_coag = sp.csc_matrix(gen, shape=(Ntot, Ntot))
 
     if np.any(freeze_velocity_mask) or np.any(freeze_diffusion_mask):
-        A_h, B_h, C_h = _jacobian_hydrodynamic_generator_numpy(area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, freeze_velocity_mask=freeze_velocity_mask, freeze_diffusion_mask=freeze_diffusion_mask)
+        A_h, B_h, C_h = _jacobian_hydrodynamic_generator_numpy(area, D, r, ri, SigmaGas, v, freeze_velocity_mask=freeze_velocity_mask, freeze_diffusion_mask=freeze_diffusion_mask)
     else:
-        A_h, B_h, C_h = _dust_f_call(dust_f.jacobian_hydrodynamic_generator, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, to_backend_result=False)
+        A_h, B_h, C_h = _dust_f_call(dust_f.jacobian_hydrodynamic_generator, area, D, r, ri, SigmaGas, v, to_backend_result=False)
     if zero_flux:
-        A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_numpy(A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad)
+        A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_numpy(A_h, B_h, C_h, area, D, r, ri, SigmaGas, v)
     elif diode_block_mask is not None and np.any(to_numpy(diode_block_mask)):
-        A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_numpy(A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, diode_block_mask, adv_drain_mask=inner_adv_drain_mask)
+        A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_numpy(A_h, B_h, C_h, area, D, r, ri, SigmaGas, v, diode_block_mask, adv_drain_mask=inner_adv_drain_mask)
     J_hyd = sp.diags((A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]), offsets=(-Nm, 0, Nm), shape=(Ntot, Ntot), format="csc")
 
     # Right-hand side defaults to the current state for all rows.
@@ -1280,18 +1284,18 @@ def _jacobian_numpy(sim, x, dx=None, *args, **kwargs):
 
 def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     # Parameters for function call
-    A = sim.dust.coagulation.A
-    cstick = sim.dust.coagulation.stick
-    eps = sim.dust.coagulation.eps
-    ilf = sim.dust.coagulation.lf_ind
-    irm = sim.dust.coagulation.rm_ind
-    istick = sim.dust.coagulation.stick_ind
-    m = sim.grid.m
-    phi = sim.dust.coagulation.phi
-    Rf = sim.dust.kernel * sim.dust.p.frag
-    Rs = sim.dust.kernel * sim.dust.p.stick
-    SigD = sim.dust.Sigma
-    SigDfloor = sim.dust.SigmaFloor
+    A = _field_data(sim.dust.coagulation.A)
+    cstick = _field_data(sim.dust.coagulation.stick)
+    eps = _field_data(sim.dust.coagulation.eps)
+    ilf = _field_data(sim.dust.coagulation.lf_ind)
+    irm = _field_data(sim.dust.coagulation.rm_ind)
+    istick = _field_data(sim.dust.coagulation.stick_ind)
+    m = _field_data(sim.grid.m)
+    phi = _field_data(sim.dust.coagulation.phi)
+    Rf = _field_data(sim.dust.kernel * sim.dust.p.frag)
+    Rs = _field_data(sim.dust.kernel * sim.dust.p.stick)
+    SigD = _field_data(sim.dust.Sigma)
+    SigDfloor = _field_data(sim.dust.SigmaFloor)
 
     if dx is None:
         dt = x.stepsize
@@ -1304,8 +1308,11 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
 
     r = _field_data(sim.grid.r)
     ri = _field_data(sim.grid.ri)
-    SigmaArr = _field_data(sim.dust.Sigma)
-    area = sim.grid.A
+    SigmaArr = SigD
+    area = _field_data(sim.grid.A)
+    D = _field_data(sim.dust.D)
+    SigmaGas = _field_data(sim.gas.Sigma)
+    v = _field_data(sim.dust.v.rad)
     Nr = int(sim.grid.Nr)
     Nm = int(sim.grid.Nm)
     Ntot = int((Nr * Nm))
@@ -1318,7 +1325,7 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     freeze_mask = _gas_floor_freeze_mask(sim)
     freeze_velocity_mask = _transport_velocity_freeze_interface_mask(sim, SigmaDust=sim.dust.Sigma, Fi_adv=sim.dust.Fi.adv)
     freeze_diffusion_mask = _transport_diffusion_freeze_interface_mask(sim, SigmaDust=sim.dust.Sigma)
-    q = _get_mass_grid_q(cp.asarray(_field_data(m)), Nm)
+    q = _get_mass_grid_q(m, Nm)
     _, _, _, _, _, jcoag_indices, jcoag_indptr, jcoag_perm = _get_jcoag_pattern_cupy(Nr, Nm, q)
 
     dat, _, _ = _jacobian_coagulation_generator_cupy(A, cstick, eps, ilf, irm, istick, m, phi, Rf, Rs, SigD, SigDfloor)
@@ -1328,11 +1335,11 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
     dat_csr = dat if jcoag_perm is None else dat[jcoag_perm]
     J_coag = cp_sparse.csr_matrix((dat_csr, jcoag_indices, jcoag_indptr), shape=(Ntot, Ntot))
 
-    A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, freeze_velocity_mask=freeze_velocity_mask, freeze_diffusion_mask=freeze_diffusion_mask)
+    A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v, freeze_velocity_mask=freeze_velocity_mask, freeze_diffusion_mask=freeze_diffusion_mask)
     if zero_flux:
-        A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad)
+        A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(A_h, B_h, C_h, area, D, r, ri, SigmaGas, v)
     elif diode_block_mask is not None and int(to_numpy(diode_block_mask.sum())) > 0:
-        A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_cupy(A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, diode_block_mask, adv_drain_mask=inner_adv_drain_mask)
+        A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_cupy(A_h, B_h, C_h, area, D, r, ri, SigmaGas, v, diode_block_mask, adv_drain_mask=inner_adv_drain_mask)
     n_hyd, jhb_map, jhb_indices, jhb_indptr = _get_dust_hyd_boundary_pattern_cupy(Nr, Nm)
     dat_hyd = cp.concatenate((A_h.ravel()[Nm:], B_h.ravel(), C_h.ravel()[:-Nm]))
 
@@ -1431,18 +1438,18 @@ def _jacobian_cupy(sim, x, dx=None, *args, **kwargs):
 
 def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
     """CuPy Jacobian assembly into a dense matrix (no sparse conversion path)."""
-    A = sim.dust.coagulation.A
-    cstick = sim.dust.coagulation.stick
-    eps = sim.dust.coagulation.eps
-    ilf = sim.dust.coagulation.lf_ind
-    irm = sim.dust.coagulation.rm_ind
-    istick = sim.dust.coagulation.stick_ind
-    m = sim.grid.m
-    phi = sim.dust.coagulation.phi
-    Rf = sim.dust.kernel * sim.dust.p.frag
-    Rs = sim.dust.kernel * sim.dust.p.stick
-    SigD = sim.dust.Sigma
-    SigDfloor = sim.dust.SigmaFloor
+    A = _field_data(sim.dust.coagulation.A)
+    cstick = _field_data(sim.dust.coagulation.stick)
+    eps = _field_data(sim.dust.coagulation.eps)
+    ilf = _field_data(sim.dust.coagulation.lf_ind)
+    irm = _field_data(sim.dust.coagulation.rm_ind)
+    istick = _field_data(sim.dust.coagulation.stick_ind)
+    m = _field_data(sim.grid.m)
+    phi = _field_data(sim.dust.coagulation.phi)
+    Rf = _field_data(sim.dust.kernel * sim.dust.p.frag)
+    Rs = _field_data(sim.dust.kernel * sim.dust.p.stick)
+    SigD = _field_data(sim.dust.Sigma)
+    SigDfloor = _field_data(sim.dust.SigmaFloor)
 
     if dx is None:
         dt = x.stepsize
@@ -1455,8 +1462,11 @@ def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
 
     r = _field_data(sim.grid.r)
     ri = _field_data(sim.grid.ri)
-    SigmaArr = _field_data(sim.dust.Sigma)
-    area = sim.grid.A
+    SigmaArr = SigD
+    area = _field_data(sim.grid.A)
+    D = _field_data(sim.dust.D)
+    SigmaGas = _field_data(sim.gas.Sigma)
+    v = _field_data(sim.dust.v.rad)
     Nr = int(sim.grid.Nr)
     Nm = int(sim.grid.Nm)
     Ntot = int(Nr * Nm)
@@ -1470,7 +1480,7 @@ def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
     freeze_velocity_mask = _transport_velocity_freeze_interface_mask(sim, SigmaDust=sim.dust.Sigma, Fi_adv=sim.dust.Fi.adv)
     freeze_diffusion_mask = _transport_diffusion_freeze_interface_mask(sim, SigmaDust=sim.dust.Sigma)
 
-    q = _get_mass_grid_q(cp.asarray(_field_data(m)), Nm)
+    q = _get_mass_grid_q(m, Nm)
     _, _, row, col, _, _, _, _ = _get_jcoag_pattern_cupy(Nr, Nm, q)
     dat_coag, _, _ = _jacobian_coagulation_generator_cupy(A, cstick, eps, ilf, irm, istick, m, phi, Rf, Rs, SigD, SigDfloor)
     if int(to_numpy(freeze_mask[1:-1].sum())) > 0:
@@ -1481,11 +1491,11 @@ def _jacobian_cupy_dense(sim, x, dx=None, *args, **kwargs):
     J_flat = J.ravel()
     _scatter_add_1d(J_flat, row * Ntot + col, dat_coag)
 
-    A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, freeze_velocity_mask=freeze_velocity_mask, freeze_diffusion_mask=freeze_diffusion_mask)
+    A_h, B_h, C_h = _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v, freeze_velocity_mask=freeze_velocity_mask, freeze_diffusion_mask=freeze_diffusion_mask)
     if zero_flux:
-        A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad)
+        A_h, B_h, C_h = _apply_zero_flux_dust_hyd_edges_cupy(A_h, B_h, C_h, area, D, r, ri, SigmaGas, v)
     elif diode_block_mask is not None and int(to_numpy(diode_block_mask.sum())) > 0:
-        A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_cupy(A_h, B_h, C_h, area, sim.dust.D, r, ri, sim.gas.Sigma, sim.dust.v.rad, diode_block_mask, adv_drain_mask=inner_adv_drain_mask)
+        A_h, B_h, C_h = _apply_inner_zero_flux_dust_hyd_edge_cupy(A_h, B_h, C_h, area, D, r, ri, SigmaGas, v, diode_block_mask, adv_drain_mask=inner_adv_drain_mask)
 
     idx = cp.arange(Ntot, dtype=cp.int64)
     Bflat = B_h.ravel()
@@ -1945,7 +1955,7 @@ def vrel_tot(sim):
     -------
     vrel : Field
         Relative velocities"""
-    if _VREL_TOT_MODE == "elementwise" and cp is not None and getattr(xp, "name", "") == "cupy":
+    if _VREL_TOT_MODE == "elementwise" and getattr(xp, "name", "") == "cupy":
         vrel = _vrel_tot_cupy_elementwise(_field_data(sim.dust.v.rel.azi), _field_data(sim.dust.v.rel.brown), _field_data(sim.dust.v.rel.rad), _field_data(sim.dust.v.rel.turb), _field_data(sim.dust.v.rel.vert))
         if vrel is not None:
             return vrel
@@ -2017,7 +2027,7 @@ def _f_impl_1_direct_numpy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
     if jac is None:
         jac = Y0.jacobian(x0, dx)
     if rhs is None:
-        rhs = np.asarray(_field_data(Y0.ravel()))
+        rhs = _field_data(Y0).ravel()
 
     Nm = Y0._owner.dust.Sigma.shape[1]
 
@@ -2046,7 +2056,7 @@ def _f_impl_1_direct_cupy(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs):
     if jac is None:
         jac = Y0.jacobian(x0, dx)
     if rhs is None:
-        rhs = cp.asarray(_field_data(Y0.ravel()))
+        rhs = _field_data(Y0).ravel()
 
     Nm = Y0._owner.dust.Sigma.shape[1]
     if zero_flux:
@@ -2079,9 +2089,9 @@ def _f_impl_1_direct_cupy_dense(x0, Y0, dx, jac=None, rhs=None, *args, **kwargs)
     if jac is None:
         jac = Y0.jacobian(x0, dx)
     if rhs is None:
-        rhs = cp.asarray(_field_data(Y0.ravel()))
+        rhs = _field_data(Y0).ravel()
     else:
-        rhs = cp.asarray(_field_data(rhs))
+        rhs = _field_data(rhs)
 
     Nm = Y0._owner.dust.Sigma.shape[1]
     if zero_flux:

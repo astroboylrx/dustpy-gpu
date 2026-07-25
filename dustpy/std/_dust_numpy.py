@@ -66,13 +66,9 @@ def reset_runtime_caches():
 
 
 def _interp_to_interfaces_numpy(values, r, ri):
-    """NumPy/xp linear interpolation to interfaces with endpoint extrapolation."""
-    values = _field_data(values)
-    r = _field_data(r)
-    ri = _field_data(ri)
-
+    """Interpolate NumPy arrays from cell centers to interfaces."""
     if values.ndim == 1:
-        out = xp.zeros((values.shape[0] + 1,), dtype=values.dtype)
+        out = np.zeros((values.shape[0] + 1,), dtype=values.dtype)
         t = (ri[1:-1] - r[:-1]) / (r[1:] - r[:-1])
         out[1:-1] = values[:-1] + t * (values[1:] - values[:-1])
         m0 = (values[1] - values[0]) / (r[1] - r[0])
@@ -81,7 +77,7 @@ def _interp_to_interfaces_numpy(values, r, ri):
         out[-1] = values[-1] + m1 * (ri[-1] - r[-1])
         return out
 
-    out = xp.zeros((values.shape[0] + 1, values.shape[1]), dtype=values.dtype)
+    out = np.zeros((values.shape[0] + 1, values.shape[1]), dtype=values.dtype)
     t = ((ri[1:-1] - r[:-1]) / (r[1:] - r[:-1]))[:, None]
     out[1:-1, :] = values[:-1, :] + t * (values[1:, :] - values[:-1, :])
     m0 = (values[1, :] - values[0, :]) / (r[1] - r[0])
@@ -157,30 +153,21 @@ def _get_jcoag_pattern(Nr, Nm, q):
 
 
 def _jacobian_hydrodynamic_generator_numpy(area, D, r, ri, SigmaGas, v, freeze_velocity_mask=None, freeze_diffusion_mask=None):
-    """NumPy equivalent of dust_f.jacobian_hydrodynamic_generator with optional interface freeze."""
-    area = np.asarray(_field_data(area))
-    D = np.asarray(_field_data(D))
-    r = np.asarray(_field_data(r))
-    ri = np.asarray(_field_data(ri))
-    SigmaGas = np.asarray(_field_data(SigmaGas))
-    v = np.asarray(_field_data(v))
-
+    """Generate the hydrodynamic Jacobian from NumPy arrays."""
     Nr = int(r.shape[0])
     Nm = int(D.shape[1])
 
     h = SigmaGas * r
-    hi = np.asarray(_interp_to_interfaces_numpy(h, r, ri))
-    vi = np.asarray(_interp_to_interfaces_numpy(v, r, ri))
-    Di = np.asarray(_interp_to_interfaces_numpy(D, r, ri))
+    hi = _interp_to_interfaces_numpy(h, r, ri)
+    vi = _interp_to_interfaces_numpy(v, r, ri)
+    Di = _interp_to_interfaces_numpy(D, r, ri)
 
     if freeze_velocity_mask is not None:
-        freeze_velocity_mask = np.asarray(to_numpy(freeze_velocity_mask), dtype=bool)
         if freeze_velocity_mask.ndim == 1 and freeze_velocity_mask.size == vi.shape[0] and np.any(freeze_velocity_mask):
             vi[freeze_velocity_mask, :] = 0.0
         elif freeze_velocity_mask.shape == vi.shape and np.any(freeze_velocity_mask):
             vi[freeze_velocity_mask] = 0.0
     if freeze_diffusion_mask is not None:
-        freeze_diffusion_mask = np.asarray(to_numpy(freeze_diffusion_mask), dtype=bool)
         if freeze_diffusion_mask.ndim == 1 and freeze_diffusion_mask.size == Di.shape[0] and np.any(freeze_diffusion_mask):
             Di[freeze_diffusion_mask, :] = 0.0
         elif freeze_diffusion_mask.shape == Di.shape and np.any(freeze_diffusion_mask):
@@ -216,22 +203,15 @@ def _jacobian_hydrodynamic_generator_numpy(area, D, r, ri, SigmaGas, v, freeze_v
 
 
 def _apply_zero_flux_dust_hyd_edges_numpy(A, B, C, area, D, r, ri, SigmaGas, v):
-    """Inject conservative zero-flux boundary rows into dust hydrodynamic Jacobian."""
+    """Inject conservative zero-flux boundary rows using NumPy arrays."""
     Nr = int(A.shape[0])
     if Nr < 2:
         return A, B, C
 
-    area = np.asarray(area)
-    D = np.asarray(D)
-    r = np.asarray(r)
-    ri = np.asarray(ri)
-    SigmaGas = np.asarray(SigmaGas)
-    v = np.asarray(v)
-
     h = SigmaGas * r
-    hi = np.asarray(_interp_to_interfaces_numpy(h, r, ri))
-    Di = np.asarray(_interp_to_interfaces_numpy(D, r, ri))
-    vi = np.asarray(_interp_to_interfaces_numpy(v, r, ri))
+    hi = _interp_to_interfaces_numpy(h, r, ri)
+    Di = _interp_to_interfaces_numpy(D, r, ri)
+    vi = _interp_to_interfaces_numpy(v, r, ri)
     vip = np.maximum(vi, 0.0)
     vim = np.minimum(vi, 0.0)
     Vinv = (2.0 * c.pi) / area
@@ -266,22 +246,15 @@ def _apply_zero_flux_dust_hyd_edges_numpy(A, B, C, area, D, r, ri, SigmaGas, v):
 
 
 def _apply_inner_zero_flux_dust_hyd_edge_numpy(A, B, C, area, D, r, ri, SigmaGas, v, block_mask, adv_drain_mask=None, diff_drain_mask=None):
-    """Inject conservative zero-flux row at the inner edge only for selected mass bins."""
+    """Inject a selective inner zero-flux row using NumPy arrays."""
     Nr = int(A.shape[0])
     if Nr < 2:
         return A, B, C
 
-    area = np.asarray(area)
-    D = np.asarray(D)
-    r = np.asarray(r)
-    ri = np.asarray(ri)
-    SigmaGas = np.asarray(SigmaGas)
-    v = np.asarray(v)
-
     h = SigmaGas * r
-    hi = np.asarray(_interp_to_interfaces_numpy(h, r, ri))
-    Di = np.asarray(_interp_to_interfaces_numpy(D, r, ri))
-    vi = np.asarray(_interp_to_interfaces_numpy(v, r, ri))
+    hi = _interp_to_interfaces_numpy(h, r, ri)
+    Di = _interp_to_interfaces_numpy(D, r, ri)
+    vi = _interp_to_interfaces_numpy(v, r, ri)
     vip = np.maximum(vi, 0.0)
     vim = np.minimum(vi, 0.0)
     Vinv = (2.0 * c.pi) / area
@@ -290,18 +263,15 @@ def _apply_inner_zero_flux_dust_hyd_edge_numpy(A, B, C, area, D, r, ri, SigmaGas
     h0 = h[0] + 1.0e-300
     h1 = h[1] + 1.0e-300
 
-    block_mask = np.asarray(to_numpy(block_mask), dtype=bool)
     if block_mask.ndim != 1 or block_mask.size != B.shape[1] or not np.any(block_mask):
         return A, B, C
 
     vip1 = vip[1, :].copy()
     di1 = Di[1, :].copy()
     if adv_drain_mask is not None:
-        adv_drain_mask = np.asarray(to_numpy(adv_drain_mask), dtype=bool)
         if adv_drain_mask.ndim == 1 and adv_drain_mask.size == B.shape[1]:
             vip1[adv_drain_mask] = 0.0
     if diff_drain_mask is not None:
-        diff_drain_mask = np.asarray(to_numpy(diff_drain_mask), dtype=bool)
         if diff_drain_mask.ndim == 1 and diff_drain_mask.size == B.shape[1]:
             di1[diff_drain_mask] = 0.0
 
@@ -321,6 +291,8 @@ def _apply_inner_zero_flux_dust_hyd_edge_numpy(A, B, C, area, D, r, ri, SigmaGas
 
 def _dust_f_call(func, *args, to_backend_result=True, **kwargs):
     """Call NumPy/F2PY dust kernels with backend-safe conversions."""
+    args = tuple(_field_data(arg) for arg in args)
+    kwargs = {key: _field_data(value) for key, value in kwargs.items()}
     return call_numpy(func, *args, to_backend_result=to_backend_result, audit_tag=f"dust_f:{func.__name__}", **kwargs)
 
 
@@ -539,7 +511,7 @@ def _coagulation_parameters_python(sim):
             klf[jarr, i] = i
             AFrag[jarr, i] = m[i] + m[jarr]
 
-    if get_backend() == "cupy" and cp is not None:
+    if get_backend() == "cupy":
         return (
             cp.asarray(cstick),
             cp.asarray(cstick_ind),

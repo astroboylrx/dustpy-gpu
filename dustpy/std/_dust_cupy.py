@@ -16,26 +16,30 @@ from dustpy.std._dust_cupy_kernels import _kernel_cupy_elementwise
 from dustpy.std._dust_cupy_kernels import _p_frag_cupy_elementwise
 from dustpy.std._dust_cupy_kernels import _get_raw_scatter_kernel
 from dustpy.std._dust_cupy_kernels import _vrel_turbulent_motion_cupy_elementwise
-from dustpy.std._dust_numpy import _S_coag_fortran
 from dustpy.std._dust_numpy import _get_jcoag_pattern
-from dustpy.std._dust_numpy import _interp_to_interfaces_numpy
 from dustpy.utils.boundary_modes import is_zero_flux_enabled
 from dustpy.utils.backend import to_numpy
 from simframe.backends.api import xp
 
 try:
     import cupy as cp
-    import cupyx.scipy.sparse as cp_sparse
-    from cupyx.scipy.interpolate import interp1d as cp_interp1d
-    try:
-        from cupyx import scatter_add as cp_scatter_add
-    except Exception:  # pragma: no cover - optional dependency
-        cp_scatter_add = None
 except Exception:  # pragma: no cover - optional dependency
     cp = None
-    cp_scatter_add = None
+
+try:
+    import cupyx.scipy.sparse as cp_sparse
+except Exception:  # pragma: no cover - optional dependency
     cp_sparse = None
+
+try:
+    from cupyx.scipy.interpolate import interp1d as cp_interp1d
+except Exception:  # pragma: no cover - optional dependency
     cp_interp1d = None
+
+try:
+    from cupyx import scatter_add as cp_scatter_add
+except Exception:  # pragma: no cover - optional dependency
+    cp_scatter_add = None
 
 
 _COAG_PAIR_CACHE_KEY = None
@@ -199,13 +203,27 @@ def _get_jcoag_chunk_size(Nr_int, Nm):
 
 
 def _interp_to_interfaces_cupy(values, r, ri):
-    values = _field_data(values)
-    r = _field_data(r)
-    ri = _field_data(ri)
-    if cp is None or cp_interp1d is None:
-        return _interp_to_interfaces_numpy(values, r, ri)
-    f = cp_interp1d(cp.asarray(r), cp.asarray(values), kind="linear", axis=0, bounds_error=False, fill_value="extrapolate")
-    return f(cp.asarray(ri))
+    """Interpolate CuPy arrays from cell centers to interfaces."""
+    if cp_interp1d is None:
+        if values.ndim == 1:
+            out = cp.zeros((values.shape[0] + 1,), dtype=values.dtype)
+            t = (ri[1:-1] - r[:-1]) / (r[1:] - r[:-1])
+            out[1:-1] = values[:-1] + t * (values[1:] - values[:-1])
+            m0 = (values[1] - values[0]) / (r[1] - r[0])
+            m1 = (values[-1] - values[-2]) / (r[-1] - r[-2])
+            out[0] = values[0] + m0 * (ri[0] - r[0])
+            out[-1] = values[-1] + m1 * (ri[-1] - r[-1])
+            return out
+        out = cp.zeros((values.shape[0] + 1, values.shape[1]), dtype=values.dtype)
+        t = ((ri[1:-1] - r[:-1]) / (r[1:] - r[:-1]))[:, None]
+        out[1:-1, :] = values[:-1, :] + t * (values[1:, :] - values[:-1, :])
+        m0 = (values[1, :] - values[0, :]) / (r[1] - r[0])
+        m1 = (values[-1, :] - values[-2, :]) / (r[-1] - r[-2])
+        out[0, :] = values[0, :] + m0 * (ri[0] - r[0])
+        out[-1, :] = values[-1, :] + m1 * (ri[-1] - r[-1])
+        return out
+    f = cp_interp1d(r, values, kind="linear", axis=0, bounds_error=False, fill_value="extrapolate")
+    return f(ri)
 
 
 def _get_coag_pair_indices(Nm):
@@ -213,13 +231,10 @@ def _get_coag_pair_indices(Nm):
     global _COAG_PAIR_CACHE_KEY, _COAG_PAIR_CACHE_VALUE
     if _COAG_PAIR_CACHE_KEY != Nm or _COAG_PAIR_CACHE_VALUE is None:
         j_np, i_np = np.tril_indices(Nm)
-        if cp is None:
-            _COAG_PAIR_CACHE_VALUE = (j_np, i_np)
-        else:
-            _COAG_PAIR_CACHE_VALUE = (
-                cp.asarray(j_np, dtype=cp.int64),
-                cp.asarray(i_np, dtype=cp.int64),
-            )
+        _COAG_PAIR_CACHE_VALUE = (
+            cp.asarray(j_np, dtype=cp.int64),
+            cp.asarray(i_np, dtype=cp.int64),
+        )
         _COAG_PAIR_CACHE_KEY = Nm
     return _COAG_PAIR_CACHE_VALUE
 
@@ -275,10 +290,7 @@ def _get_mass_grid_q(m, Nm):
     if _MGRID_Q_CACHE_KEY == key and _MGRID_Q_CACHE_VALUE is not None:
         return _MGRID_Q_CACHE_VALUE
 
-    if cp is not None and isinstance(m, cp.ndarray):
-        agrid = float((cp.log10(m[0] / m[-1]) / (1.0 - Nm)).item())
-    else:
-        agrid = math.log10(float(m[0]) / float(m[-1])) / (1.0 - Nm)
+    agrid = float((cp.log10(m[0] / m[-1]) / (1.0 - Nm)).item())
     q = int(math.ceil(math.log10(2.0) / agrid))
     _MGRID_Q_CACHE_KEY = key
     _MGRID_Q_CACHE_VALUE = q
@@ -439,14 +451,10 @@ def _get_scoag_precomp(cstick, cstick_ind, A, eps, klf, krm, phi, m, Nm):
 def _active_imax_per_radius(Sigma, SigmaFloor):
     """Return per-radius active imax from Sigma > SigmaFloor as host int array."""
     active = Sigma > SigmaFloor
-    if cp is not None and isinstance(active, cp.ndarray):
-        any_active = cp.any(active, axis=1)
-        last_from_end = cp.argmax(active[:, ::-1], axis=1)
-        imax = cp.where(any_active, Sigma.shape[1] - last_from_end, 0).astype(cp.int64)
-        return cp.asnumpy(imax)
-    any_active = np.any(active, axis=1)
-    last_from_end = np.argmax(active[:, ::-1], axis=1)
-    return np.where(any_active, Sigma.shape[1] - last_from_end, 0).astype(np.int64)
+    any_active = cp.any(active, axis=1)
+    last_from_end = cp.argmax(active[:, ::-1], axis=1)
+    imax = cp.where(any_active, Sigma.shape[1] - last_from_end, 0).astype(cp.int64)
+    return cp.asnumpy(imax)
 
 
 def _get_jcoag_pattern_cupy(Nr, Nm, q):
@@ -893,20 +901,7 @@ def _get_jcoag_work_buffer(Nr, Nm, dtype):
 
 
 def _jacobian_coagulation_generator_cupy(A, cStick, eps, iLF, iRM, iStick, m, phi, Rf, Rs, Sigma, SigmaFloor):
-    """CuPy-native equivalent of dust_f.jacobian_coagulation_generator."""
-    A = cp.asarray(_field_data(A))
-    cStick = cp.asarray(_field_data(cStick))
-    eps = cp.asarray(_field_data(eps))
-    iLF = cp.asarray(_field_data(iLF))
-    iRM = cp.asarray(_field_data(iRM))
-    iStick = cp.asarray(_field_data(iStick))
-    m = cp.asarray(_field_data(m))
-    phi = cp.asarray(_field_data(phi))
-    Rf = cp.asarray(_field_data(Rf))
-    Rs = cp.asarray(_field_data(Rs))
-    Sigma = cp.asarray(_field_data(Sigma))
-    SigmaFloor = cp.asarray(_field_data(SigmaFloor))
-
+    """Generate the coagulation Jacobian from CuPy arrays."""
     Nr = int(Sigma.shape[0])
     Nm = int(Sigma.shape[1])
     N = Sigma / m[None, :]
@@ -970,14 +965,7 @@ def _jacobian_coagulation_generator_cupy(A, cStick, eps, iLF, iRM, iStick, m, ph
 
 
 def _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v, freeze_velocity_mask=None, freeze_diffusion_mask=None):
-    """CuPy-native equivalent of dust_f.jacobian_hydrodynamic_generator."""
-    area = _field_data(area)
-    D = _field_data(D)
-    r = _field_data(r)
-    ri = _field_data(ri)
-    SigmaGas = _field_data(SigmaGas)
-    v = _field_data(v)
-
+    """Generate the hydrodynamic Jacobian from CuPy arrays."""
     Nr = int(r.shape[0])
     Nm = int(D.shape[1])
 
@@ -987,14 +975,12 @@ def _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v, freeze_ve
     Di = _interp_to_interfaces(D, r, ri)
 
     if freeze_velocity_mask is not None:
-        freeze_velocity_mask = xp.asarray(freeze_velocity_mask, dtype=bool)
         if int(to_numpy(freeze_velocity_mask.sum())) > 0:
             if freeze_velocity_mask.ndim == 1 and int(freeze_velocity_mask.shape[0]) == int(vi.shape[0]):
                 vi[freeze_velocity_mask, :] = 0.0
             elif freeze_velocity_mask.shape == vi.shape:
                 vi[freeze_velocity_mask] = 0.0
     if freeze_diffusion_mask is not None:
-        freeze_diffusion_mask = xp.asarray(freeze_diffusion_mask, dtype=bool)
         if int(to_numpy(freeze_diffusion_mask.sum())) > 0:
             if freeze_diffusion_mask.ndim == 1 and int(freeze_diffusion_mask.shape[0]) == int(Di.shape[0]):
                 Di[freeze_diffusion_mask, :] = 0.0
@@ -1032,17 +1018,10 @@ def _jacobian_hydrodynamic_generator_cupy(area, D, r, ri, SigmaGas, v, freeze_ve
 
 
 def _apply_zero_flux_dust_hyd_edges_cupy(A, B, C, area, D, r, ri, SigmaGas, v):
-    """Inject conservative zero-flux boundary rows into dust hydrodynamic Jacobian."""
+    """Inject conservative zero-flux boundary rows using CuPy arrays."""
     Nr = int(A.shape[0])
     if Nr < 2:
         return A, B, C
-
-    area = _field_data(area)
-    D = _field_data(D)
-    r = _field_data(r)
-    ri = _field_data(ri)
-    SigmaGas = _field_data(SigmaGas)
-    v = _field_data(v)
 
     h = SigmaGas * r
     hi = _interp_to_interfaces(h, r, ri)
@@ -1082,17 +1061,10 @@ def _apply_zero_flux_dust_hyd_edges_cupy(A, B, C, area, D, r, ri, SigmaGas, v):
 
 
 def _apply_inner_zero_flux_dust_hyd_edge_cupy(A, B, C, area, D, r, ri, SigmaGas, v, block_mask, adv_drain_mask=None, diff_drain_mask=None):
-    """Inject conservative zero-flux row at the inner edge only for selected mass bins."""
+    """Inject a selective inner zero-flux row using CuPy arrays."""
     Nr = int(A.shape[0])
     if Nr < 2:
         return A, B, C
-
-    area = _field_data(area)
-    D = _field_data(D)
-    r = _field_data(r)
-    ri = _field_data(ri)
-    SigmaGas = _field_data(SigmaGas)
-    v = _field_data(v)
 
     h = SigmaGas * r
     hi = _interp_to_interfaces(h, r, ri)
@@ -1108,18 +1080,15 @@ def _apply_inner_zero_flux_dust_hyd_edge_cupy(A, B, C, area, D, r, ri, SigmaGas,
 
     if block_mask is None:
         return A, B, C
-    block_mask = xp.asarray(block_mask, dtype=bool)
     if int(to_numpy(block_mask.sum())) == 0:
         return A, B, C
 
     vip1 = vip[1, :].copy()
     di1 = Di[1, :].copy()
     if adv_drain_mask is not None:
-        adv_drain_mask = xp.asarray(adv_drain_mask, dtype=bool)
         if int(to_numpy(adv_drain_mask.sum())) > 0:
             vip1[adv_drain_mask] = 0.0
     if diff_drain_mask is not None:
-        diff_drain_mask = xp.asarray(diff_drain_mask, dtype=bool)
         if int(to_numpy(diff_drain_mask.sum())) > 0:
             di1[diff_drain_mask] = 0.0
 
@@ -1158,7 +1127,7 @@ def _get_cupy_dust_solver_mode():
 def _get_cupy_diag_positions_csr(matrix):
     """Return cached CSR data positions for diagonal entries, or None if absent."""
     global _CUPY_DIAG_POS_CACHE_KEY, _CUPY_DIAG_POS_CACHE_VALUE
-    if cp is None or cp_sparse is None:
+    if cp_sparse is None:
         return None
     if not isinstance(matrix, cp_sparse.spmatrix):
         return None
@@ -1311,9 +1280,6 @@ def _S_hyd_cupy(sim, Sigma=None):
 
 
 def _S_coag_cupy(sim, Sigma=None):
-    if cp is None:
-        return _S_coag_fortran(sim, Sigma=Sigma)
-
     if Sigma is None:
         Sigma = sim.dust.Sigma
 
@@ -1331,21 +1297,21 @@ def _S_coag_cupy(sim, Sigma=None):
     if _COAG_CACHE_KEY != cache_key or _COAG_CACHE_VALUE is None:
         _COAG_CACHE_KEY = cache_key
         _COAG_CACHE_VALUE = (
-            cp.asarray(_field_data(sim.dust.coagulation.stick)),
-            cp.asarray(_field_data(sim.dust.coagulation.stick_ind)),
-            cp.asarray(_field_data(sim.dust.coagulation.A)),
-            cp.asarray(_field_data(sim.dust.coagulation.eps)),
-            cp.asarray(_field_data(sim.dust.coagulation.lf_ind)),
-            cp.asarray(_field_data(sim.dust.coagulation.rm_ind)),
-            cp.asarray(_field_data(sim.dust.coagulation.phi)),
-            cp.asarray(_field_data(sim.grid.m)),
+            _field_data(sim.dust.coagulation.stick),
+            _field_data(sim.dust.coagulation.stick_ind),
+            _field_data(sim.dust.coagulation.A),
+            _field_data(sim.dust.coagulation.eps),
+            _field_data(sim.dust.coagulation.lf_ind),
+            _field_data(sim.dust.coagulation.rm_ind),
+            _field_data(sim.dust.coagulation.phi),
+            _field_data(sim.grid.m),
         )
 
     cstick, cstick_ind, A, eps, klf, krm, phi, m = _COAG_CACHE_VALUE
-    Kf = cp.asarray(_field_data(sim.dust.kernel * sim.dust.p.frag))
-    Ks = cp.asarray(_field_data(sim.dust.kernel * sim.dust.p.stick))
-    SigmaArr = cp.asarray(_field_data(Sigma))
-    SigmaFloor = cp.asarray(_field_data(sim.dust.SigmaFloor))
+    Kf = _field_data(sim.dust.kernel * sim.dust.p.frag)
+    Ks = _field_data(sim.dust.kernel * sim.dust.p.stick)
+    SigmaArr = _field_data(Sigma)
+    SigmaFloor = _field_data(sim.dust.SigmaFloor)
 
     Nr, Nm = SigmaArr.shape
     Nr_int = Nr - 2
@@ -1478,7 +1444,7 @@ def _kernel_cupy(sim):
     vrel = _field_data(sim.dust.v.rel.tot)
     Nm = int(sim.grid.Nm)
 
-    if _COLLISION_KERNEL_MODE == "elementwise" and cp is not None:
+    if _COLLISION_KERNEL_MODE == "elementwise":
         K = _kernel_cupy_elementwise(a, H, Sigma, SigmaFloor, vrel)
         if K is not None:
             return K
@@ -1647,7 +1613,7 @@ def _p_frag_cupy(sim):
     vrel = _field_data(sim.dust.v.rel.tot)
     vfrag = _field_data(sim.dust.v.frag)
 
-    if _P_FRAG_MODE == "elementwise" and cp is not None:
+    if _P_FRAG_MODE == "elementwise":
         pf = _p_frag_cupy_elementwise(vrel, vfrag)
         if pf is not None:
             return pf
