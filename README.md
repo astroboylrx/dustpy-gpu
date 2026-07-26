@@ -50,6 +50,12 @@ Existing DustPy code can continue to use `import dustpy`. With the CuPy backend,
 
 Multiple simulations may use different backends in one process when run sequentially. Concurrent simulation advancement is not supported because the active backend bindings are process-global.
 
+### Parity and benchmark
+
+The `numpy` backend reproduces upstream `DustPy` results bitwise in the tested default model; `numpy` and `cupy` backends agree to strict FP64 tolerances at 1 kyr, while the normalized long-run field differences remain small and oscillatory rather than accumulating with time. The official Ice Lines, Planetary Gaps, and Planetesimal Formation examples are visually indistinguishable between DustPy and DustPy-GPU. See the [parity and benchmark notebook](gpu_examples/backend_parity_and_benchmarks.ipynb) for the comparisons and for performance benchmarks.
+
+CuPy runs are not expected to be bitwise deterministic. Parallel GPU accumulation and iterative-solver paths can produce tiny run-to-run differences that may alter adaptive timesteps. In particular, the CuPy dust evolution relies on sparse GMRES with a Jacobi preconditioner, whereas the NumPy path uses a direct sparse solver. Users should expect numerical and scientific parity, not identical arrays from long or repeated GPU runs.
+
 ## Documentation
 
-The existing DustPy API and physical model are documented in the [upstream DustPy documentation](https://stammler.github.io/dustpy/). GPU-specific validation and benchmark examples will be included in this repository.
+The existing DustPy API and physical model are documented in the [upstream DustPy documentation](https://stammler.github.io/dustpy/). GPU-specific validation and benchmark examples are included in [`gpu_examples`](gpu_examples).
