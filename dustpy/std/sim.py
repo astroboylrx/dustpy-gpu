@@ -86,6 +86,8 @@ def _rl_debug_line(sim, dt_step):
 
 
 def _record_accepted_step(sim):
+    if not getattr(sim, "RL_debug", False):
+        return
     _ensure_rl_debug_state(sim)
     dt_step = float(sim.t.prevstepsize)
     if not np.isfinite(dt_step) or dt_step <= 0.0:

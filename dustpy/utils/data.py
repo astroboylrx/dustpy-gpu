@@ -1,9 +1,14 @@
-from simframe import Frame
-import numpy as np
-from scipy.interpolate import interp1d
-from simframe.io.writers import hdf5writer
+from contextlib import nullcontext
 from types import SimpleNamespace
 import warnings
+
+import numpy as np
+from scipy.interpolate import interp1d
+
+from dustpy.utils.backend import to_numpy
+from simframe import Frame
+from simframe.frame import field_data
+from simframe.io.writers import hdf5writer
 
 
 def read_data(data, filename="data", extension="hdf5", Na=50):
@@ -31,23 +36,25 @@ def read_data(data, filename="data", extension="hdf5", Na=50):
     # Loading data
 
     if isinstance(data, Frame):
-        # Loading from Simulation object and expanding dimension
-        # Simulation
-        t = data.t[None, ...]
-        # Dust
-        deltaTurb = data.dust.delta.turb[None, ...]
-        eps = data.dust.eps[None, ...]
-        SigmaDust = data.dust.Sigma[None, ...]
-        St = data.dust.St[None, ...]
-        vFrag = data.dust.v.frag[None, ...]
-        # Gas
-        cs = data.gas.cs[None, ...]
-        SigmaGas = data.gas.Sigma[None, ...]
-        # Grid
-        OmegaK = data.grid.OmegaK[None, ...]
-        m = data.grid.m[None, ...]
-        r = data.grid.r[None, ...]
-        ri = data.grid.ri[None, ...]
+        backend_context = getattr(data, "_backend_context", nullcontext())
+        with backend_context:
+            # Loading from Simulation object, converting to NumPy, and expanding dimension
+            # Simulation
+            t = to_numpy(field_data(data.t))[None, ...]
+            # Dust
+            deltaTurb = to_numpy(field_data(data.dust.delta.turb))[None, ...]
+            eps = to_numpy(field_data(data.dust.eps))[None, ...]
+            SigmaDust = to_numpy(field_data(data.dust.Sigma))[None, ...]
+            St = to_numpy(field_data(data.dust.St))[None, ...]
+            vFrag = to_numpy(field_data(data.dust.v.frag))[None, ...]
+            # Gas
+            cs = to_numpy(field_data(data.gas.cs))[None, ...]
+            SigmaGas = to_numpy(field_data(data.gas.Sigma))[None, ...]
+            # Grid
+            OmegaK = to_numpy(field_data(data.grid.OmegaK))[None, ...]
+            m = to_numpy(field_data(data.grid.m))[None, ...]
+            r = to_numpy(field_data(data.grid.r))[None, ...]
+            ri = to_numpy(field_data(data.grid.ri))[None, ...]
     else:
         # Loading from data directory
         wrtr = hdf5writer(datadir=data, filename=filename, extension=extension)

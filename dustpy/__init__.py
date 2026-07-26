@@ -22,8 +22,10 @@ from importlib import metadata as _md
 
 __name__ = "dustpy"
 __version__ = _md.version("dustpy-gpu")
+__upstream_version__ = "1.0.8"
 
 Simulation.__version__ = __version__
+Simulation.__upstream_version__ = __upstream_version__
 plot.__version__ = __version__
 utils.__version__ = __version__
 
@@ -34,6 +36,3 @@ __all__ = [
     "readdump",
     "Simulation"
 ]
-
-# Print warning if dustpy version is outdated
-utils.print_version_warning()

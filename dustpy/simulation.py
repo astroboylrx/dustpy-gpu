@@ -230,6 +230,7 @@ class Simulation(Frame):
         self.updater = ["star", "grid", "gas", "dust"]
 
         self.t = None
+        self.RL_debug = False
         self.RL_count_cycle = 0
         self.RL_count_accepted = 0
         self.RL_ncycle_out = 100
@@ -271,17 +272,21 @@ class Simulation(Frame):
     def _run_with_active_context(self):
         # Print welcome message
         if self.verbosity > 0:
-            msg = ""
-            msg += "\nDustPy v{}".format(self.__version__)
-            msg += "\n"
-            msg += "\nDocumentation: {}".format(
-                "https://stammler.github.io/dustpy/")
-            msg += "\nPyPI:          {}".format(
-                "https://pypi.org/project/dustpy/")
-            msg += "\nGitHub:        {}".format(
-                "https://github.com/stammler/dustpy/")
-            msg += "\n"
-            msg += colorize("\nPlease cite Stammler & Birnstiel (2022).", "blue")
+            msg = (
+                f"\nDustPy-GPU v{self.__version__} (based on DustPy v{self.__upstream_version__})\n"
+                f"Backend: {self.backend}\n"
+                "\n"
+                "Documentation (DustPy): https://stammler.github.io/dustpy/\n"
+                "PyPI (DustPy): https://pypi.org/project/dustpy/\n"
+                "GitHub (DustPy): https://github.com/stammler/dustpy/\n"
+                "GitHub (DustPy-GPU): https://github.com/astroboylrx/dustpy-gpu/\n"
+                "GPU examples: https://github.com/astroboylrx/dustpy-gpu/tree/master/gpu_examples\n"
+            )
+            msg += colorize(
+                "\nPlease cite Stammler & Birnstiel (2022) for DustPy\n"
+                "and Li & Chiang (2026) for DustPy-GPU.",
+                "blue",
+            )
             print(msg)
         # Check for mass conservation unless explicitly disabled for perf runs.
         if not self._skip_mass_check:
@@ -289,8 +294,9 @@ class Simulation(Frame):
         # Actually run the simulation
         super().run()
 
-    def run(self):
-        """This functions runs the simulation."""
+    def run(self, *, RL_debug=False):
+        """Run the simulation with optional accepted-cycle diagnostics."""
+        self.RL_debug = bool(RL_debug)
         if self._strict_backend_lock:
             with self.__class__._backend_runtime_lock:
                 self._activate_backend_context()
@@ -322,6 +328,7 @@ class Simulation(Frame):
         before calling ``Simulation.makegrids()``.
         You cannot have a customized mass grid, because the coagulation alorithm strictly needs a logarithmic grid. Always
         set your mass grid parameters with ``Simulation.ini``.'''
+        self._activate_backend_context()
         self._makemassgrid()
         self._makeradialgrid()
 

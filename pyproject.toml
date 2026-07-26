@@ -4,7 +4,7 @@ requires = ['meson-python', 'numpy']
 
 [project]
 name = 'dustpy-gpu'
-version = '1.0.8'
+version = '1.0.8.1'
 description = 'Dust evolution in protoplanetary disks'
 readme = { file = 'README.md', content-type = 'text/markdown' }
 keywords = [
@@ -16,13 +16,13 @@ keywords = [
   "astronomy",
 ]
 authors = [
+  { name = "Rixin Li", email = "rixin.li.astro@gmail.com" },
   { name = "Sebastian Stammler", email = "sebastian.stammler@gmail.com" },
   { name = "Til Birnstiel", email = "til.birnstiel@lmu.de" },
   { name = "León-Alexander Hühn", email = "huehn@uni-heidelberg.de" },
 ]
 maintainers = [
-  { name = "Sebastian Stammler", email = "sebastian.stammler@gmail.com" },
-  { name = "Tilman Birnstiel", email = "til.birnstiel@lmu.de" },
+  { name = "Rixin Li", email = "rixin.li.astro@gmail.com" },
 ]
 license = { text = "GPLv3" }
 classifiers = [
