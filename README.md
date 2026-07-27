@@ -16,6 +16,7 @@ python -m pip install --upgrade pip
 python -m pip install cupy-cuda13x
 
 # Install dustpy-gpu (automatically installs the required simframe-gpu fork)
+# Alternatively: python -m pip install dustpy-gpu
 python -m pip install git+https://github.com/astroboylrx/dustpy-gpu.git
 ```
 
@@ -38,7 +39,7 @@ Multiple backends can be used together in a single script if run sequentially, b
 
 ## Documentation
 
-Most official tutorials from the [upstream DustPy documentation](https://stammler.github.io/dustpy/) have been adapted for the GPU backend. These examples, alongside the validation benchmarks, are available in [`gpu_examples`](gpu_examples).
+Most official tutorials from the [upstream DustPy documentation](https://stammler.github.io/dustpy/) have been adapted for the GPU backend. These examples, alongside the validation benchmarks, are available in [`gpu_examples`](https://github.com/astroboylrx/dustpy-gpu/tree/master/gpu_examples).
 
 ### Parity and benchmarks
 
@@ -48,4 +49,4 @@ Users should expect **numerical and scientific parity**, though not strictly ide
 * **CuPy Backend:** Agrees with NumPy to strict FP64 tolerances initially. Long-run differences remain quite small and non-accumulating. Official examples (ice lines, planetary gaps, planetesimal formation, etc.) are visually indistinguishable.
 * **GPU Determinism:** CuPy runs are not bitwise deterministic. The use of an iterative solver (sparse GMRES) — necessitated because CuPy's direct sparse solver API currently falls back to the CPU — combined with parallel GPU accumulation, can produce tiny run-to-run differences.
 
-For detailed comparisons and performance results, see the [parity and benchmark notebook](gpu_examples/backend_parity_and_benchmarks.ipynb).
+For detailed comparisons and performance results, see the [parity and benchmark notebook](https://github.com/astroboylrx/dustpy-gpu/blob/master/gpu_examples/backend_parity_and_benchmarks.ipynb).
