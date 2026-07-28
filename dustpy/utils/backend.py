@@ -495,10 +495,9 @@ def _solve_sparse_linear_system_cupy(matrix, rhs):
     rhs_gpu = cp.asarray(rhs_raw)
 
     def _gmres_true_residual_ok(sol, *, rtol, atol):
-        b_norm = float(cp.linalg.norm(rhs_gpu))
-        tol = max(float(atol), float(rtol) * b_norm)
         res = matrix_gpu.dot(sol) - rhs_gpu
-        res_norm = float(cp.linalg.norm(res))
+        b_norm, res_norm = cp.asnumpy(cp.stack((cp.linalg.norm(rhs_gpu), cp.linalg.norm(res))))
+        tol = max(float(atol), float(rtol) * b_norm)
         return (res_norm <= tol), res_norm, tol
 
     def _solve_equilibrated_retry(*, tier1_info, tier2_info):
