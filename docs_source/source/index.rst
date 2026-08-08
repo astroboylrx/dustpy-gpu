@@ -1,53 +1,45 @@
-``DustPy`` Documentation
-=========================================
+DustPy-GPU Documentation
+========================
 
-| ``DustPy`` is a Python package to simulate the evolution of dust in protoplanetary disks.
+``DustPy-GPU`` is a GPU-enabled fork of `DustPy <https://github.com/stammler/dustpy>`_
+for simulations of gas and dust evolution in protoplanetary disks. It preserves
+the ``dustpy`` import name and upstream API while adding per-simulation NumPy and
+CuPy backend selection.
 
-| This documentation is for ``DustPy v1.0.8``.
-
-| ``DustPy`` simulates the radial evolution of gas and dust in protoplanetary disks, including viscous evolution of the gas, advection and diffusion of the dust, as well as dust growth by solving the Smoluchowski equation.
-
-| ``DustPy`` has been published in `Stammler & Birnstiel (2022) <https://iopscience.iop.org/article/10.3847/1538-4357/ac7d58>`_.
-
-| ``DustPy`` can be installed via the Python Package Index
-| ``pip install dustpy``
-
-| ``DustPy`` requires a Python3 distribution and a Fortran compiler.
-
-| ``DustPy`` is based on the ``Simframe`` framework for scientific simulation (`Stammler & Birnstiel 2022 <https://joss.theoj.org/papers/10.21105/joss.03882>`_).
-| Please have a look at the `Simframe Documentation <https://simframe.rtfd.io/>`_ for details of its usage.
-
-| ``dustpylib`` is a collection of auxiliary tools and extensions for ``DustPy``, containing for example interfaces to radiative transfer codes.
-| For more details, please have a look at the `dustpylinbdocumentation <https://dustpylib.rtfd.io/>`_.
+This documentation covers the GPU fork, backend behavior, adapted examples,
+numerical parity, and performance. Refer to the `upstream DustPy documentation
+<https://stammler.github.io/dustpy/>`_ for the complete physics and standard API
+reference.
 
 .. toctree::
    :maxdepth: 2
-   :caption: Contents:
+   :caption: DustPy-GPU
 
-   1_basics
-   2_simple_customization
-   3_advanced_customization
-   4_standard_model
-   5_dust_coagulation
-   6_dust_evolution
-   7_gas_evolution
-   dustpylib
-   test_analytical_coagulation_kernels
-   test_gas_evolution
-   example_ice_lines
-   example_planetary_gaps
-   example_planetesimal_formation
-   A_citation
-   B_publications
-   C_contrib_bug_feature
-   D_discussions
-   E_changelog
+   overview
+   installation
+   backends
+   Backend Parity and Performance <backend_parity_and_benchmarks>
+   troubleshooting
    api
 
+.. toctree::
+   :maxdepth: 3
+   :caption: GPU Tutorials and Examples
 
+   1. Basic Usage <1_basics>
+   2. Simple Customization <2_simple_customization>
+   3. Advanced Customization <3_advanced_customization>
+   4. The Standard Model <4_standard_model>
+   5. Dust Coagulation <5_dust_coagulation>
+   6. Dust Evolution <6_dust_evolution>
+   7. Gas Evolution <7_gas_evolution>
+   Test: Gas Evolution <test_gas_evolution>
+   Test: Analytical Coagulation Kernels <test_analytical_coagulation_kernels>
+   Example: Ice Lines <example_ice_lines>
+   Example: Planetary Gaps <example_planetary_gaps>
+   Example: Planetesimal Formation <example_planetesimal_formation>
 
 Indices and tables
 ==================
 
 * :ref:`genindex`
-* :ref:`modindex`

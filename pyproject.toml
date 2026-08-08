@@ -49,4 +49,4 @@ dependencies = [
 
 [project.urls]
 Repository = "https://github.com/astroboylrx/dustpy-gpu/"
-Documentation = "https://github.com/astroboylrx/dustpy-gpu/"
+Documentation = "https://astroboylrx.github.io/dustpy-gpu/"

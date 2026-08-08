@@ -1,63 +1,50 @@
-# Configuration file for the Sphinx documentation builder.
-#
-# This file only contains a selection of the most common options. For a full
-# list see the documentation:
-# https://www.sphinx-doc.org/en/master/usage/configuration.html
-
-# -- Path setup --------------------------------------------------------------
-
-# If extensions (or modules to document with autodoc) are in another directory,
-# add these directories to sys.path here. If the directory is relative to the
-# documentation root, use os.path.abspath to make it absolute, like shown here.
-#
 from pathlib import Path
-import sys
-sys.path.insert(0, Path(__file__).parents[1].absolute())
+import re
 
 
-# -- Project information -----------------------------------------------------
+project = "DustPy-GPU"
+copyright = "2026, Rixin Li and the DustPy authors (Sebastian Stammler and Tilman Birnstiel)"
+author = "Rixin Li and the DustPy authors"
 
-project = 'dustpy'
-copyright = '2020-2023, Sebastian Stammler & Tilman Birnstiel'
-author = 'Sebastian Stammler & Tilman Birnstiel'
+pyproject = (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text()
+release = re.search(r"^version = ['\"]([^'\"]+)", pyproject, re.MULTILINE).group(1)
+version = release
 
-
-# -- General configuration ---------------------------------------------------
-
-# Add any Sphinx extension module names here, as strings. They can be
-# extensions coming with Sphinx (named 'sphinx.ext.*') or your custom
-# ones.
 extensions = [
-    'sphinx.ext.autodoc',
-    'sphinx.ext.viewcode',
-    'sphinx.ext.napoleon',
-    'nbsphinx',
-    'sphinx_automodapi.automodapi',
+    "sphinx.ext.napoleon",
+    "sphinx.ext.viewcode",
+    "nbsphinx",
 ]
 
-# Add any paths that contain templates here, relative to this directory.
-templates_path = ['_templates']
-
-# List of patterns, relative to source directory, that match files and
-# directories to ignore when looking for source files.
-# This pattern also affects html_static_path and html_extra_path.
+templates_path = ["_templates"]
 exclude_patterns = [
-    '_build',
-    '**.ipynb_checkpoints',
+    "_build",
+    "**.ipynb_checkpoints",
+    "A_citation.ipynb",
+    "B_publications.ipynb",
+    "C_contrib_bug_feature.ipynb",
+    "D_discussions.ipynb",
+    "E_changelog.ipynb",
+    "dustpylib.ipynb",
 ]
 
+nbsphinx_execute = "never"
+rst_epilog = f".. |release| replace:: {release}"
 
-# -- Options for HTML output -------------------------------------------------
-
-# The theme to use for HTML and HTML Help pages.  See the documentation for
-# a list of builtin themes.
-#
-html_theme = 'sphinx_rtd_theme'
-
-
-# -- Logo --------------------------------------------------------------------
-html_static_path = ['_static']
-html_logo = "_static/logo.png"
+html_theme = "sphinx_rtd_theme"
+html_title = f"DustPy-GPU {release}"
+html_static_path = ["_static"]
+html_css_files = ["custom.css"]
+html_logo = "_static/logo-gpu.png"
 html_theme_options = {
-    'logo_only': True,
+    "logo_only": True,
+    "navigation_depth": 4,
+    "titles_only": False,
+}
+html_context = {
+    "display_github": True,
+    "github_user": "astroboylrx",
+    "github_repo": "dustpy-gpu",
+    "github_version": "master",
+    "conf_py_path": "/docs_source/source/",
 }

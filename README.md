@@ -39,7 +39,7 @@ Multiple backends can be used together in a single script if run sequentially, b
 
 ## Documentation
 
-Most official tutorials from the [upstream DustPy documentation](https://stammler.github.io/dustpy/) have been adapted for the GPU backend. These examples, alongside the validation benchmarks, are available in [`gpu_examples`](https://github.com/astroboylrx/dustpy-gpu/tree/master/gpu_examples).
+The [DustPy-GPU documentation](https://astroboylrx.github.io/dustpy-gpu/) covers installation, backend behavior, GPU-adapted examples, numerical parity, and performance. Refer to the [upstream DustPy documentation](https://stammler.github.io/dustpy/) for the complete physics and standard API reference.
 
 ### Parity and benchmarks
 
@@ -49,4 +49,8 @@ Users should expect **numerical and scientific parity**, though not strictly ide
 * **CuPy Backend:** Agrees with NumPy to strict FP64 tolerances initially. Long-run differences remain quite small and non-accumulating. Official examples (ice lines, planetary gaps, planetesimal formation, etc.) are visually indistinguishable.
 * **GPU Determinism:** CuPy runs are not bitwise deterministic. The use of an iterative solver (sparse GMRES) — necessitated because CuPy's direct sparse solver API currently falls back to the CPU — combined with parallel GPU accumulation, can produce tiny run-to-run differences.
 
-For detailed comparisons and performance results, see the [parity and benchmark notebook](https://github.com/astroboylrx/dustpy-gpu/blob/master/gpu_examples/backend_parity_and_benchmarks.ipynb).
+For detailed comparisons and performance results, see the [backend parity and performance documentation](https://astroboylrx.github.io/dustpy-gpu/backend_parity_and_benchmarks.html).
+
+## Citation
+
+Please cite [Stammler & Birnstiel (2022)](https://doi.org/10.3847/1538-4357/ac7d58) for DustPy and [Li & Chiang (2026)](https://ui.adsabs.harvard.edu/abs/2026arXiv260614704L) for DustPy-GPU.

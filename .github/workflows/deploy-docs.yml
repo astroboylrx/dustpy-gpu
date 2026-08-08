@@ -1,0 +1,58 @@
+name: Deploy documentation
+
+on:
+  push:
+    branches: [master]
+    paths:
+      - ".github/workflows/deploy-docs.yml"
+      - "docs_source/**"
+      - "dustpy/**"
+      - "gpu_examples/**"
+      - "pyproject.toml"
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: documentation
+  cancel-in-progress: true
+
+jobs:
+  build-and-deploy:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+          cache: pip
+
+      - name: Install system dependencies
+        run: sudo apt-get update && sudo apt-get install --yes pandoc
+
+      - name: Install documentation dependencies
+        run: python -m pip install -r docs_source/requirements.txt
+
+      - name: Build documentation
+        run: python -m sphinx -W --keep-going -b html docs_source/source docs_source/build/html
+
+      - name: Publish gh-pages branch
+        env:
+          DOCS_DIR: ${{ github.workspace }}/docs_source/build/html
+        run: |
+          git worktree add --detach "${RUNNER_TEMP}/gh-pages"
+          cd "${RUNNER_TEMP}/gh-pages"
+          git checkout --orphan gh-pages
+          git rm -rf .
+          cp -a "${DOCS_DIR}/." .
+          touch .nojekyll
+          git add --all
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -m "Deploy documentation from ${GITHUB_SHA}"
+          git push --force origin gh-pages

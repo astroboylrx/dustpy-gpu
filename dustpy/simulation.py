@@ -276,6 +276,7 @@ class Simulation(Frame):
                 f"\nDustPy-GPU v{self.__version__} (based on DustPy v{self.__upstream_version__})\n"
                 f"Backend: {self.backend}\n"
                 "\n"
+                "Documentation (DustPy-GPU): https://astroboylrx.github.io/dustpy-gpu/\n"
                 "Documentation (DustPy): https://stammler.github.io/dustpy/\n"
                 "PyPI (DustPy): https://pypi.org/project/dustpy/\n"
                 "GitHub (DustPy): https://github.com/stammler/dustpy/\n"
@@ -284,7 +285,8 @@ class Simulation(Frame):
             )
             msg += colorize(
                 "\nPlease cite Stammler & Birnstiel (2022) for DustPy\n"
-                "and Li & Chiang (2026) for DustPy-GPU.",
+                "and Li & Chiang (2026; https://ui.adsabs.harvard.edu/abs/2026arXiv260614704L) "
+                "for DustPy-GPU.",
                 "blue",
             )
             print(msg)
