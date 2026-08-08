@@ -1,5 +1,7 @@
 # DustPy-GPU
 
+[![PyPI](https://img.shields.io/pypi/v/dustpy-gpu)](https://pypi.org/project/dustpy-gpu/)
+
 `dustpy-gpu` is a GPU-enabled fork of [DustPy](https://github.com/stammler/dustpy), a Python package for simulating gas and dust evolution in protoplanetary disks.
 
 Designed as a drop-in replacement, it retains the upstream `dustpy` import name and original API, so migrating existing scripts requires minimal changes (mainly backend selection, see below).
@@ -49,7 +51,7 @@ Users should expect **numerical and scientific parity**, though not strictly ide
 * **CuPy Backend:** Agrees with NumPy to strict FP64 tolerances initially. Long-run differences remain quite small and non-accumulating. Official examples (ice lines, planetary gaps, planetesimal formation, etc.) are visually indistinguishable.
 * **GPU Determinism:** CuPy runs are not bitwise deterministic. The use of an iterative solver (sparse GMRES) — necessitated because CuPy's direct sparse solver API currently falls back to the CPU — combined with parallel GPU accumulation, can produce tiny run-to-run differences.
 
-For detailed comparisons and performance results, see the [backend parity and performance documentation](https://astroboylrx.github.io/dustpy-gpu/backend_parity_and_benchmarks.html).
+For detailed comparisons and performance results, see the [backend parity and performance documentation](https://astroboylrx.github.io/dustpy-gpu/backend_parity_and_benchmarks.html). Modern HPC GPUs can deliver >10x speedups for typical research workloads (e.g., 14x at `Nr=200` and 25x at `Nr=300` in our benchmarks).
 
 ## Citation
 
