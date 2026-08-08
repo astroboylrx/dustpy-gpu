@@ -1,0 +1,170 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Troubleshooting &mdash; DustPy-GPU 1.0.9.2</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+      <link rel="stylesheet" type="text/css" href="_static/custom.css?v=03b27a11" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=f0a5a7e0"></script>
+      <script src="_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+      <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="API Extensions" href="api.html" />
+    <link rel="prev" title="Backend Parity and Performance" href="backend_parity_and_benchmarks.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="index.html">
+            
+              <img src="_static/logo-gpu.png" class="logo" alt="Logo"/>
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">DustPy-GPU</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="backends.html">Backends</a></li>
+<li class="toctree-l1"><a class="reference internal" href="backend_parity_and_benchmarks.html">Backend Parity and Performance</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Troubleshooting</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#cupy-cannot-find-a-cuda-device">CuPy cannot find a CUDA device</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#matplotlib-cannot-plot-a-field">Matplotlib cannot plot a field</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#the-first-gpu-step-is-slow">The first GPU step is slow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#editable-install-fails-after-an-environment-change">Editable install fails after an environment change</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#unexpected-backend-switching">Unexpected backend switching</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api.html">API Extensions</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">GPU Tutorials and Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="1_basics.html">1. Basic Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="2_simple_customization.html">2. Simple Customization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="3_advanced_customization.html">3. Advanced Customization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="4_standard_model.html">4. The Standard Model</a></li>
+<li class="toctree-l1"><a class="reference internal" href="5_dust_coagulation.html">5. Dust Coagulation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="6_dust_evolution.html">6. Dust Evolution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="7_gas_evolution.html">7. Gas Evolution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="test_gas_evolution.html">Test: Gas Evolution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="test_analytical_coagulation_kernels.html">Test: Analytical Coagulation Kernels</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_ice_lines.html">Example: Ice Lines</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_planetary_gaps.html">Example: Planetary Gaps</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_planetesimal_formation.html">Example: Planetesimal Formation</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">DustPy-GPU</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Troubleshooting</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/astroboylrx/dustpy-gpu/blob/master/docs_source/source/troubleshooting.rst" class="fa fa-github"> Edit on GitHub</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="troubleshooting">
+<h1>Troubleshooting<a class="headerlink" href="#troubleshooting" title="Link to this heading"></a></h1>
+<section id="cupy-cannot-find-a-cuda-device">
+<h2>CuPy cannot find a CUDA device<a class="headerlink" href="#cupy-cannot-find-a-cuda-device" title="Link to this heading"></a></h2>
+<p>Install the CuPy distribution matching the machine’s CUDA major version and
+verify <code class="docutils literal notranslate"><span class="pre">cupy.cuda.runtime.getDeviceCount()</span></code> before selecting the CuPy backend.
+Use <code class="docutils literal notranslate"><span class="pre">backend=&quot;numpy&quot;</span></code> on systems without a CUDA GPU.</p>
+</section>
+<section id="matplotlib-cannot-plot-a-field">
+<h2>Matplotlib cannot plot a field<a class="headerlink" href="#matplotlib-cannot-plot-a-field" title="Link to this heading"></a></h2>
+<p>General plotting and analysis packages expect host arrays. Convert a CuPy field
+with <code class="docutils literal notranslate"><span class="pre">cupy.asnumpy(field)</span></code>. DustPy’s own plotting helpers handle their
+supported field inputs automatically.</p>
+</section>
+<section id="the-first-gpu-step-is-slow">
+<h2>The first GPU step is slow<a class="headerlink" href="#the-first-gpu-step-is-slow" title="Link to this heading"></a></h2>
+<p>CUDA context creation and just-in-time kernel compilation add one-time startup
+cost. Measure performance after a warm-up interval and reuse the same Python
+process for repeated runs.</p>
+</section>
+<section id="editable-install-fails-after-an-environment-change">
+<h2>Editable install fails after an environment change<a class="headerlink" href="#editable-install-fails-after-an-environment-change" title="Link to this heading"></a></h2>
+<p>Reinstall both forks into the active environment:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="n">python</span> <span class="o">-</span><span class="n">m</span> <span class="n">pip</span> <span class="n">install</span> <span class="o">--</span><span class="n">no</span><span class="o">-</span><span class="n">build</span><span class="o">-</span><span class="n">isolation</span> <span class="o">-</span><span class="n">e</span> <span class="o">./</span><span class="n">simframe</span> <span class="o">-</span><span class="n">e</span> <span class="o">./</span><span class="n">dustpy</span>
+</pre></div>
+</div>
+</section>
+<section id="unexpected-backend-switching">
+<h2>Unexpected backend switching<a class="headerlink" href="#unexpected-backend-switching" title="Link to this heading"></a></h2>
+<p>Use an explicit backend instead of <code class="docutils literal notranslate"><span class="pre">auto</span></code> when reproducibility across
+machines matters. Multiple simulation objects may be used sequentially, but do
+not evolve them concurrently in separate threads.</p>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="backend_parity_and_benchmarks.html" class="btn btn-neutral float-left" title="Backend Parity and Performance" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="api.html" class="btn btn-neutral float-right" title="API Extensions" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, Rixin Li and the DustPy authors (Sebastian Stammler and Tilman Birnstiel).</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

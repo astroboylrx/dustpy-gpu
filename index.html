@@ -1,0 +1,367 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>DustPy-GPU Documentation &mdash; DustPy-GPU 1.0.9.2</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+      <link rel="stylesheet" type="text/css" href="_static/custom.css?v=03b27a11" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=f0a5a7e0"></script>
+      <script src="_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+      <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Overview" href="overview.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="#">
+            
+              <img src="_static/logo-gpu.png" class="logo" alt="Logo"/>
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">DustPy-GPU</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="backends.html">Backends</a></li>
+<li class="toctree-l1"><a class="reference internal" href="backend_parity_and_benchmarks.html">Backend Parity and Performance</a></li>
+<li class="toctree-l1"><a class="reference internal" href="troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api.html">API Extensions</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">GPU Tutorials and Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="1_basics.html">1. Basic Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="2_simple_customization.html">2. Simple Customization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="3_advanced_customization.html">3. Advanced Customization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="4_standard_model.html">4. The Standard Model</a></li>
+<li class="toctree-l1"><a class="reference internal" href="5_dust_coagulation.html">5. Dust Coagulation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="6_dust_evolution.html">6. Dust Evolution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="7_gas_evolution.html">7. Gas Evolution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="test_gas_evolution.html">Test: Gas Evolution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="test_analytical_coagulation_kernels.html">Test: Analytical Coagulation Kernels</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_ice_lines.html">Example: Ice Lines</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_planetary_gaps.html">Example: Planetary Gaps</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_planetesimal_formation.html">Example: Planetesimal Formation</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="#">DustPy-GPU</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="#" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">DustPy-GPU Documentation</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/astroboylrx/dustpy-gpu/blob/master/docs_source/source/index.rst" class="fa fa-github"> Edit on GitHub</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="dustpy-gpu-documentation">
+<h1>DustPy-GPU Documentation<a class="headerlink" href="#dustpy-gpu-documentation" title="Link to this heading"></a></h1>
+<p><code class="docutils literal notranslate"><span class="pre">DustPy-GPU</span></code> is a GPU-enabled fork of <a class="reference external" href="https://github.com/stammler/dustpy">DustPy</a>
+for simulations of gas and dust evolution in protoplanetary disks. It preserves
+the <code class="docutils literal notranslate"><span class="pre">dustpy</span></code> import name and upstream API while adding per-simulation NumPy and
+CuPy backend selection.</p>
+<p>This documentation covers the GPU fork, backend behavior, adapted examples,
+numerical parity, and performance. Refer to the <a class="reference external" href="https://stammler.github.io/dustpy/">upstream DustPy documentation</a> for the complete physics and standard API
+reference.</p>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">DustPy-GPU</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="overview.html">Overview</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="overview.html#scope">Scope</a></li>
+<li class="toctree-l2"><a class="reference internal" href="overview.html#citation">Citation</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#pypi">PyPI</a></li>
+<li class="toctree-l2"><a class="reference internal" href="installation.html#github-checkout">GitHub checkout</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="backends.html">Backends</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="backends.html#multiple-simulation-objects">Multiple simulation objects</a></li>
+<li class="toctree-l2"><a class="reference internal" href="backends.html#gpu-runtime-behavior">GPU runtime behavior</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="backend_parity_and_benchmarks.html">Backend Parity and Performance</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="backend_parity_and_benchmarks.html#1.-DustPy-GPU-with-backend=%22numpy%22-is-in-bitwise-agreement-with-DustPy">1. <code class="docutils literal notranslate"><span class="pre">DustPy-GPU</span></code> with <code class="docutils literal notranslate"><span class="pre">backend=&quot;numpy&quot;</span></code> is in bitwise agreement with <code class="docutils literal notranslate"><span class="pre">DustPy</span></code></a></li>
+<li class="toctree-l2"><a class="reference internal" href="backend_parity_and_benchmarks.html#2.-Parity-between-DustPy-GPU-backends">2. Parity between <code class="docutils literal notranslate"><span class="pre">DustPy-GPU</span></code> backends</a></li>
+<li class="toctree-l2"><a class="reference internal" href="backend_parity_and_benchmarks.html#3.-Performance-benchmarks">3. Performance benchmarks</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="troubleshooting.html">Troubleshooting</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="troubleshooting.html#cupy-cannot-find-a-cuda-device">CuPy cannot find a CUDA device</a></li>
+<li class="toctree-l2"><a class="reference internal" href="troubleshooting.html#matplotlib-cannot-plot-a-field">Matplotlib cannot plot a field</a></li>
+<li class="toctree-l2"><a class="reference internal" href="troubleshooting.html#the-first-gpu-step-is-slow">The first GPU step is slow</a></li>
+<li class="toctree-l2"><a class="reference internal" href="troubleshooting.html#editable-install-fails-after-an-environment-change">Editable install fails after an environment change</a></li>
+<li class="toctree-l2"><a class="reference internal" href="troubleshooting.html#unexpected-backend-switching">Unexpected backend switching</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="api.html">API Extensions</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="api.html#dustpy.Simulation"><code class="docutils literal notranslate"><span class="pre">dustpy.Simulation</span></code></a></li>
+</ul>
+</li>
+</ul>
+</div>
+<div class="toctree-wrapper compound">
+<p class="caption" role="heading"><span class="caption-text">GPU Tutorials and Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="1_basics.html">1. Basic Usage</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="1_basics.html#The-Simulation-Frame">The Simulation Frame</a></li>
+<li class="toctree-l2"><a class="reference internal" href="1_basics.html#Initializing">Initializing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="1_basics.html#Running-a-Simulation">Running a Simulation</a></li>
+<li class="toctree-l2"><a class="reference internal" href="1_basics.html#Plotting">Plotting</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="1_basics.html#Code-Units">Code Units</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="1_basics.html#Reading-data-files">Reading data files</a></li>
+<li class="toctree-l2"><a class="reference internal" href="1_basics.html#Reading-Dump-Files">Reading Dump Files</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="2_simple_customization.html">2. Simple Customization</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="2_simple_customization.html#Stellar-parameters">Stellar parameters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="2_simple_customization.html#Grid-parameters">Grid parameters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="2_simple_customization.html#Gas-Parameters">Gas Parameters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="2_simple_customization.html#Dust-Parameters">Dust Parameters</a></li>
+<li class="toctree-l2"><a class="reference internal" href="2_simple_customization.html#Changing-the-Initial-Conditions">Changing the Initial Conditions</a></li>
+<li class="toctree-l2"><a class="reference internal" href="2_simple_customization.html#Changing-the-Snapshots">Changing the Snapshots</a></li>
+<li class="toctree-l2"><a class="reference internal" href="2_simple_customization.html#Changing-the-Output-Directory">Changing the Output Directory</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="3_advanced_customization.html">3. Advanced Customization</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="3_advanced_customization.html#Customizing-the-Grids">Customizing the Grids</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="3_advanced_customization.html#The-Radial-Grid">The Radial Grid</a></li>
+<li class="toctree-l3"><a class="reference internal" href="3_advanced_customization.html#The-Mass-Grid">The Mass Grid</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="3_advanced_customization.html#Customizing-the-Physics-of-a-Field">Customizing the Physics of a Field</a></li>
+<li class="toctree-l2"><a class="reference internal" href="3_advanced_customization.html#Adding-Custom-Fields">Adding Custom Fields</a></li>
+<li class="toctree-l2"><a class="reference internal" href="3_advanced_customization.html#Modifying-the-Update-Order">Modifying the Update Order</a></li>
+<li class="toctree-l2"><a class="reference internal" href="3_advanced_customization.html#Systoles-and-Diastoles">Systoles and Diastoles</a></li>
+<li class="toctree-l2"><a class="reference internal" href="3_advanced_customization.html#Customizing-the-Snapshots">Customizing the Snapshots</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="4_standard_model.html">4. The Standard Model</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="4_standard_model.html#Dust">Dust</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.backreaction"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.backreaction</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.boundary"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.boundary</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.coagulation"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.coagulation</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.delta"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.delta</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.Fi"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.Fi</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.p"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.p</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.S"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.S</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.v"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.v</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.a"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.a</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.D"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.D</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.eps"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.eps</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.fill"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.fill</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.H"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.H</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.kernel"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.kernel</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.rho"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.rho</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.rhos"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.rhos</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.Sigma"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.Sigma</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.SigmaFloor"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.SigmaFloor</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.dust.St"><code class="docutils literal notranslate"><span class="pre">Simulation.dust.St</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Update-order">Update order</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="4_standard_model.html#Gas">Gas</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.boundary"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.boundary</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.S"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.S</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.torque"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.torque</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.v"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.v</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.alpha"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.alpha</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.cs"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.cs</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.eta"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.eta</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.Fi"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.Fi</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.Hp"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.Hp</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.mfp"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.mfp</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.mu"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.mu</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.n"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.n</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.nu"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.nu</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.P"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.P</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.rho"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.rho</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.Sigma"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.Sigma</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.SigmaFloor"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.SigmaFloor</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.gas.T"><code class="docutils literal notranslate"><span class="pre">Simulation.gas.T</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#id1">Update order</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="4_standard_model.html#Grid">Grid</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.grid.A"><code class="docutils literal notranslate"><span class="pre">Simulation.grid.A</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.grid.m"><code class="docutils literal notranslate"><span class="pre">Simulation.grid.m</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.grid.Nm"><code class="docutils literal notranslate"><span class="pre">Simulation.grid.Nm</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.grid.Nr"><code class="docutils literal notranslate"><span class="pre">Simulation.grid.Nr</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.grid.OmegaK"><code class="docutils literal notranslate"><span class="pre">Simulation.grid.OmegaK</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.grid.r"><code class="docutils literal notranslate"><span class="pre">Simulation.grid.r</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.grid.ri"><code class="docutils literal notranslate"><span class="pre">Simulation.grid.ri</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#id2">Update order</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="4_standard_model.html#Star">Star</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.star.L"><code class="docutils literal notranslate"><span class="pre">Simulation.star.L</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.star.M"><code class="docutils literal notranslate"><span class="pre">Simulation.star.M</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.star.R"><code class="docutils literal notranslate"><span class="pre">Simulation.star.R</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#Simulation.star.T"><code class="docutils literal notranslate"><span class="pre">Simulation.star.T</span></code></a></li>
+<li class="toctree-l3"><a class="reference internal" href="4_standard_model.html#id3">Update order</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="4_standard_model.html#Time">Time</a></li>
+<li class="toctree-l2"><a class="reference internal" href="4_standard_model.html#Integrator">Integrator</a></li>
+<li class="toctree-l2"><a class="reference internal" href="4_standard_model.html#Writer">Writer</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="5_dust_coagulation.html">5. Dust Coagulation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="5_dust_coagulation.html#Sticking">Sticking</a></li>
+<li class="toctree-l2"><a class="reference internal" href="5_dust_coagulation.html#Fragmentation-&amp;-Erosion">Fragmentation &amp; Erosion</a></li>
+<li class="toctree-l2"><a class="reference internal" href="5_dust_coagulation.html#Probabilities">Probabilities</a></li>
+<li class="toctree-l2"><a class="reference internal" href="5_dust_coagulation.html#Bouncing">Bouncing</a></li>
+<li class="toctree-l2"><a class="reference internal" href="5_dust_coagulation.html#Collision-Rates">Collision Rates</a></li>
+<li class="toctree-l2"><a class="reference internal" href="5_dust_coagulation.html#Coagulation-Sources">Coagulation Sources</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="6_dust_evolution.html">6. Dust Evolution</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="6_dust_evolution.html#Coagulation">Coagulation</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="6_dust_evolution.html#Turning-off-Fragmentation">Turning off Fragmentation</a></li>
+<li class="toctree-l3"><a class="reference internal" href="6_dust_evolution.html#Turning-off-Coagulation">Turning off Coagulation</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="6_dust_evolution.html#Hydrodynamics">Hydrodynamics</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="6_dust_evolution.html#Advection">Advection</a></li>
+<li class="toctree-l3"><a class="reference internal" href="6_dust_evolution.html#Turning-off-Advection">Turning off Advection</a></li>
+<li class="toctree-l3"><a class="reference internal" href="6_dust_evolution.html#Diffusion">Diffusion</a></li>
+<li class="toctree-l3"><a class="reference internal" href="6_dust_evolution.html#Turning-off-Diffusion">Turning off Diffusion</a></li>
+<li class="toctree-l3"><a class="reference internal" href="6_dust_evolution.html#Turning-off-Hydrodynamics">Turning off Hydrodynamics</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="6_dust_evolution.html#External-Sources">External Sources</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6_dust_evolution.html#Turning-off-Dust-Evolution">Turning off Dust Evolution</a></li>
+<li class="toctree-l2"><a class="reference internal" href="6_dust_evolution.html#Changing-the-Dust-Integrator">Changing the Dust Integrator</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="7_gas_evolution.html">7. Gas Evolution</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="7_gas_evolution.html#Hydrodynamics">Hydrodynamics</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="7_gas_evolution.html#Turning-off-Hydrodynamics">Turning off Hydrodynamics</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="7_gas_evolution.html#External-Sources">External Sources</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="7_gas_evolution.html#Turning-off-External-Sources">Turning off External Sources</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="7_gas_evolution.html#Turning-off-Gas-Evolution">Turning off Gas Evolution</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="test_gas_evolution.html">Test: Gas Evolution</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="test_gas_evolution.html#Analytical-Solution">Analytical Solution</a></li>
+<li class="toctree-l2"><a class="reference internal" href="test_gas_evolution.html#Setting-up-DustPy">Setting up DustPy</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="test_gas_evolution.html#Turning-off-Dust-Evolution">Turning off Dust Evolution</a></li>
+<li class="toctree-l3"><a class="reference internal" href="test_gas_evolution.html#Modifying-Integration-Variable">Modifying Integration Variable</a></li>
+<li class="toctree-l3"><a class="reference internal" href="test_gas_evolution.html#Setting-Writer-Options">Setting Writer Options</a></li>
+<li class="toctree-l3"><a class="reference internal" href="test_gas_evolution.html#Reading-and-Plotting-Data">Reading and Plotting Data</a></li>
+</ul>
+</li>
+<li class="toctree-l2"><a class="reference internal" href="test_gas_evolution.html#Modifying-the-Power-Law-Index">Modifying the Power Law Index</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="test_gas_evolution.html#Why-is-the-inner-boundary-condition-not-constant-power-law-by-default?">Why is the inner boundary condition not constant power law by default?</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="test_analytical_coagulation_kernels.html">Test: Analytical Coagulation Kernels</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="test_analytical_coagulation_kernels.html#The-Constant-Kernel">The Constant Kernel</a></li>
+<li class="toctree-l2"><a class="reference internal" href="test_analytical_coagulation_kernels.html#The-Linear-Kernel">The Linear Kernel</a></li>
+<li class="toctree-l2"><a class="reference internal" href="test_analytical_coagulation_kernels.html#The-Product-Kernel">The Product Kernel</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="example_ice_lines.html">Example: Ice Lines</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_planetary_gaps.html">Example: Planetary Gaps</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="example_planetary_gaps.html#Gap-Profiles">Gap Profiles</a></li>
+<li class="toctree-l2"><a class="reference internal" href="example_planetary_gaps.html#Adding-planets">Adding planets</a></li>
+<li class="toctree-l2"><a class="reference internal" href="example_planetary_gaps.html#Adding-torque-profile">Adding torque profile</a></li>
+<li class="toctree-l2"><a class="reference internal" href="example_planetary_gaps.html#Growing-planets">Growing planets</a></li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="example_planetesimal_formation.html">Example: Planetesimal Formation</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="example_planetesimal_formation.html#Refining-the-radial-grid">Refining the radial grid</a></li>
+<li class="toctree-l2"><a class="reference internal" href="example_planetesimal_formation.html#Adding-gap">Adding gap</a></li>
+<li class="toctree-l2"><a class="reference internal" href="example_planetesimal_formation.html#Adding-planetesimals">Adding planetesimals</a></li>
+<li class="toctree-l2"><a class="reference internal" href="example_planetesimal_formation.html#Adding-planetesimal-formation">Adding planetesimal formation</a></li>
+</ul>
+</li>
+</ul>
+</div>
+</section>
+<section id="indices-and-tables">
+<h1>Indices and tables<a class="headerlink" href="#indices-and-tables" title="Link to this heading"></a></h1>
+<ul class="simple">
+<li><p><a class="reference internal" href="genindex.html"><span class="std std-ref">Index</span></a></p></li>
+</ul>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="overview.html" class="btn btn-neutral float-right" title="Overview" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, Rixin Li and the DustPy authors (Sebastian Stammler and Tilman Birnstiel).</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>

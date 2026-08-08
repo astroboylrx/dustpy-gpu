@@ -1,0 +1,102 @@
+/* Keep the fork logo legible in the narrow Read the Docs sidebar. */
+.wy-side-nav-search > a img.logo,
+.wy-side-nav-search .wy-dropdown > a img.logo {
+    height: auto;
+    max-width: 260px;
+    width: 100%;
+}
+
+/* Stack official example comparisons so both panels use the full content width. */
+section[id="Ice-Lines"] table,
+section[id="Ice-Lines"] tbody,
+section[id="Ice-Lines"] tr,
+section[id="Ice-Lines"] td,
+section[id="Planetary-Gaps"] table,
+section[id="Planetary-Gaps"] tbody,
+section[id="Planetary-Gaps"] tr,
+section[id="Planetary-Gaps"] td,
+section[id="Planetesimal-Formation"] > .wy-table-responsive:first-of-type table,
+section[id="Planetesimal-Formation"] > .wy-table-responsive:first-of-type tbody,
+section[id="Planetesimal-Formation"] > .wy-table-responsive:first-of-type tr,
+section[id="Planetesimal-Formation"] > .wy-table-responsive:first-of-type td {
+    display: block;
+    width: 100%;
+}
+
+section[id="Ice-Lines"] thead,
+section[id="Planetary-Gaps"] thead,
+section[id="Planetesimal-Formation"] > .wy-table-responsive:first-of-type thead {
+    display: none;
+}
+
+section[id="Ice-Lines"] td,
+section[id="Planetary-Gaps"] td,
+section[id="Planetesimal-Formation"] > .wy-table-responsive:first-of-type td {
+    border: 0;
+    padding: 0 0 1.5rem;
+    text-align: center;
+}
+
+section[id="Ice-Lines"] td::before,
+section[id="Planetary-Gaps"] td::before,
+section[id="Planetesimal-Formation"] > .wy-table-responsive:first-of-type td::before {
+    display: block;
+    font-weight: 700;
+    margin-bottom: 0.5rem;
+}
+
+section[id="Ice-Lines"] td:first-child::before,
+section[id="Planetary-Gaps"] td:first-child::before,
+section[id="Planetesimal-Formation"] > .wy-table-responsive:first-of-type td:first-child::before {
+    content: "DustPy";
+}
+
+section[id="Ice-Lines"] td:last-child::before,
+section[id="Planetary-Gaps"] td:last-child::before,
+section[id="Planetesimal-Formation"] > .wy-table-responsive:first-of-type td:last-child::before {
+    content: "DustPy-GPU (backend=cupy)";
+}
+
+section[id="Ice-Lines"] td img,
+section[id="Planetary-Gaps"] td img,
+section[id="Planetesimal-Formation"] > .wy-table-responsive:first-of-type td img {
+    height: auto;
+    max-width: none;
+    width: 100%;
+}
+
+/* Keep the planetesimal mass-history comparison side by side. */
+section[id="Planetesimal-Formation"] > .wy-table-responsive:nth-of-type(2) table {
+    display: table !important;
+    table-layout: fixed;
+    width: 100%;
+}
+
+section[id="Planetesimal-Formation"] > .wy-table-responsive:nth-of-type(2) thead {
+    display: table-header-group !important;
+}
+
+section[id="Planetesimal-Formation"] > .wy-table-responsive:nth-of-type(2) tbody {
+    display: table-row-group !important;
+}
+
+section[id="Planetesimal-Formation"] > .wy-table-responsive:nth-of-type(2) tr {
+    display: table-row !important;
+}
+
+section[id="Planetesimal-Formation"] > .wy-table-responsive:nth-of-type(2) th,
+section[id="Planetesimal-Formation"] > .wy-table-responsive:nth-of-type(2) td {
+    display: table-cell !important;
+    width: 50% !important;
+}
+
+section[id="Planetesimal-Formation"] > .wy-table-responsive:nth-of-type(2) td::before {
+    content: none !important;
+    display: none !important;
+}
+
+section[id="Planetesimal-Formation"] > .wy-table-responsive:nth-of-type(2) td img {
+    height: auto;
+    max-width: 100%;
+    width: 100%;
+}

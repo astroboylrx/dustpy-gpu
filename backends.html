@@ -1,0 +1,210 @@
+
+
+<!DOCTYPE html>
+<html class="writer-html5" lang="en" data-content_root="./">
+<head>
+  <meta charset="utf-8" /><meta name="viewport" content="width=device-width, initial-scale=1" />
+
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Backends &mdash; DustPy-GPU 1.0.9.2</title>
+      <link rel="stylesheet" type="text/css" href="_static/pygments.css?v=b86133f3" />
+      <link rel="stylesheet" type="text/css" href="_static/css/theme.css?v=9edc463e" />
+      <link rel="stylesheet" type="text/css" href="_static/custom.css?v=03b27a11" />
+
+  
+      <script src="_static/jquery.js?v=5d32c60e"></script>
+      <script src="_static/_sphinx_javascript_frameworks_compat.js?v=2cd50e6c"></script>
+      <script src="_static/documentation_options.js?v=f0a5a7e0"></script>
+      <script src="_static/doctools.js?v=fd6eb6e6"></script>
+      <script src="_static/sphinx_highlight.js?v=6ffebe34"></script>
+      <script crossorigin="anonymous" integrity="sha256-Ae2Vz/4ePdIu6ZyI/5ZGsYnb+m0JlOmKPjt6XZ9JJkA=" src="https://cdnjs.cloudflare.com/ajax/libs/require.js/2.3.4/require.min.js"></script>
+    <script src="_static/js/theme.js"></script>
+    <link rel="index" title="Index" href="genindex.html" />
+    <link rel="search" title="Search" href="search.html" />
+    <link rel="next" title="Backend Parity and Performance" href="backend_parity_and_benchmarks.html" />
+    <link rel="prev" title="Installation" href="installation.html" /> 
+</head>
+
+<body class="wy-body-for-nav"> 
+  <div class="wy-grid-for-nav">
+    <nav data-toggle="wy-nav-shift" class="wy-nav-side">
+      <div class="wy-side-scroll">
+        <div class="wy-side-nav-search" >
+
+          
+          
+          <a href="index.html">
+            
+              <img src="_static/logo-gpu.png" class="logo" alt="Logo"/>
+          </a>
+<div role="search">
+  <form id="rtd-search-form" class="wy-form" action="search.html" method="get">
+    <input type="text" name="q" placeholder="Search docs" aria-label="Search docs" />
+    <input type="hidden" name="check_keywords" value="yes" />
+    <input type="hidden" name="area" value="default" />
+  </form>
+</div>
+        </div><div class="wy-menu wy-menu-vertical" data-spy="affix" role="navigation" aria-label="Navigation menu">
+              <p class="caption" role="heading"><span class="caption-text">DustPy-GPU</span></p>
+<ul class="current">
+<li class="toctree-l1"><a class="reference internal" href="overview.html">Overview</a></li>
+<li class="toctree-l1"><a class="reference internal" href="installation.html">Installation</a></li>
+<li class="toctree-l1 current"><a class="current reference internal" href="#">Backends</a><ul>
+<li class="toctree-l2"><a class="reference internal" href="#multiple-simulation-objects">Multiple simulation objects</a></li>
+<li class="toctree-l2"><a class="reference internal" href="#gpu-runtime-behavior">GPU runtime behavior</a><ul>
+<li class="toctree-l3"><a class="reference internal" href="#backend-arrays">Backend arrays</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#sparse-solver">Sparse solver</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#numerical-reproducibility">Numerical reproducibility</a></li>
+<li class="toctree-l3"><a class="reference internal" href="#performance-notes">Performance notes</a></li>
+</ul>
+</li>
+</ul>
+</li>
+<li class="toctree-l1"><a class="reference internal" href="backend_parity_and_benchmarks.html">Backend Parity and Performance</a></li>
+<li class="toctree-l1"><a class="reference internal" href="troubleshooting.html">Troubleshooting</a></li>
+<li class="toctree-l1"><a class="reference internal" href="api.html">API Extensions</a></li>
+</ul>
+<p class="caption" role="heading"><span class="caption-text">GPU Tutorials and Examples</span></p>
+<ul>
+<li class="toctree-l1"><a class="reference internal" href="1_basics.html">1. Basic Usage</a></li>
+<li class="toctree-l1"><a class="reference internal" href="2_simple_customization.html">2. Simple Customization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="3_advanced_customization.html">3. Advanced Customization</a></li>
+<li class="toctree-l1"><a class="reference internal" href="4_standard_model.html">4. The Standard Model</a></li>
+<li class="toctree-l1"><a class="reference internal" href="5_dust_coagulation.html">5. Dust Coagulation</a></li>
+<li class="toctree-l1"><a class="reference internal" href="6_dust_evolution.html">6. Dust Evolution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="7_gas_evolution.html">7. Gas Evolution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="test_gas_evolution.html">Test: Gas Evolution</a></li>
+<li class="toctree-l1"><a class="reference internal" href="test_analytical_coagulation_kernels.html">Test: Analytical Coagulation Kernels</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_ice_lines.html">Example: Ice Lines</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_planetary_gaps.html">Example: Planetary Gaps</a></li>
+<li class="toctree-l1"><a class="reference internal" href="example_planetesimal_formation.html">Example: Planetesimal Formation</a></li>
+</ul>
+
+        </div>
+      </div>
+    </nav>
+
+    <section data-toggle="wy-nav-shift" class="wy-nav-content-wrap"><nav class="wy-nav-top" aria-label="Mobile navigation menu" >
+          <i data-toggle="wy-nav-top" class="fa fa-bars"></i>
+          <a href="index.html">DustPy-GPU</a>
+      </nav>
+
+      <div class="wy-nav-content">
+        <div class="rst-content">
+          <div role="navigation" aria-label="Page navigation">
+  <ul class="wy-breadcrumbs">
+      <li><a href="index.html" class="icon icon-home" aria-label="Home"></a></li>
+      <li class="breadcrumb-item active">Backends</li>
+      <li class="wy-breadcrumbs-aside">
+              <a href="https://github.com/astroboylrx/dustpy-gpu/blob/master/docs_source/source/backends.rst" class="fa fa-github"> Edit on GitHub</a>
+      </li>
+  </ul>
+  <hr/>
+</div>
+          <div role="main" class="document" itemscope="itemscope" itemtype="http://schema.org/Article">
+           <div itemprop="articleBody">
+             
+  <section id="backends">
+<h1>Backends<a class="headerlink" href="#backends" title="Link to this heading"></a></h1>
+<p>Select a backend when constructing a simulation:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">dustpy</span>
+
+<span class="n">sim_cpu</span> <span class="o">=</span> <span class="n">dustpy</span><span class="o">.</span><span class="n">Simulation</span><span class="p">()</span>                 <span class="c1"># NumPy, the default</span>
+<span class="n">sim_numpy</span> <span class="o">=</span> <span class="n">dustpy</span><span class="o">.</span><span class="n">Simulation</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="s2">&quot;numpy&quot;</span><span class="p">)</span>
+<span class="n">sim_cupy</span> <span class="o">=</span> <span class="n">dustpy</span><span class="o">.</span><span class="n">Simulation</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="s2">&quot;cupy&quot;</span><span class="p">)</span>
+<span class="n">sim_auto</span> <span class="o">=</span> <span class="n">dustpy</span><span class="o">.</span><span class="n">Simulation</span><span class="p">(</span><span class="n">backend</span><span class="o">=</span><span class="s2">&quot;auto&quot;</span><span class="p">)</span> <span class="c1"># CuPy if available</span>
+</pre></div>
+</div>
+<dl class="simple">
+<dt><code class="docutils literal notranslate"><span class="pre">numpy</span></code></dt><dd><p>Preserves the upstream CPU behavior and uses the existing SciPy and Fortran
+implementations where applicable.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">cupy</span></code></dt><dd><p>Uses CuPy/CuPyX arrays, kernels, sparse matrices, and GPU solvers for the
+accelerated dust path. A CUDA-capable GPU and a compatible CuPy package are
+required.</p>
+</dd>
+<dt><code class="docutils literal notranslate"><span class="pre">auto</span></code></dt><dd><p>Selects CuPy when it can be imported and a CUDA device is available;
+otherwise it selects NumPy. The default remains NumPy so hardware
+availability cannot silently change an existing simulation.</p>
+</dd>
+</dl>
+<section id="multiple-simulation-objects">
+<h2>Multiple simulation objects<a class="headerlink" href="#multiple-simulation-objects" title="Link to this heading"></a></h2>
+<p>NumPy and CuPy simulation objects can coexist in one Python process when they
+are used sequentially. DustPy-GPU activates and rebinds the requested backend
+before <code class="docutils literal notranslate"><span class="pre">initialize()</span></code>, <code class="docutils literal notranslate"><span class="pre">run()</span></code>, or <code class="docutils literal notranslate"><span class="pre">update()</span></code>. Concurrent execution of
+different backends in the same process is not supported because some low-level
+bindings remain process-global.</p>
+</section>
+<section id="gpu-runtime-behavior">
+<h2>GPU runtime behavior<a class="headerlink" href="#gpu-runtime-behavior" title="Link to this heading"></a></h2>
+<section id="backend-arrays">
+<h3>Backend arrays<a class="headerlink" href="#backend-arrays" title="Link to this heading"></a></h3>
+<p>Simulation fields contain NumPy arrays with <code class="docutils literal notranslate"><span class="pre">backend=&quot;numpy&quot;</span></code> and CuPy arrays
+with <code class="docutils literal notranslate"><span class="pre">backend=&quot;cupy&quot;</span></code>. Convert GPU results explicitly when passing them to
+host-only analysis tools:</p>
+<div class="highlight-default notranslate"><div class="highlight"><pre><span></span><span class="kn">import</span><span class="w"> </span><span class="nn">cupy</span><span class="w"> </span><span class="k">as</span><span class="w"> </span><span class="nn">cp</span>
+
+<span class="n">sigma_dust</span> <span class="o">=</span> <span class="n">cp</span><span class="o">.</span><span class="n">asnumpy</span><span class="p">(</span><span class="n">sim</span><span class="o">.</span><span class="n">dust</span><span class="o">.</span><span class="n">Sigma</span><span class="p">)</span>
+</pre></div>
+</div>
+<p>DustPy’s plotting helpers perform the required conversion for their supported
+inputs.</p>
+</section>
+<section id="sparse-solver">
+<h3>Sparse solver<a class="headerlink" href="#sparse-solver" title="Link to this heading"></a></h3>
+<p>The accelerated dust path uses CuPy sparse GMRES with Jacobi preconditioning.
+CuPy’s direct sparse-solver API currently executes its solve on the CPU, so it
+does not provide the same accelerated path. DustPy-GPU retains a tiered solver
+policy and CPU fallback for robustness.</p>
+</section>
+<section id="numerical-reproducibility">
+<h3>Numerical reproducibility<a class="headerlink" href="#numerical-reproducibility" title="Link to this heading"></a></h3>
+<p>CuPy results are not expected to be bitwise deterministic. Sparse iterative
+solves and parallel scatter/accumulation can change floating-point operation
+order between runs. These tiny differences can lead to nearby numerical
+trajectories, but validation shows bounded, non-monotonic backend differences
+rather than persistent error accumulation. See <a class="reference internal" href="backend_parity_and_benchmarks.html"><span class="doc">Backend Parity and Performance</span></a>.</p>
+</section>
+<section id="performance-notes">
+<h3>Performance notes<a class="headerlink" href="#performance-notes" title="Link to this heading"></a></h3>
+<p>The first GPU run in a process includes CUDA context setup and kernel
+compilation. Benchmark continued evolution after a warm-up interval rather than
+timing initialization. Avoid frequent <code class="docutils literal notranslate"><span class="pre">cupy.asnumpy()</span></code>, <code class="docutils literal notranslate"><span class="pre">.get()</span></code>, or GPU
+scalar reads inside evolution loops because they synchronize the device.</p>
+</section>
+</section>
+</section>
+
+
+           </div>
+          </div>
+          <footer><div class="rst-footer-buttons" role="navigation" aria-label="Footer">
+        <a href="installation.html" class="btn btn-neutral float-left" title="Installation" accesskey="p" rel="prev"><span class="fa fa-arrow-circle-left" aria-hidden="true"></span> Previous</a>
+        <a href="backend_parity_and_benchmarks.html" class="btn btn-neutral float-right" title="Backend Parity and Performance" accesskey="n" rel="next">Next <span class="fa fa-arrow-circle-right" aria-hidden="true"></span></a>
+    </div>
+
+  <hr/>
+
+  <div role="contentinfo">
+    <p>&#169; Copyright 2026, Rixin Li and the DustPy authors (Sebastian Stammler and Tilman Birnstiel).</p>
+  </div>
+
+  Built with <a href="https://www.sphinx-doc.org/">Sphinx</a> using a
+    <a href="https://github.com/readthedocs/sphinx_rtd_theme">theme</a>
+    provided by <a href="https://readthedocs.org">Read the Docs</a>.
+   
+
+</footer>
+        </div>
+      </div>
+    </section>
+  </div>
+  <script>
+      jQuery(function () {
+          SphinxRtdTheme.Navigation.enable(true);
+      });
+  </script> 
+
+</body>
+</html>
